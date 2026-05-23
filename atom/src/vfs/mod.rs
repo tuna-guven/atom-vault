@@ -1,8 +1,9 @@
-use std::os::fd::{OwnedFd, AsRawFd, FromRawFd};
+use std::os::fd::{OwnedFd, AsRawFd}; 
 use std::ffi::CString;
 use std::io::{Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind};
-use nix::sys::memfd::{memfd_create, MFdFlags};
+use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
 use nix::unistd::{ftruncate, lseek, Whence};
+
 pub struct MemFile {
     fd: OwnedFd,
     fixed_size: usize,
@@ -13,12 +14,10 @@ impl MemFile {
         let vault_name = CString::new(vault_name)?;
 
         // we want from linux to create an empty file for us
-        let fd = memfd_create(&vault_name, MFdFlags::MFD_CLOEXEC)?;
-
+        let fd = memfd_create(&vault_name, MemFdCreateFlag::MFD_CLOEXEC)?;
+        
         // we want vault to be fixed size
-        ftruncate(fd, vault_size as i64)?;
-
-        //let smart_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        ftruncate(&fd, vault_size as i64)?;
 
         Ok(Self { 
             fd, 
@@ -30,7 +29,7 @@ impl MemFile {
 // we are making a contract with the trait of std::io::write so that our file is not just any file but can write 
 impl Write for MemFile {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize>{
-        let written_size = nix::unistd::write(self.fd.as_raw_fd(), buf)
+        let written_size = nix::unistd::write(&self.fd, buf)
             .map_err(|e| Error::new(ErrorKind::Other, e))?;
         Ok(written_size)     
     }
