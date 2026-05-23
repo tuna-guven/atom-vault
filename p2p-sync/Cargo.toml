@@ -1,0 +1,27 @@
+[package]
+name = "p2p-sync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Transport & Multiplexing
+rusqlite = { version = "0.31", features = ["bundled"] }
+arti-client = { version = "0.22", features = ["onion-service-client"] }
+tor-keymgr = { version = "0.x", features = ["ephemeral-keystore", "keymgr"] }
+tor-hsservice = "0.x"
+tokio-socks = "0.5"
+tokio = { version = "1.0", features = ["full"]}
+tokio-util = { version = "0.7", features = ["compat"] }
+yamux = "0.13"
+futures = "0.3"
+
+# Handshake & Cryptography
+snow = "0.9"
+ed25519-dalek = "2.1"
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Tor Integration
+data-encoding = "2.6"
+sha3 = "0.10" # Tor uses SHA3-256 for the checksum, not SHA2
+tor-rtcompat = "0.22"
