@@ -62,8 +62,3 @@ impl Seek for MemFile {
         Ok(new_pos as u64)
     }
 }
-
-
-fn main() {
-
-}
