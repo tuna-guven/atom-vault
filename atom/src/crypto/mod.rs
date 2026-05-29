@@ -1,7 +1,8 @@
 use argon2::{Argon2, Algorithm, Version, Params};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::{Aead, KeyInit}};
 use rand::{RngCore, rngs::OsRng};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
 
 // Cryptographic Constants
 pub const SALT_LEN: usize = 32;
@@ -121,19 +122,13 @@ pub fn decrypt_chunk(
     unlocked_vault: &UnlockedVault,
     chunk_ciphertext: &[u8],
     nonce_bytes: &[u8; XNONCE_LEN],
-) -> Result<Vec<u8>, chacha20poly1305::Error> {
-    
-    // 1. Initialize the cipher using the DEK
+) -> Result<Zeroizing<Vec<u8>>, chacha20poly1305::Error> {
     let cipher = XChaCha20Poly1305::new(unlocked_vault.dek.as_ref().into());
-
-    // 2. Convert the raw nonce_bytes into the XNonce type
     let nonce = XNonce::from_slice(nonce_bytes);
 
-    // 3. Decrypt the ciphertext 
-    // This mathematically verifies the Auth Tag first. If a single bit 
-    // was flipped by corruption or an attacker, this returns an Error.
-    let plaintext = cipher.decrypt(nonce, chunk_ciphertext)?;
+    // Decrypt the data directly
+    let plaintext_vec = cipher.decrypt(nonce, chunk_ciphertext)?;
 
-    // 4. Return the plaintext bytes
-    Ok(plaintext)
+    // Wrap immediately into a Zeroizing container to seal the memory
+    Ok(Zeroizing::new(plaintext_vec))
 }
