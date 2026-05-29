@@ -1,11 +1,13 @@
 use std::io::{Read, BufReader};
 use fastcdc::v2020::StreamCDC;
 
+/* 
 pub struct Chunk{
     pub offset: u64,
     pub length: usize,
     pub data: Vec<u8>,
 }
+*/
 
 pub fn chunk_data<R: Read>(source: R) -> impl Iterator<Item = Result<fastcdc::v2020::ChunkData, std::io::Error>> {
     let min_size = 2048;

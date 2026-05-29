@@ -1,5 +1,5 @@
 use atom::chunker;
-use std::io::{Write, Seek, SeekFrom, Cursor};
+use std::io::Cursor;
 
 #[test]
 fn test_streaming_chunker_boundaries() {
