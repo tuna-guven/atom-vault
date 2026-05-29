@@ -4,9 +4,11 @@ use std::io::{Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind}
 use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
 use nix::unistd::{ftruncate, lseek, Whence};
 
+
 pub struct MemFile {
     fd: OwnedFd,
     fixed_size: usize,
+    memory_ptr: std::ptr::NonNull<libc::c_void>,
 }
 
 impl MemFile {
@@ -19,10 +21,34 @@ impl MemFile {
         // we want vault to be fixed size
         ftruncate(&fd, vault_size as i64)?;
 
+        let raw_ptr = unsafe{
+            libc::mmap(
+                std::ptr::null_mut(),                 // OS shall pick an address which is empty
+                vault_size,                            // Memory size to be mapped
+                libc::PROT_READ | libc::PROT_WRITE,   // both write and read permissions
+                libc::MAP_SHARED,                    // changes shall affect the file
+                fd.as_raw_fd(),                            // our ram file's ID
+                0                                  // offset from the doc header
+            )
+        };
+
+        if raw_ptr == libc::MAP_FAILED {
+            return Err(Box::new(std::io::Error::last_os_error()));
+        }
+
         Ok(Self { 
             fd, 
-            fixed_size: vault_size
+            fixed_size: vault_size,
+            memory_ptr: std::ptr::NonNull::new(raw_ptr).unwrap()
         })        
+    }
+}
+
+impl Drop for MemFile{
+    fn drop(&mut self){
+        unsafe{
+            libc::munmap(self.memory_ptr.as_ptr(), self.fixed_size);
+        }
     }
 }
 

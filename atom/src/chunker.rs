@@ -1,5 +1,5 @@
-use std::io::Read;
-use fastcdc::v2020::FastCDC;
+use std::io::{Read, BufReader};
+use fastcdc::v2020::StreamCDC;
 
 pub struct Chunk{
     pub offset: u64,
@@ -7,26 +7,18 @@ pub struct Chunk{
     pub data: Vec<u8>,
 }
 
-pub fn chunk_data<R: Read>(mut source: R) -> Result<Vec<Chunk>, std::io::Error>{
-    let mut buffer = Vec::new();
-    source.read_to_end(&mut buffer)?;
-
+pub fn chunk_data<R: Read>(source: R) -> impl Iterator<Item = Result<fastcdc::v2020::ChunkData, std::io::Error>> {
     let min_size = 2048;
     let avg_size = 4096;
     let max_size = 8192;
-    let chunker = FastCDC::new(&buffer, min_size, avg_size, max_size);
-    
-    let mut chunks: Vec<Chunk> = Vec::new();
-    for entry in chunker{
-        let start = entry.offset;
-        let end = start + entry.length;
 
-        let chunk_data = buffer[start..end].to_vec();
-        chunks.push(Chunk { 
-            offset: entry.offset as u64, 
-            length: entry.length, 
-            data: chunk_data 
-        });
-    }
-    Ok(chunks)
+    // making streamCDC more performatic
+    let reader = BufReader::new(source);
+
+    let chunker = StreamCDC::new(reader, min_size, avg_size, max_size);
+
+    // turning fastcdc::Error -> std::io::Error
+    chunker.map(|result| {
+        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    })
 }
