@@ -1,8 +1,10 @@
-use argon2::{Argon2, Algorithm, Version, Params};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::{Aead, KeyInit}};
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit},
+};
 use rand::{RngCore, rngs::OsRng};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
-
 
 // Cryptographic Constants
 pub const SALT_LEN: usize = 32;
@@ -11,11 +13,11 @@ pub const XNONCE_LEN: usize = 24;
 
 // Type aliases for clarity
 pub type Salt = [u8; SALT_LEN];
-pub type VaultKey = [u8; KEY_LEN];      // Used for both KEK and DEK
-pub type WrappedKey = Vec<u8>;          // The DEK after it's encrypted (Ciphertext + 16-byte Tag)
+pub type VaultKey = [u8; KEY_LEN]; // Used for both KEK and DEK
+pub type WrappedKey = Vec<u8>; // The DEK after it's encrypted (Ciphertext + 16-byte Tag)
 
 /// The structure that holds the raw Data Encryption Key (DEK) in memory while the vault is open.
-/// We use ZeroizeOnDrop so that when this struct goes out of scope, Rust automatically overwrites 
+/// We use ZeroizeOnDrop so that when this struct goes out of scope, Rust automatically overwrites
 /// the DEK in RAM with zeros, preventing memory-scraping malware from finding it.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct UnlockedVault {
@@ -65,7 +67,7 @@ pub fn wrap_dek(
     let nonce_bytes = generate_xnonce();
     let nonce = XNonce::from_slice(&nonce_bytes);
 
-    // 3. Encrypt the DEK. 
+    // 3. Encrypt the DEK.
     // The `.encrypt()` method automatically appends a 16-byte Poly1305 Auth Tag.
     let wrapped_dek = cipher.encrypt(nonce, dek.as_ref())?;
 
@@ -100,7 +102,6 @@ pub fn encrypt_chunk(
     unlocked_vault: &UnlockedVault,
     chunk_plaintext: &[u8],
 ) -> Result<(Vec<u8>, [u8; XNONCE_LEN]), chacha20poly1305::Error> {
-    
     // 1. Initialize the XChaCha20Poly1305 cipher using the DEK inside unlocked_vault
     let cipher = XChaCha20Poly1305::new(unlocked_vault.dek.as_ref().into());
 
@@ -108,7 +109,7 @@ pub fn encrypt_chunk(
     let nonce_bytes = generate_xnonce();
     let nonce = XNonce::from_slice(&nonce_bytes);
 
-    // 3. Encrypt the chunk_plaintext 
+    // 3. Encrypt the chunk_plaintext
     // The encrypt() function automatically appends the 16-byte Poly1305 Auth Tag
     // to the end of the returned Vec<u8>.
     let ciphertext = cipher.encrypt(nonce, chunk_plaintext)?;

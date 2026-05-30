@@ -1,14 +1,14 @@
-mod cli; 
+mod cli;
 
 use clap::Parser;
 use cli::{Cli, Commands};
-use std::io::{Read, Write, Seek, SeekFrom};
 use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 // Prevent split-brain compilation issues by importing directly from the library crate
-use atom::crypto;
-use atom::vfs::{self, VaultMetadata, FileIndex, ChunkEntry};
 use atom::chunker;
+use atom::crypto;
+use atom::vfs::{self, ChunkEntry, FileIndex, VaultMetadata};
 
 fn save_vault_metadata(
     physical_vault: &mut File,
@@ -19,13 +19,28 @@ fn save_vault_metadata(
     let raw_bytes = bincode::serialize(metadata)?;
 
     let secure_buffer = zeroize::Zeroizing::new(raw_bytes);
-    unsafe { libc::mlock(secure_buffer.as_ptr() as *const libc::c_void, secure_buffer.len()); }
-    
+    unsafe {
+        libc::mlock(
+            secure_buffer.as_ptr() as *const libc::c_void,
+            secure_buffer.len(),
+        );
+    }
+
     // Format authenticated AEAD errors using Debug formatting {:?}
     let (ciphertext, metadata_nonce) = crypto::encrypt_chunk(unlocked_vault, &secure_buffer)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Crypto error: {:?}", e)))?;
-        
-    unsafe { libc::munlock(secure_buffer.as_ptr() as *const libc::c_void, secure_buffer.len()); }
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Crypto error: {:?}", e),
+            )
+        })?;
+
+    unsafe {
+        libc::munlock(
+            secure_buffer.as_ptr() as *const libc::c_void,
+            secure_buffer.len(),
+        );
+    }
 
     // 1. Append encrypted metadata payload right at the end of the existing payload data area
     physical_vault.seek(SeekFrom::Start(payload_end_offset))?;
@@ -55,7 +70,12 @@ fn load_vault_metadata(
     if file_len < 8 {
         physical_vault.seek(SeekFrom::Start(0))?;
         physical_vault.write_all(&8u64.to_le_bytes())?;
-        return Ok((VaultMetadata { file_table: Vec::new() }, 8));
+        return Ok((
+            VaultMetadata {
+                file_table: Vec::new(),
+            },
+            8,
+        ));
     }
 
     // Read the 8-byte pointer to locate tail-based metadata
@@ -66,7 +86,12 @@ fn load_vault_metadata(
 
     // Return empty table if the master pointer references space beyond current EOF bounds
     if metadata_offset >= file_len {
-        return Ok((VaultMetadata { file_table: Vec::new() }, 8));
+        return Ok((
+            VaultMetadata {
+                file_table: Vec::new(),
+            },
+            8,
+        ));
     }
 
     // Seek directly to the tail partition and parse out the layout structure
@@ -82,11 +107,26 @@ fn load_vault_metadata(
     physical_vault.read_exact(&mut cipher_buffer)?;
 
     let decrypted_bytes = crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, &metadata_nonce)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Metadata error: {:?}", e)))?;
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Metadata error: {:?}", e),
+            )
+        })?;
 
-    unsafe { libc::mlock(decrypted_bytes.as_ptr() as *const libc::c_void, decrypted_bytes.len()); }
+    unsafe {
+        libc::mlock(
+            decrypted_bytes.as_ptr() as *const libc::c_void,
+            decrypted_bytes.len(),
+        );
+    }
     let metadata: VaultMetadata = bincode::deserialize(&decrypted_bytes)?;
-    unsafe { libc::munlock(decrypted_bytes.as_ptr() as *const libc::c_void, decrypted_bytes.len()); }
+    unsafe {
+        libc::munlock(
+            decrypted_bytes.as_ptr() as *const libc::c_void,
+            decrypted_bytes.len(),
+        );
+    }
 
     // Return current structural layout and the exact offset where new chunks can be safely appended
     Ok((metadata, metadata_offset))
@@ -95,7 +135,7 @@ fn load_vault_metadata(
 fn main() {
     let args = Cli::parse();
     let vault_size = 50 * 1024 * 1024;
-    
+
     let mut physical_vault = OpenOptions::new()
         .read(true)
         .write(true)
@@ -105,13 +145,14 @@ fn main() {
 
     let mut mounted_vfs = vfs::MemFile::new("atom_mount", vault_size).unwrap();
 
-    let salt = [0u8; 32]; 
+    let salt = [0u8; 32];
     let kek = crypto::derive_kek("master_password", &salt).unwrap();
-    let raw_dek = [42u8; 32]; 
+    let raw_dek = [42u8; 32];
     let (wrapped_dek, dek_nonce) = crypto::wrap_dek(&kek, &raw_dek).unwrap();
     let unlocked_vault = crypto::unwrap_dek(&kek, &wrapped_dek, &dek_nonce).unwrap();
 
-    let (mut metadata, mut current_payload_offset) = load_vault_metadata(&mut physical_vault, &unlocked_vault).unwrap();
+    let (mut metadata, mut current_payload_offset) =
+        load_vault_metadata(&mut physical_vault, &unlocked_vault).unwrap();
 
     match args.command {
         Commands::Ls => {
@@ -125,7 +166,10 @@ fn main() {
             }
         }
 
-        Commands::Import { from_disk, vfs_name } => {
+        Commands::Import {
+            from_disk,
+            vfs_name,
+        } => {
             println!("[Ingress] Importing '{}'...", vfs_name);
             let mut input_file = File::open(&from_disk).expect("Failed to open local file");
             let chunk_boundaries: Vec<_> = chunker::chunk_data(&mut input_file).collect();
@@ -133,20 +177,35 @@ fn main() {
             let mut new_chunks = Vec::new();
 
             // Seek directly to current payload end boundary to write fresh chunks over the old metadata location
-            physical_vault.seek(SeekFrom::Start(current_payload_offset)).unwrap();
+            physical_vault
+                .seek(SeekFrom::Start(current_payload_offset))
+                .unwrap();
 
             for chunk_result in chunk_boundaries {
                 let chunk_info = chunk_result.unwrap();
                 let mut secure_buffer = zeroize::Zeroizing::new(vec![0u8; chunk_info.length]);
-                
-                input_file.seek(SeekFrom::Start(chunk_info.offset as u64)).unwrap();
+
+                input_file
+                    .seek(SeekFrom::Start(chunk_info.offset as u64))
+                    .unwrap();
                 input_file.read_exact(&mut secure_buffer).unwrap();
 
-                unsafe { libc::mlock(secure_buffer.as_ptr() as *const libc::c_void, chunk_info.length); }
-                let (ciphertext, chunk_nonce) = crypto::encrypt_chunk(&unlocked_vault, &secure_buffer).unwrap();
-                physical_vault.write_all(&ciphertext).unwrap(); 
-                unsafe { libc::munlock(secure_buffer.as_ptr() as *const libc::c_void, chunk_info.length); }
-                
+                unsafe {
+                    libc::mlock(
+                        secure_buffer.as_ptr() as *const libc::c_void,
+                        chunk_info.length,
+                    );
+                }
+                let (ciphertext, chunk_nonce) =
+                    crypto::encrypt_chunk(&unlocked_vault, &secure_buffer).unwrap();
+                physical_vault.write_all(&ciphertext).unwrap();
+                unsafe {
+                    libc::munlock(
+                        secure_buffer.as_ptr() as *const libc::c_void,
+                        chunk_info.length,
+                    );
+                }
+
                 new_chunks.push(ChunkEntry {
                     cipher_len: ciphertext.len(),
                     offset: current_payload_offset,
@@ -157,8 +216,17 @@ fn main() {
                 current_payload_offset += ciphertext.len() as u64;
             }
 
-            metadata.file_table.push(FileIndex { vfs_name, chunks: new_chunks });
-            save_vault_metadata(&mut physical_vault, &metadata, &unlocked_vault, current_payload_offset).unwrap();
+            metadata.file_table.push(FileIndex {
+                vfs_name,
+                chunks: new_chunks,
+            });
+            save_vault_metadata(
+                &mut physical_vault,
+                &metadata,
+                &unlocked_vault,
+                current_payload_offset,
+            )
+            .unwrap();
             println!("Import complete. Tail-based metadata map serialized and pointer updated.");
         }
 
@@ -178,44 +246,62 @@ fn main() {
 
                     let mut decrypted_chunk = Vec::new();
                     vfs::process_secure_chunk(
-                        &mut mounted_vfs, 
+                        &mut mounted_vfs,
                         chunk.cipher_len,
                         &chunk.nonce,
                         &unlocked_vault,
                         |secure_plaintext| {
                             decrypted_chunk.extend_from_slice(secure_plaintext);
-                        }
-                    ).unwrap(); 
+                        },
+                    )
+                    .unwrap();
 
                     mounted_vfs.seek(SeekFrom::Start(current_vfs_pos)).unwrap();
                     mounted_vfs.write_all(&decrypted_chunk).unwrap();
                 }
             }
-            println!("Vault successfully unlocked. Decrypted plaintext is live on virtual RAM disk.");
-            
+            println!(
+                "Vault successfully unlocked. Decrypted plaintext is live on virtual RAM disk."
+            );
+
             // Validate volatile mapping context inside active RAM pages
             mounted_vfs.seek(SeekFrom::Start(0)).unwrap();
-            let mut ram_verification = vec![0u8; 30]; 
+            let mut ram_verification = vec![0u8; 30];
             if mounted_vfs.read_exact(&mut ram_verification).is_ok() {
-                println!("[Verification] Raw plaintext data read from volatile RAM: {:?}", String::from_utf8_lossy(&ram_verification));
+                println!(
+                    "[Verification] Raw plaintext data read from volatile RAM: {:?}",
+                    String::from_utf8_lossy(&ram_verification)
+                );
             }
         }
 
         Commands::Export { vfs_name, to_disk } => {
             println!("[Egress] Exporting '{}' to '{}'...", vfs_name, to_disk);
             let mut output_file = File::create(&to_disk).expect("Failed to create output file");
-            
+
             if let Some(file_entry) = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name) {
                 for chunk in &file_entry.chunks {
                     physical_vault.seek(SeekFrom::Start(chunk.offset)).unwrap();
                     let mut cipher_buffer = vec![0u8; chunk.cipher_len];
                     physical_vault.read_exact(&mut cipher_buffer).unwrap();
-                    
-                    let secure_plaintext = crypto::decrypt_chunk(&unlocked_vault, &cipher_buffer, &chunk.nonce).unwrap();
 
-                    unsafe { libc::mlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len()); }
+                    let secure_plaintext =
+                        crypto::decrypt_chunk(&unlocked_vault, &cipher_buffer, &chunk.nonce)
+                            .unwrap();
+
+                    unsafe {
+                        libc::mlock(
+                            secure_plaintext.as_ptr() as *const libc::c_void,
+                            secure_plaintext.len(),
+                        );
+                    }
                     output_file.write_all(&secure_plaintext).unwrap();
-                    unsafe { libc::munlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len()); }
+                    unsafe {
+                        libc::munlock(
+                            secure_plaintext.as_ptr() as *const libc::c_void,
+                            secure_plaintext.len(),
+                        );
+                    }
                 }
                 println!("Export complete. File safely extracted and written.");
             } else {
@@ -224,14 +310,30 @@ fn main() {
         }
 
         Commands::Rm { vfs_name } => {
-            println!("[Wiping] Commencing SSD-Safe Crypto-Shredding for '{}'...", vfs_name);
+            println!(
+                "[Wiping] Commencing SSD-Safe Crypto-Shredding for '{}'...",
+                vfs_name
+            );
 
             // Purge the file entry and corresponding nonces out of the Bincode allocation layout.
             // Abandoned disk blocks become instant cryptographic noise, neutralizing FTL wear leveling vulnerabilities.
-            if let Some(file_position) = metadata.file_table.iter().position(|f| f.vfs_name == vfs_name) {
+            if let Some(file_position) = metadata
+                .file_table
+                .iter()
+                .position(|f| f.vfs_name == vfs_name)
+            {
                 metadata.file_table.remove(file_position);
-                save_vault_metadata(&mut physical_vault, &metadata, &unlocked_vault, current_payload_offset).unwrap();
-                println!("[Success] File '{}' crypto-shredded securely. SSD blocks abandoned.", vfs_name);
+                save_vault_metadata(
+                    &mut physical_vault,
+                    &metadata,
+                    &unlocked_vault,
+                    current_payload_offset,
+                )
+                .unwrap();
+                println!(
+                    "[Success] File '{}' crypto-shredded securely. SSD blocks abandoned.",
+                    vfs_name
+                );
             } else {
                 println!("Error: File '{}' not found in vault index.", vfs_name);
             }
