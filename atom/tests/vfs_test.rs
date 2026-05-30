@@ -38,26 +38,42 @@ fn test_bincode_vault_metadata_serialization_loop() {
         .unwrap();
 
     // 1. Create mock structured Bincode metadata layouts with offset attributes
-    let chunk_1 = ChunkEntry { cipher_len: 128, offset: 0, nonce: [1u8; crypto::XNONCE_LEN] };
-    let chunk_2 = ChunkEntry { cipher_len: 256, offset: 0, nonce: [2u8; crypto::XNONCE_LEN] };
+    let chunk_1 = ChunkEntry { cipher_len: 128, offset: 8, nonce: [1u8; crypto::XNONCE_LEN] };
+    let chunk_2 = ChunkEntry { cipher_len: 256, offset: 136, nonce: [2u8; crypto::XNONCE_LEN] };
     let file_index = FileIndex {
         vfs_name: "secure_payload.bin".to_string(),
         chunks: vec![chunk_1, chunk_2],
     };
     let original_metadata = VaultMetadata { file_table: vec![file_index] };
 
-    // 2. Serialize and encrypt to disk layout
+    // 2. Serialize and encrypt metadata
     let raw_bytes = bincode::serialize(&original_metadata).unwrap();
     let secure_buffer = Zeroizing::new(raw_bytes);
     let (ciphertext, metadata_nonce) = crypto::encrypt_chunk(&unlocked_vault, &secure_buffer).unwrap();
     let ciphertext_len = ciphertext.len() as u64;
 
+    // Simulate Tail-Based Architecture layout: 
+    // Chunks end at offset 8, so metadata begins at offset 8.
+    let payload_end_offset = 8u64; 
+    
+    // Write the 8-byte master pointer at offset 0 pointing to metadata position (offset 8)
+    file.write_all(&payload_end_offset.to_le_bytes()).unwrap();
+
+    // Write the encrypted metadata payload at the specified offset
+    file.seek(SeekFrom::Start(payload_end_offset)).unwrap();
     file.write_all(&ciphertext_len.to_le_bytes()).unwrap();
     file.write_all(&metadata_nonce).unwrap();
     file.write_all(&ciphertext).unwrap();
 
-    // 3. Simulating app restart: read back, decrypt and deserialize
+    // 3. Simulating app restart: read the 8-byte master pointer first
     file.seek(SeekFrom::Start(0)).unwrap();
+    let mut ptr_bytes = [0u8; 8];
+    file.read_exact(&mut ptr_bytes).unwrap();
+    let read_metadata_offset = u64::from_le_bytes(ptr_bytes);
+    assert_eq!(read_metadata_offset, payload_end_offset);
+
+    // Seek directly to the dynamic tail location using the parsed pointer
+    file.seek(SeekFrom::Start(read_metadata_offset)).unwrap();
     let mut len_bytes = [0u8; 8];
     file.read_exact(&mut len_bytes).unwrap();
     let read_cipher_len = u64::from_le_bytes(len_bytes) as usize;

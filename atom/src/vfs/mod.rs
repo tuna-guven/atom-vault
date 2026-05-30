@@ -37,8 +37,8 @@ pub fn process_secure_chunk<F>(
 
     // decrypt the file
     let secure_plaintext = crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Decryption error: {:?}", e)))?;
+    
     // lock on ram to prevent swap leakage
     unsafe {
         libc::mlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len());
