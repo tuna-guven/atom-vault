@@ -1,1 +1,0 @@
-Tail-based pointer architecture evaluation test string

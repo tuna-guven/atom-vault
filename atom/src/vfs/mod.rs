@@ -22,6 +22,7 @@ pub struct FileIndex {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VaultMetadata {
     pub file_table: Vec<FileIndex>,
+    pub max_capacity: Option<u64>,
 }
 
 pub fn process_secure_chunk<F>(

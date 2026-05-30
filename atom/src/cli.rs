@@ -28,10 +28,12 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// List all files currently mounted inside the vault
+    Create {
+        /// Optional fixed size in Megabytes (MB). If not provided, vault expands dynamically.
+        #[arg(short, long)]
+        size: Option<u64>,
+    },
     Ls,
-
-    /// Import a physical file from hard disk into the secure vault (Ingress)
     Import {
         /// Path to the local file on your hard disk
         #[arg(long)]
@@ -41,15 +43,15 @@ pub enum Commands {
         #[arg(long, value_parser = parse_vault_name)]
         vfs_name: String,
     },
-
-    /// Unlock a vault and mount it to volatile memory layout
     Unlock {
         /// Path to the .aegis vault file on disk
         #[arg(long, default_value = "my_data.aegis")]
         path: String,
     },
-
-    /// Export a file from the secure vault back to the local hard disk (Egress)
+    // Securely wipe volatile ram disk and terminate the background mount daemon
+    Lock,
+    /// Repack the vault, discard abandoned noise blocks, and shrink container size
+    Vacuum,
     Export {
         /// Name of the file inside the VFS
         #[arg(long)]
@@ -59,8 +61,6 @@ pub enum Commands {
         #[arg(long)]
         to_disk: String,
     },
-
-    /// Securely wipe a file from the vault
     Rm {
         vfs_name: String,
     },

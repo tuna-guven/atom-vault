@@ -37,14 +37,19 @@ fn test_bincode_vault_metadata_serialization_loop() {
         .open(test_file_path)
         .unwrap();
 
-    // 1. Create mock structured Bincode metadata layouts with offset attributes
-    let chunk_1 = ChunkEntry { cipher_len: 128, offset: 8, nonce: [1u8; crypto::XNONCE_LEN] };
-    let chunk_2 = ChunkEntry { cipher_len: 256, offset: 136, nonce: [2u8; crypto::XNONCE_LEN] };
+    // 1. Create mock structured Bincode metadata layouts with updated max_capacity attribute
+    let chunk_1 = ChunkEntry { cipher_len: 128, offset: 40, nonce: [1u8; crypto::XNONCE_LEN] };
+    let chunk_2 = ChunkEntry { cipher_len: 256, offset: 168, nonce: [2u8; crypto::XNONCE_LEN] };
     let file_index = FileIndex {
         vfs_name: "secure_payload.bin".to_string(),
         chunks: vec![chunk_1, chunk_2],
     };
-    let original_metadata = VaultMetadata { file_table: vec![file_index] };
+    
+    // COMPACTION FIX: Instantiated with max_capacity to respect fixed-size constraints if any
+    let original_metadata = VaultMetadata { 
+        file_table: vec![file_index],
+        max_capacity: Some(10 * 1024 * 1024), // 10 MB limit
+    };
 
     // 2. Serialize and encrypt metadata
     let raw_bytes = bincode::serialize(&original_metadata).unwrap();
@@ -52,12 +57,13 @@ fn test_bincode_vault_metadata_serialization_loop() {
     let (ciphertext, metadata_nonce) = crypto::encrypt_chunk(&unlocked_vault, &secure_buffer).unwrap();
     let ciphertext_len = ciphertext.len() as u64;
 
-    // Simulate Tail-Based Architecture layout: 
-    // Chunks end at offset 8, so metadata begins at offset 8.
-    let payload_end_offset = 8u64; 
+    // VFS GROUNDWORK: Chunks end at offset 40 due to 8-byte pointer + 32-byte salt rezerve block
+    let payload_end_offset = 40u64; 
     
-    // Write the 8-byte master pointer at offset 0 pointing to metadata position (offset 8)
+    // Write the 8-byte master pointer at offset 0 pointing to metadata position (offset 40)
     file.write_all(&payload_end_offset.to_le_bytes()).unwrap();
+    // Fill the 32-byte space with dummy placeholder bytes
+    file.write_all(&[0u8; 32]).unwrap();
 
     // Write the encrypted metadata payload at the specified offset
     file.seek(SeekFrom::Start(payload_end_offset)).unwrap();
@@ -84,7 +90,10 @@ fn test_bincode_vault_metadata_serialization_loop() {
     let mut read_cipher_buffer = vec![0u8; read_cipher_len];
     file.read_exact(&mut read_cipher_buffer).unwrap();
 
-    let decrypted_bytes = crypto::decrypt_chunk(&unlocked_vault, &read_cipher_buffer, &read_nonce).unwrap();
+    // SANITATION MATCH: Explicit Zeroize binding on transient buffers
+    let decrypted_bytes = Zeroizing::new(
+        crypto::decrypt_chunk(&unlocked_vault, &read_cipher_buffer, &read_nonce).unwrap()
+    );
     let parsed_metadata: VaultMetadata = bincode::deserialize(&decrypted_bytes).unwrap();
 
     // 4. Structural Verification
@@ -92,6 +101,7 @@ fn test_bincode_vault_metadata_serialization_loop() {
     assert_eq!(parsed_metadata.file_table[0].vfs_name, "secure_payload.bin");
     assert_eq!(parsed_metadata.file_table[0].chunks.len(), 2);
     assert_eq!(parsed_metadata.file_table[0].chunks[0].cipher_len, 128);
+    assert_eq!(parsed_metadata.max_capacity, Some(10 * 1024 * 1024));
 
     let _ = std::fs::remove_file(test_file_path);
 }
@@ -116,7 +126,7 @@ fn test_process_secure_chunk_callback_execution() {
     mem_file.seek(SeekFrom::Start(0)).unwrap();
 
     // 2. Execute process_secure_chunk and capture decrypted plaintext inside closure
-    let mut validated_data = Vec::new();
+    let mut validated_data = Zeroizing::new(Vec::new());
     process_secure_chunk(
         &mut mem_file,
         ciphertext.len(),
@@ -128,5 +138,5 @@ fn test_process_secure_chunk_callback_execution() {
     ).unwrap();
 
     // 3. Assert callback executed successfully with correct context match
-    assert_eq!(validated_data, raw_payload);
+    assert_eq!(*validated_data, raw_payload.to_vec());
 }
