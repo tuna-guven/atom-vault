@@ -28,41 +28,22 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// List all files currently mounted inside the vault
-    Ls,
+    /// Create a new, empty secure vault container file
+    Create {
+        /// Path to the new secure vault file on disk
+        #[arg(long, default_value = ".")]
+        vault_path: String,
 
-    /// Import a physical file from hard disk into the secure vault (Ingress)
-    Import {
-        /// Path to the local file on your hard disk
-        #[arg(long)]
-        from_disk: String,
-        
-        /// Target name inside the secure VFS
+        /// Target name for the virtual memory layout (Max 32 ASCII chars)
         #[arg(long, value_parser = parse_vault_name)]
-        vfs_name: String,
+        vault_name: String,
     },
 
-    /// Unlock a vault and mount it to volatile memory layout
-    Unlock {
+    /// Unlock a vault and enter its cryptographically isolated interactive shell
+    Enter {
         /// Path to the .aegis vault file on disk
         #[arg(long, default_value = "my_data.aegis")]
-        path: String,
-    },
-
-    /// Export a file from the secure vault back to the local hard disk (Egress)
-    Export {
-        /// Name of the file inside the VFS
-        #[arg(long)]
-        vfs_name: String,
-        
-        /// Target path on the local hard disk
-        #[arg(long)]
-        to_disk: String,
-    },
-
-    /// Securely wipe a file from the vault
-    Rm {
-        vfs_name: String,
+        vault_path: String,
     },
 }
 

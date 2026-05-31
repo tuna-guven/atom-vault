@@ -1,15 +1,15 @@
 use std::os::fd::{OwnedFd, AsRawFd}; 
 use std::ffi::CString;
-use std::io::{self, Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind};
+use std::io::{ Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind};
 use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
 use nix::unistd::{ftruncate, lseek, Whence};
-use crate::crypto::{self, UnlockedVault, XNONCE_LEN};
 use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChunkEntry {
     pub cipher_len: usize,
     pub offset: u64,
+    // with merkle tree we would get deterministic nonce here instead of creating totally random bytes
     pub nonce: [u8; crate::crypto::XNONCE_LEN],
 }
 
@@ -25,29 +25,24 @@ pub struct VaultMetadata {
 }
 
 pub fn process_secure_chunk<F>(
-    vault: &mut MemFile,
+    physical_vault: &mut std::fs::File,
     cipher_len: usize,
-    nonce: &[u8; XNONCE_LEN],
-    unlocked_vault: &UnlockedVault,
+    nonce: &[u8; crate::crypto::XNONCE_LEN],
+    unlocked_vault: &crate::crypto::UnlockedVault,
     action: F,   
-) -> io::Result<()> where F: FnOnce(&[u8]), {
-    // read the encrypted data from vfs into the buffer
+) -> std::io::Result<()> where F: FnOnce(&[u8]), {
     let mut cipher_buffer = vec![0u8; cipher_len];
-    vault.read_exact(&mut cipher_buffer)?;
+    physical_vault.read_exact(&mut cipher_buffer)?;
 
-    // decrypt the file
-    let secure_plaintext = crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Decryption error: {:?}", e)))?;
+    let secure_plaintext = crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Decryption error: {:?}", e)))?;
     
-    // lock on ram to prevent swap leakage
     unsafe {
         libc::mlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len());
     }
 
-    // execute closure with the locked plaintext
     action(&secure_plaintext);
 
-    // unpin memory
     unsafe {
         libc::munlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len());
     }
@@ -59,7 +54,6 @@ pub struct MemFile {
     fd: OwnedFd,
     fixed_size: usize,
     memory_ptr: std::ptr::NonNull<libc::c_void>,
-    // FIX: files ve current_write_offset alanları Bincode mimarisinde gereksiz olduğu için kaldırıldı.
 }
 
 impl MemFile {

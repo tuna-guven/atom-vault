@@ -1,6 +1,5 @@
 use atom::vfs::{MemFile, process_secure_chunk, VaultMetadata, FileIndex, ChunkEntry};
 use atom::crypto;
-use zeroize::Zeroizing;
 use std::io::{Write, Read, Seek, SeekFrom};
 use std::fs::OpenOptions;
 
@@ -38,8 +37,8 @@ fn test_bincode_vault_metadata_serialization_loop() {
         .unwrap();
 
     // 1. Create mock structured Bincode metadata layouts with offset attributes
-    let chunk_1 = ChunkEntry { cipher_len: 128, offset: 8, nonce: [1u8; crypto::XNONCE_LEN] };
-    let chunk_2 = ChunkEntry { cipher_len: 256, offset: 136, nonce: [2u8; crypto::XNONCE_LEN] };
+    let chunk_1 = ChunkEntry { cipher_len: 128, offset: 112, nonce: [1u8; crypto::XNONCE_LEN] };
+    let chunk_2 = ChunkEntry { cipher_len: 256, offset: 240, nonce: [2u8; crypto::XNONCE_LEN] };
     let file_index = FileIndex {
         vfs_name: "secure_payload.bin".to_string(),
         chunks: vec![chunk_1, chunk_2],
@@ -48,20 +47,20 @@ fn test_bincode_vault_metadata_serialization_loop() {
 
     // 2. Serialize and encrypt metadata
     let raw_bytes = bincode::serialize(&original_metadata).unwrap();
-    let secure_buffer = Zeroizing::new(raw_bytes);
-    let (ciphertext, metadata_nonce) = crypto::encrypt_chunk(&unlocked_vault, &secure_buffer).unwrap();
-    let ciphertext_len = ciphertext.len() as u64;
+    let (ciphertext, metadata_nonce) = crypto::encrypt_chunk(&unlocked_vault, &raw_bytes).unwrap();
 
     // Simulate Tail-Based Architecture layout: 
-    // Chunks end at offset 8, so metadata begins at offset 8.
-    let payload_end_offset = 8u64; 
+    // Header size (8+32+24+48 = 112). Payload starts at 112. 
+    // In this mock, assume payload is empty and metadata starts right after header.
+    let payload_end_offset = 112u64; 
     
-    // Write the 8-byte master pointer at offset 0 pointing to metadata position (offset 8)
+    // Write the 8-byte master pointer at offset 0 pointing to metadata position
     file.write_all(&payload_end_offset.to_le_bytes()).unwrap();
 
-    // Write the encrypted metadata payload at the specified offset
+    // Write the encrypted metadata payload at the specified dynamic offset
     file.seek(SeekFrom::Start(payload_end_offset)).unwrap();
-    file.write_all(&ciphertext_len.to_le_bytes()).unwrap();
+    
+    // YENİ MİMARİ: Artık uzunluk byte'ı yazmıyoruz, doğrudan Nonce ve Ciphertext basıyoruz
     file.write_all(&metadata_nonce).unwrap();
     file.write_all(&ciphertext).unwrap();
 
@@ -74,15 +73,13 @@ fn test_bincode_vault_metadata_serialization_loop() {
 
     // Seek directly to the dynamic tail location using the parsed pointer
     file.seek(SeekFrom::Start(read_metadata_offset)).unwrap();
-    let mut len_bytes = [0u8; 8];
-    file.read_exact(&mut len_bytes).unwrap();
-    let read_cipher_len = u64::from_le_bytes(len_bytes) as usize;
-
+    
     let mut read_nonce = [0u8; crypto::XNONCE_LEN];
     file.read_exact(&mut read_nonce).unwrap();
 
-    let mut read_cipher_buffer = vec![0u8; read_cipher_len];
-    file.read_exact(&mut read_cipher_buffer).unwrap();
+    // YENİ MİMARİ: Uzunluk okumak yerine EOF (End Of File) gelene kadar tampona çekiyoruz
+    let mut read_cipher_buffer = Vec::new();
+    file.read_to_end(&mut read_cipher_buffer).unwrap();
 
     let decrypted_bytes = crypto::decrypt_chunk(&unlocked_vault, &read_cipher_buffer, &read_nonce).unwrap();
     let parsed_metadata: VaultMetadata = bincode::deserialize(&decrypted_bytes).unwrap();
@@ -98,7 +95,7 @@ fn test_bincode_vault_metadata_serialization_loop() {
 
 #[test]
 fn test_process_secure_chunk_callback_execution() {
-    let mut mem_file = MemFile::new("secure_chunk_test", 1024 * 1024).unwrap();
+    let test_file_path = "test_secure_chunk_io.bin";
     
     // Crypto Setup
     let salt = crypto::generate_32_bytes();
@@ -107,18 +104,26 @@ fn test_process_secure_chunk_callback_execution() {
     let (wrapped_dek, dek_nonce) = crypto::wrap_dek(&kek, &raw_dek).unwrap();
     let unlocked_vault = crypto::unwrap_dek(&kek, &wrapped_dek, &dek_nonce).unwrap();
 
-    // 1. Write encrypted dummy data to simulated RAM disk
+    // 1. Write encrypted dummy data to a PHYSICAL mock file 
+    // (Because process_secure_chunk now demands &mut std::fs::File for security boundaries)
     let raw_payload = b"SECRET_CHUNK_DATA";
-    let secure_buffer = Zeroizing::new(raw_payload.to_vec());
-    let (ciphertext, chunk_nonce) = crypto::encrypt_chunk(&unlocked_vault, &secure_buffer).unwrap();
+    let (ciphertext, chunk_nonce) = crypto::encrypt_chunk(&unlocked_vault, raw_payload).unwrap();
     
-    mem_file.write_all(&ciphertext).unwrap();
-    mem_file.seek(SeekFrom::Start(0)).unwrap();
+    let mut physical_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(test_file_path)
+        .unwrap();
+
+    physical_file.write_all(&ciphertext).unwrap();
+    physical_file.seek(SeekFrom::Start(0)).unwrap();
 
     // 2. Execute process_secure_chunk and capture decrypted plaintext inside closure
     let mut validated_data = Vec::new();
     process_secure_chunk(
-        &mut mem_file,
+        &mut physical_file,
         ciphertext.len(),
         &chunk_nonce,
         &unlocked_vault,
@@ -129,4 +134,6 @@ fn test_process_secure_chunk_callback_execution() {
 
     // 3. Assert callback executed successfully with correct context match
     assert_eq!(validated_data, raw_payload);
+
+    let _ = std::fs::remove_file(test_file_path);
 }
