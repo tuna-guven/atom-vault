@@ -1,215 +1,206 @@
-# Atom Vault: Secure Application-Level Virtual File System
+# Atom Vault
 
-Atom Vault is a security-focused Virtual File System (VFS) built on advanced Linux memory isolation mechanisms (`memfd_create`, `mmap`, `mlock`) and industry-standard cryptographic primitives (`Argon2id`, `XChaCha20-Poly1305`).
+Atom Vault is a secure, application-level Virtual File System (VFS) written in Rust. It provides hardware-level memory isolation, cryptographic shredding, and an interactive ephemeral shell while avoiding the security and complexity concerns associated with FUSE-based architectures.
 
-The system features a cryptographically isolated interactive shell (REPL) designed to prevent command history leakage and keep sensitive encryption keys protected exclusively in locked memory regions.
+## Core Features
 
----
-
-# Features
-
-* Secure vault creation with encrypted metadata headers
-* Argon2id-based master password key derivation
-* XChaCha20-Poly1305 authenticated encryption
-* Memory-locked cryptographic keys using `mlock`
-* Anonymous in-memory file operations using `memfd_create`
-* Automatic memory sanitization with secure zeroization
-* Chunk-based storage architecture
-* Interactive VFS shell (REPL)
-* Secure file import and export operations
-* Zero-trace file viewing without disk exposure
-* Anti-forensics protections against shell history leakage
+* Application-Level VFS with no FUSE dependencies.
+* Ephemeral Shell powered by `memfd_create` for RAM-only plaintext handling.
+* Strict memory sanitation through automatic buffer zeroization.
+* Cryptographic file shredding with instant metadata and key destruction.
+* Storage compaction through zero-crypto vacuum operations.
+* Dynamic tail-based vault architecture for efficient storage management.
+* Anti-forensics design preventing plaintext persistence on physical storage.
+* Secure virtual file import, export, and management capabilities.
 
 ---
 
-# End-to-End Testing Guide
-
-This guide demonstrates how to validate the complete security pipeline of Atom Vault, from vault creation to secure file destruction.
-
-## Step 1: Create a Sample File
-
-Prepare a plaintext file that will later be imported into the vault.
+## Build and Installation
 
 ```bash
-echo "Computer Engineering Virtual File System Project Success Message!" > secret_note.txt
+git clone https://github.com/YOUR_USERNAME/atom-vault.git
+cd atom-vault
+cargo build --release
 ```
 
 ---
 
-## Step 2: Create a New Encrypted Vault
+## Testing and Usage Scenarios
 
-Create a new vault container with an encrypted header and define the master password when prompted.
+The following scenarios demonstrate the complete lifecycle of the vault system and its security mechanisms.
+
+### Scenario 1: Vault Initialization
+
+Create a new vault container.
 
 ```bash
-./target/debug/atom create --vault-path vault.aegis --vault-name "Secure Storage"
+atom create --vault-name my_secure_vault
+```
+
+Expected Result:
+
+* A new vault file named `my_secure_vault.aegis` is created.
+* The user is prompted to define a master password.
+* The initial vault size consists only of the vault header and metadata structures.
+
+Verification:
+
+```bash
+ls -lh my_secure_vault.aegis
 ```
 
 ---
 
-## Step 3: Enter the Secure Vault Shell
+### Scenario 2: Entering the Ephemeral Shell and Importing Files
 
-Authenticate using the master password and enter the isolated VFS shell.
+Create a test file and import it into the vault.
 
 ```bash
-./target/debug/atom enter --vault-path vault.aegis
+echo "Top Secret VFS Architecture Data" > host_secret.txt
+dd if=/dev/zero bs=1M count=10 >> host_secret.txt 2>/dev/null
 ```
 
-Once authenticated, the Data Encryption Key (DEK) is securely loaded into locked memory.
+Enter the vault:
 
-Example prompt:
+```bash
+atom enter --vault-path my_secure_vault.aegis
+```
+
+Import the file:
 
 ```text
-atom-vault>
-```
-
----
-
-# Interactive Shell Operations
-
-After entering the vault, execute the following commands to verify functionality.
-
-## 1. List Vault Contents
-
-```bash
+atom-vault> import host_secret.txt isolated_secret.txt
 atom-vault> ls
 ```
 
-Since the vault is empty, no files should be displayed.
+Expected Result:
+
+* `isolated_secret.txt` appears in the virtual file table.
+* The encrypted payload is stored inside the vault container.
+* The physical vault file grows according to the imported content size.
 
 ---
 
-## 2. Import a File Into the Vault
+### Scenario 3: Volatile In-Memory Access
 
-Import and encrypt the file created earlier.
-
-```bash
-atom-vault> import secret_note.txt virtual_note.txt
-```
-
-During this process, the file is chunked, encrypted, and securely stored inside the vault.
-
----
-
-## 3. Verify Imported Files
-
-```bash
-atom-vault> ls
-```
-
-You should now see the imported virtual file along with its metadata.
-
----
-
-## 4. Zero-Trace Memory-Only Read Test
-
-This is one of Atom Vault's most important security features.
-
-Display file contents directly from anonymous memory without writing decrypted data to disk.
-
-```bash
-atom-vault> cat virtual_note.txt
-```
-
-Expected output:
+Display the file contents directly from the vault.
 
 ```text
-Computer Engineering Virtual File System Project Success Message!
+atom-vault> cat isolated_secret.txt
 ```
 
-The plaintext exists only in protected memory and is automatically destroyed afterward.
+Expected Result:
+
+* Plaintext is temporarily reconstructed in memory.
+* Data is processed through anonymous memory-backed file descriptors.
+* Internal buffers are wiped immediately after command completion.
+
+Verification:
+
+* No plaintext files are created on the host filesystem.
+* Data exists only during active command execution.
 
 ---
 
-## 5. Export a File
+### Scenario 4: Secure File Export
 
-Export and decrypt a file from the vault back to the host filesystem.
+Export the file back to the host operating system.
 
-```bash
-atom-vault> export virtual_note.txt exported_note.txt
+```text
+atom-vault> export isolated_secret.txt extracted_data.txt
 ```
 
-After leaving the shell, verify file integrity:
+Expected Result:
+
+* A file named `extracted_data.txt` is created.
+* Exported content matches the original imported file.
+
+Verification:
 
 ```bash
-cat exported_note.txt
+cat extracted_data.txt
 ```
 
 ---
 
-## 6. Remove a File
+### Scenario 5: Cryptographic Shredding
 
-Permanently remove file references and metadata mappings from the vault.
+Remove the file from the vault.
 
-```bash
-atom-vault> rm virtual_note.txt
-```
-
-Verify removal:
-
-```bash
+```text
+atom-vault> rm isolated_secret.txt
 atom-vault> ls
 ```
 
-The file should no longer appear in the vault.
+Expected Result:
+
+* The file disappears from the virtual file table.
+* Metadata references are destroyed.
+* Cryptographic material associated with the file is removed.
+
+Note:
+
+The physical vault size remains unchanged until compaction is performed.
 
 ---
 
-## 7. Secure Shutdown
+### Scenario 6: Storage Compaction
 
-Exit the vault shell.
+Reclaim unused vault space.
 
-```bash
+```text
+atom-vault> vacuum
+```
+
+Expected Result:
+
+* Dead storage regions are eliminated.
+* Active encrypted records are rewritten sequentially.
+* Unused physical space is removed.
+
+Exit the shell:
+
+```text
 atom-vault> exit
 ```
 
-All sensitive cryptographic material is securely wiped from memory before termination.
+Verification:
 
----
-
-# Security Architecture Validation
-
-## Anti-Forensics
-
-Commands executed within the Atom Vault shell are isolated from the host shell environment and are not written to standard shell history files such as:
-
-```text
-.bash_history
-.zsh_history
+```bash
+ls -lh my_secure_vault.aegis
 ```
 
-## Memory Isolation
-
-Sensitive cryptographic keys remain locked in RAM using Linux memory protection mechanisms and are protected against accidental swapping.
-
-## Zero-Trace File Viewing
-
-The `cat` command never writes decrypted data to disk. Files are reconstructed inside anonymous memory-backed objects and automatically destroyed after use.
-
-## Secure Memory Sanitization
-
-Sensitive buffers are securely erased using explicit zeroization techniques before memory deallocation.
-
-## Authenticated Encryption
-
-All stored file chunks are protected using authenticated encryption, ensuring both confidentiality and integrity.
+The vault size should return close to its original footprint if no active files remain.
 
 ---
 
-# Technology Stack
+## Automated Integration Testing
 
-* Rust
-* Linux Kernel APIs
+Run the complete vault lifecycle automatically.
 
-  * `memfd_create`
-  * `mmap`
-  * `mlock`
-* Argon2id
-* XChaCha20-Poly1305
-* Zeroize
-* Secure REPL Architecture
+```bash
+chmod +x integration_test.sh
+./integration_test.sh
+```
+
+The integration suite validates:
+
+* Vault creation
+* Authentication workflow
+* File import
+* File access
+* File export
+* Cryptographic deletion
+* Storage compaction
+* Data integrity checks
 
 ---
 
-# Project Goal
+## Security Design Summary
 
-Atom Vault was developed as an educational and research-oriented cybersecurity project to explore secure storage systems, memory-safe cryptographic engineering, and application-level virtual filesystem design on Linux platforms.
+* Plaintext never resides permanently on physical storage.
+* Memory buffers are automatically sanitized after use.
+* Cryptographic deletion removes access to protected data without expensive overwrite operations.
+* Dynamic vault growth eliminates fixed-size container limitations.
+* Storage compaction reclaims abandoned encrypted regions efficiently.
+* The entire architecture operates in user space without kernel-level filesystem dependencies.
