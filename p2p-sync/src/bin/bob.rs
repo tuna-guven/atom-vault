@@ -1,16 +1,17 @@
 use ed25519_dalek::SigningKey;
-use p2p_sync::{handshake, transport};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use p2p_sync::{
+    handshake,
+    sync::{ChunkEntry, FileIndex, SyncManager, VaultMetadata},
+    transport,
+};
+use std::collections::HashMap;
 use tokio::net::TcpListener;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 #[tokio::main]
 async fn main() {
-    // Hardcoded keys for testing
     let bob_key = SigningKey::from_bytes(&[2u8; 32]);
     let alice_pub = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
 
-    // Bind to local port 8080. The Tor daemon will forward traffic here.
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
     println!("🛡️ Bob's vault is listening on 127.0.0.1:8080...");
 
@@ -21,16 +22,28 @@ async fn main() {
         .await
         .expect("Handshake failed");
 
-    let (_control, mut inbound_rx) = transport::start_multiplexer(socket, session.transport, false);
-    
-    // Wait for Alice to open a multiplexed stream
-    let mut sync_stream = inbound_rx.recv().await.unwrap().compat();
-    
-    let mut buf = vec![0u8; 1024];
-    let n = sync_stream.read(&mut buf).await.unwrap();
-    println!("📩 Received: {}", String::from_utf8_lossy(&buf[..n]));
-    
-    sync_stream.write_all(b"LOUD AND CLEAR FROM BOB").await.unwrap();
-    sync_stream.flush().await.unwrap();
-    println!("✅ Reply sent. Test complete.");
+    let (control, inbound_rx) = transport::start_multiplexer(socket, session.transport, false);
+
+    // Provide Bob with one mock chunk that Alice is missing
+    let bob_nonce = [7u8; 24];
+    let mut bob_storage = HashMap::new();
+    bob_storage.insert(bob_nonce, b"BOB'S EXCLUSIVE ENCRYPTED CHUNK".to_vec());
+
+    let bob_metadata = VaultMetadata {
+        file_table: vec![FileIndex {
+            vfs_name: "bob_secret_notes.txt".to_string(),
+            chunks: vec![ChunkEntry {
+                cipher_len: 31,
+                offset: 8,
+                nonce: bob_nonce,
+            }],
+        }],
+    };
+
+    // The SyncManager starts its daemon automatically when instantiated
+    let _sync_manager = SyncManager::new(control, inbound_rx, bob_metadata, bob_storage);
+
+    println!("⏳ Waiting for remote peer to initiate sync...");
+    tokio::signal::ctrl_c().await.unwrap();
+    println!("✅ Bob shut down.");
 }

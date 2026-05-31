@@ -1,7 +1,8 @@
 mod cli;
 
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, FriendCommands};
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -9,6 +10,29 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use atom::chunker;
 use atom::crypto;
 use atom::vfs::{self, ChunkEntry, FileIndex, VaultMetadata};
+
+// --- FRIEND REGISTRY ---
+
+#[derive(Serialize, Deserialize, Debug)]
+struct FriendRecord {
+    nickname: String,
+    url: String, // Example: atom://rv3txodaq...onion
+}
+
+fn load_friends() -> Vec<FriendRecord> {
+    if let Ok(data) = std::fs::read_to_string("friends.json") {
+        serde_json::from_str(&data).unwrap_or_else(|_| Vec::new())
+    } else {
+        Vec::new()
+    }
+}
+
+fn save_friends(friends: &[FriendRecord]) {
+    let data = serde_json::to_string_pretty(friends).expect("Failed to serialize friends");
+    std::fs::write("friends.json", data).expect("Failed to write friends.json");
+}
+
+// --- VAULT METADATA LOGIC ---
 
 fn save_vault_metadata(
     physical_vault: &mut File,
@@ -26,7 +50,6 @@ fn save_vault_metadata(
         );
     }
 
-    // Format authenticated AEAD errors using Debug formatting {:?}
     let (ciphertext, metadata_nonce) = crypto::encrypt_chunk(unlocked_vault, &secure_buffer)
         .map_err(|e| {
             std::io::Error::new(
@@ -66,7 +89,6 @@ fn load_vault_metadata(
 ) -> Result<(VaultMetadata, u64), Box<dyn std::error::Error>> {
     let file_len = physical_vault.metadata()?.len();
 
-    // If completely fresh container file, initialize master allocation pointer right past offset 8
     if file_len < 8 {
         physical_vault.seek(SeekFrom::Start(0))?;
         physical_vault.write_all(&8u64.to_le_bytes())?;
@@ -78,13 +100,11 @@ fn load_vault_metadata(
         ));
     }
 
-    // Read the 8-byte pointer to locate tail-based metadata
     physical_vault.seek(SeekFrom::Start(0))?;
     let mut ptr_bytes = [0u8; 8];
     physical_vault.read_exact(&mut ptr_bytes)?;
     let metadata_offset = u64::from_le_bytes(ptr_bytes).max(8);
 
-    // Return empty table if the master pointer references space beyond current EOF bounds
     if metadata_offset >= file_len {
         return Ok((
             VaultMetadata {
@@ -94,7 +114,6 @@ fn load_vault_metadata(
         ));
     }
 
-    // Seek directly to the tail partition and parse out the layout structure
     physical_vault.seek(SeekFrom::Start(metadata_offset))?;
     let mut len_bytes = [0u8; 8];
     physical_vault.read_exact(&mut len_bytes)?;
@@ -128,7 +147,6 @@ fn load_vault_metadata(
         );
     }
 
-    // Return current structural layout and the exact offset where new chunks can be safely appended
     Ok((metadata, metadata_offset))
 }
 
@@ -155,6 +173,30 @@ fn main() {
         load_vault_metadata(&mut physical_vault, &unlocked_vault).unwrap();
 
     match args.command {
+        Commands::Id => {
+            println!("--- 🪪 Your Atom Identity ---");
+
+            // In a production app, this path would be relative to the user's config directory
+            // (e.g., ~/.config/atom-vault/hidden_service/hostname)
+            let hostname_path = "/tmp/tor_hidden_service/hostname";
+
+            match std::fs::read_to_string(hostname_path) {
+                Ok(onion) => {
+                    let onion = onion.trim();
+                    println!("🔗 Your Link : atom://{}", onion);
+                    println!("🔒 Status    : Tor Hidden Service Active");
+                    println!("\nShare your link securely with friends so they can add your vault!");
+                }
+                Err(_) => {
+                    println!("⚠️ Could not locate your Tor Hidden Service address.");
+                    println!(
+                        "Make sure your Tor daemon is running and the hidden service is configured at:"
+                    );
+                    println!("{}", hostname_path);
+                }
+            }
+        }
+
         Commands::Ls => {
             println!("--- Volatile VFS File Allocation Table ---");
             if metadata.file_table.is_empty() {
@@ -176,7 +218,6 @@ fn main() {
 
             let mut new_chunks = Vec::new();
 
-            // Seek directly to current payload end boundary to write fresh chunks over the old metadata location
             physical_vault
                 .seek(SeekFrom::Start(current_payload_offset))
                 .unwrap();
@@ -212,7 +253,6 @@ fn main() {
                     nonce: chunk_nonce,
                 });
 
-                // Advance track offset point linearly past the written encrypted block length
                 current_payload_offset += ciphertext.len() as u64;
             }
 
@@ -263,16 +303,6 @@ fn main() {
             println!(
                 "Vault successfully unlocked. Decrypted plaintext is live on virtual RAM disk."
             );
-
-            // Validate volatile mapping context inside active RAM pages
-            mounted_vfs.seek(SeekFrom::Start(0)).unwrap();
-            let mut ram_verification = vec![0u8; 30];
-            if mounted_vfs.read_exact(&mut ram_verification).is_ok() {
-                println!(
-                    "[Verification] Raw plaintext data read from volatile RAM: {:?}",
-                    String::from_utf8_lossy(&ram_verification)
-                );
-            }
         }
 
         Commands::Export { vfs_name, to_disk } => {
@@ -314,9 +344,6 @@ fn main() {
                 "[Wiping] Commencing SSD-Safe Crypto-Shredding for '{}'...",
                 vfs_name
             );
-
-            // Purge the file entry and corresponding nonces out of the Bincode allocation layout.
-            // Abandoned disk blocks become instant cryptographic noise, neutralizing FTL wear leveling vulnerabilities.
             if let Some(file_position) = metadata
                 .file_table
                 .iter()
@@ -336,6 +363,80 @@ fn main() {
                 );
             } else {
                 println!("Error: File '{}' not found in vault index.", vfs_name);
+            }
+        }
+
+        // --- NEW P2P CLI COMMANDS ---
+        Commands::Friend { command } => match command {
+            FriendCommands::Add { url, nickname } => {
+                let mut friends = load_friends();
+                if friends.iter().any(|f| f.nickname == nickname) {
+                    println!(
+                        "❌ A friend with the nickname '{}' already exists.",
+                        nickname
+                    );
+                    return;
+                }
+
+                friends.push(FriendRecord {
+                    nickname: nickname.clone(),
+                    url: url.clone(),
+                });
+                save_friends(&friends);
+                println!(
+                    "✅ Friend '{}' successfully added with URL: {}",
+                    nickname, url
+                );
+            }
+            FriendCommands::List => {
+                let friends = load_friends();
+                if friends.is_empty() {
+                    println!("No friends added yet. Use `atom friend add <url> <nickname>`.");
+                } else {
+                    println!("--- 📋 Connected Friends ---");
+                    for friend in friends {
+                        println!("👤 {:<15} 🔗 {}", friend.nickname, friend.url);
+                    }
+                }
+            }
+        },
+
+        Commands::Sync {
+            vault_path,
+            friend_nickname,
+        } => {
+            let friends = load_friends();
+            if let Some(friend) = friends.iter().find(|f| f.nickname == friend_nickname) {
+                println!(
+                    "🚀 Initiating P2P Sync for '{}' with '{}'...",
+                    vault_path, friend.nickname
+                );
+
+                // Parse the onion address out of the atom:// url
+                let onion_address = friend.url.trim_start_matches("atom://");
+                println!("🌐 Target Tor Hidden Service: {}", onion_address);
+
+                // Spin up a Tokio runtime *just* for the P2P networking lifecycle
+                // This keeps our main file I/O completely synchronous and blocks until sync is done!
+                let rt = tokio::runtime::Runtime::new().unwrap();
+
+                rt.block_on(async {
+                    println!("🧅 Bootstrapping Arti Tor client...");
+
+                    // TODO: Move the `arti_client::TorClient` and `SyncManager`
+                    // instantiation from `alice.rs` into this block.
+                    // Pass `metadata` and `physical_vault` references to it
+                    // so the engine can pull real chunks off the disk!
+
+                    println!("✅ Handing over control to the Multiplexer Daemon...");
+                });
+
+                println!("🎉 Sync sequence successfully concluded.");
+            } else {
+                println!(
+                    "❌ Friend '{}' not found. Use `atom friend list` to see your friends.",
+                    friend_nickname
+                );
             }
         }
     }
