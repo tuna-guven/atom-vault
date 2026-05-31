@@ -5,7 +5,7 @@ pub fn handle_enter(vault_path: String) -> Result<(), Box<dyn std::error::Error>
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(vault_path)?;
+        .open(&vault_path)?; 
 
     print!("Enter the password for vault: ");
     io::stdout().flush()?;
@@ -19,6 +19,7 @@ pub fn handle_enter(vault_path: String) -> Result<(), Box<dyn std::error::Error>
         &mut file,
         &unlocked_vault,
         current_payload_offset,
+        vault_path, 
     )?;
 
     Ok(())

@@ -6,3 +6,4 @@ pub mod import;
 pub mod rm;
 pub mod export;
 pub mod cat;
+pub mod vacuum;

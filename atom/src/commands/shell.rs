@@ -8,6 +8,7 @@ pub fn start_interactive_shell(
     physical_vault: &mut File,
     unlocked_vault: &UnlockedVault,
     mut current_payload_offset: u64,
+    vault_path: String, 
 ) -> Result<(), Box<dyn std::error::Error>> {
     
     println!("\n==================================================");
@@ -103,6 +104,15 @@ pub fn start_interactive_shell(
                     )?;
                 }
             }
+            "vacuum" => {
+                crate::commands::vacuum::handle_vacuum(
+                    &vault_path,
+                    metadata,
+                    physical_vault,
+                )?;
+                *physical_vault = File::options().read(true).write(true).open(&vault_path)?;
+                current_payload_offset = physical_vault.metadata()?.len();
+            }
             
             "help" => {
                 println!("\nAvailable Commands inside the Secure Shell:");
@@ -111,6 +121,7 @@ pub fn start_interactive_shell(
                 println!("  import <from_disk> <vfs_name>       - Encrypt and import a host file into the vault");
                 println!("  export <vfs_name> <to_disk>         - Decrypt and export a file back to the host disk");
                 println!("  rm <vfs_name>                       - Cryptographically shred a file reference from metadata");
+                println!("  vacuum                              - Defragment and shrink the physical .aegis container");
                 println!("  help                                - Show this help menu");
                 println!("  exit                                - Lock vault, purge cryptographic keys, and exit\n");
             }

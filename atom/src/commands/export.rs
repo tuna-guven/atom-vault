@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use crate::crypto::UnlockedVault;
 use crate::vfs::VaultMetadata;
+use zeroize::Zeroize;
 
 pub fn handle_export(
     vfs_name: String,
@@ -32,13 +33,15 @@ pub fn handle_export(
         let mut cipher_buffer = vec![0u8; chunk.cipher_len];
         physical_vault.read_exact(&mut cipher_buffer)?;
 
-        let decrypted_bytes = crate::crypto::decrypt_chunk(
+        let mut decrypted_bytes = crate::crypto::decrypt_chunk(
             unlocked_vault,
             &cipher_buffer,
             &chunk.nonce,
         ).map_err(|e| format!("Decryption error: {:?}", e))?;
 
         output_file.write_all(&decrypted_bytes)?;
+        
+        decrypted_bytes.zeroize();
     }
 
     println!("[Success] File '{}' successfully exported and decrypted.", vfs_name);

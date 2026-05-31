@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use crate::crypto::UnlockedVault;
 use crate::vfs::{VaultMetadata, MemFile};
+use zeroize::Zeroize;
 
 pub fn handle_cat(
     vfs_name: String,
@@ -51,6 +52,8 @@ pub fn handle_cat(
     println!("\n--- Start of {} ---", vfs_name);
     println!("{}", output);
     println!("--- End of {} ---\n", vfs_name);
+
+    buffer.zeroize();
 
     Ok(())
 }
