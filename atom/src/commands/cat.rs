@@ -1,8 +1,7 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use crate::crypto::UnlockedVault;
 use crate::vfs::{VaultMetadata, MemFile};
-use zeroize::Zeroize;
 
 pub fn handle_cat(
     vfs_name: String,
@@ -35,8 +34,11 @@ pub fn handle_cat(
             chunk.cipher_len,
             &chunk.nonce,
             unlocked_vault,
+            chunk.offset,
             |plaintext| {
-                let _ = memfile.write_all(plaintext);
+                if let Err(e) = memfile.write_all(plaintext) {
+                    eprintln!("[ERROR] Memory write failed during decryption: {:?}", e);
+                }
             },
         ).map_err(|e| format!("Chunk processing error: {:?}", e))?;
     }
@@ -44,16 +46,45 @@ pub fn handle_cat(
     let final_pos = memfile.seek(SeekFrom::Current(0))?;
     memfile.seek(SeekFrom::Start(0))?;
     
-    let mut buffer = vec![0u8; final_pos as usize];
-    memfile.read_exact(&mut buffer)?;
-    
-    let output = String::from_utf8_lossy(&buffer);
+    let mut buffer = zeroize::Zeroizing::new(vec![0u8; final_pos as usize]);
+    memfile.read_exact(&mut *buffer)?;
     
     println!("\n--- Start of {} ---", vfs_name);
-    println!("{}", output);
-    println!("--- End of {} ---\n", vfs_name);
+    let mut stdout = io::stdout().lock();
+    
+    let control_chars_count = buffer.iter().filter(|&&b| b < 32 && b != b'\n' && b != b'\t' && b != b'\r').count();
+    let is_probably_binary = control_chars_count > (buffer.len() / 100); // %1 eşiği
 
-    buffer.zeroize();
+    if is_probably_binary {
+        // Kullanıcı dostu bilgilendirme mesajı
+        let preview_len = std::cmp::min(buffer.len(), 64);
+        writeln!(stdout, "[Note: Binary or Null-padded data detected. Suppressing automated terminal flood.]")?;
+        write!(stdout, "First {} bytes (HEX Preview): ", preview_len)?;
+        for byte in &buffer[..preview_len] {
+            write!(stdout, "{:02X} ", byte)?;
+        }
+        writeln!(stdout)?;
+    } else if let Ok(text) = std::str::from_utf8(&buffer) {
+        // Eğer temiz bir metin dosyasıysa normal şekilde ve güvenle yazdır
+        for c in text.chars() {
+            if c.is_ascii_control() && c != '\n' && c != '\t' && c != '\r' {
+                let _ = write!(stdout, "\\x{:02X}", c as u8);
+            } else {
+                let _ = write!(stdout, "{}", c);
+            }
+        }
+    } else {
+        writeln!(stdout, "[Note: Non-UTF8 Binary file detected. Displaying sanitized HEX layout]")?;
+        for chunk in buffer.chunks(16) {
+            for byte in chunk {
+                let _ = write!(stdout, "{:02X} ", byte);
+            }
+            let _ = writeln!(stdout);
+        }
+    }
+    
+    let _ = stdout.flush();
+    println!("\n--- End of {} ---\n", vfs_name);
 
     Ok(())
 }

@@ -7,7 +7,7 @@ pub fn handle_rm(
     metadata: &mut VaultMetadata, 
     physical_vault: &mut File, 
     unlocked_vault: &UnlockedVault, 
-    current_payload_offset: u64
+    current_payload_offset: &mut u64
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "[Wiping] Commencing SSD-Safe Crypto-Shredding for '{}'...",
@@ -17,12 +17,15 @@ pub fn handle_rm(
     let to_be_removed_file_position = metadata.file_table.iter().position(|f| f.vfs_name == vfs_name);
     if let Some(index) = to_be_removed_file_position {
         metadata.file_table.remove(index);
+        
         crate::storage::save_vault_metadata(
             physical_vault,
             metadata,
             unlocked_vault,
-            current_payload_offset,
+            *current_payload_offset,
         )?;
+
+        physical_vault.sync_all()?;
     } else {
         println!("Error: File not found.")
     }

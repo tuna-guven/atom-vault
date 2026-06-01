@@ -16,19 +16,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Reason: {}", s);
         }
         eprintln!("Purging volatile process memory and enforcing immediate emergency exit.");
-        std::process::exit(1);
     }));
 
     // Parse command line arguments using our secure customized styling interface
     let args = Cli::parse();
 
-    // Route system execution to targeted asynchronous sub-command handlers
-    match args.command {
-        Commands::Create { vault_path, vault_name } => {
-            commands::create::handle_create(vault_path, vault_name)?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Route system execution to targeted synchronous sub-command handlers
+        match args.command {
+            Commands::Create { vault_path, vault_name } => {
+                commands::create::handle_create(vault_path, vault_name)
+            }
+            Commands::Enter { vault_path } => {
+                commands::enter::handle_enter(vault_path)
+            }
         }
-        Commands::Enter { vault_path } => {
-            commands::enter::handle_enter(vault_path)?;
+    }));
+
+    match result {
+        Ok(sub_command_result) => {
+            sub_command_result?;
+        }
+        Err(_) => {
+            eprintln!("[FATAL] Process memory safely purged via unwinding. Emergency exit enforced.");
+            std::process::exit(1);
         }
     }
 

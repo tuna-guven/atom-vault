@@ -11,9 +11,13 @@ pub fn handle_import(
     unlocked_vault: &UnlockedVault, 
     current_payload_offset: &mut u64
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if metadata.file_table.iter().any(|f| f.vfs_name == vfs_name) {
+        return Err(format!("Error: A file named '{}' already exists in the vault.", vfs_name).into());
+    }
+
     let mut file = File::open(from_disk)?;
     
-    let chunk_boundaries: Vec<fastcdc::v2020::ChunkData> = crate::chunker::chunk_data(&mut file)
+    let chunk_boundaries: Vec<fastcdc::v2020::ChunkData> = crate::chunker::chunk_data(&mut file, &metadata.cdc_salt)
         .collect::<Result<Vec<_>, _>>()?;
         
     let mut new_chunks = Vec::new();
@@ -27,16 +31,26 @@ pub fn handle_import(
         file.read_exact(&mut secure_buffer)?;
         
         unsafe {
-            libc::mlock(
-                secure_buffer.as_ptr() as *const libc::c_void,
-                chunk_info.length,
-            );
+            if libc::mlock(secure_buffer.as_ptr() as *const libc::c_void, chunk_info.length) != 0 {
+                return Err(Box::new(std::io::Error::last_os_error()));
+            }
         }
         
-        let (ciphertext, chunk_nonce) = crypto::encrypt_chunk(&unlocked_vault, &secure_buffer)
-            .map_err(|e| format!("Encryption error: {:?}", e))?;
+        let encryption_result = crypto::encrypt_chunk(&unlocked_vault, &secure_buffer, *current_payload_offset)
+            .map_err(|e| format!("Encryption error: {:?}", e));
+
+        let (ciphertext, chunk_nonce) = match encryption_result {
+            Ok(data) => data,
+            Err(e) => {
+                unsafe { libc::munlock(secure_buffer.as_ptr() as *const libc::c_void, chunk_info.length); }
+                return Err(e.into());
+            }
+        };
             
-        physical_vault.write_all(&ciphertext)?;
+        if let Err(e) = physical_vault.write_all(&ciphertext) {
+            unsafe { libc::munlock(secure_buffer.as_ptr() as *const libc::c_void, chunk_info.length); }
+            return Err(e.into());
+        }
         
         unsafe {
             libc::munlock(
@@ -65,6 +79,8 @@ pub fn handle_import(
         unlocked_vault,
         *current_payload_offset,
     )?;
+    
+    physical_vault.sync_all()?;
     
     println!("Import completed. Tail-based metadata map serialized and pointer updated.");
     Ok(())

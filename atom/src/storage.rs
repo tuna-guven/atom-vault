@@ -34,12 +34,13 @@ pub fn load_vault_metadata(
     file.read_exact(&mut metadata_nonce)?;
 
     let mut encrypted_metadata = Vec::new();
-    file.read_to_end(&mut encrypted_metadata)?;
+    file.take(10 * 1024 * 1024).read_to_end(&mut encrypted_metadata)?;
 
     let decrypted_metadata_bytes = crate::crypto::decrypt_chunk(
         &unlocked_vault,
         &encrypted_metadata,
         &metadata_nonce,
+        master_pointer,
     ).map_err(|e| format!("Metadata decrypt error: {:?}", e))?;
 
     let metadata: VaultMetadata = bincode::deserialize(&decrypted_metadata_bytes)?;
@@ -58,18 +59,19 @@ pub fn save_vault_metadata(
     let (encrypted_metadata, metadata_nonce) = crate::crypto::encrypt_chunk(
         unlocked_vault,
         &serialized_metadata,
+        current_payload_offset,
     ).map_err(|e| format!("Metadata encrypt error: {:?}", e))?;
 
     file.seek(SeekFrom::Start(current_payload_offset))?;
     
     file.write_all(&metadata_nonce)?;
     file.write_all(&encrypted_metadata)?;
-    
-    let total_written = metadata_nonce.len() + encrypted_metadata.len();
-    file.set_len(current_payload_offset + total_written as u64)?;
 
+    file.sync_data()?;
+    
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&current_payload_offset.to_le_bytes())?;
-
+    file.sync_all()?;
+    
     Ok(())
 }

@@ -4,6 +4,7 @@ use std::io::{ Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind
 use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
 use nix::unistd::{ftruncate, lseek, Whence};
 use serde::{Serialize, Deserialize};
+use zeroize::Zeroize;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChunkEntry {
@@ -22,6 +23,7 @@ pub struct FileIndex {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VaultMetadata {
     pub file_table: Vec<FileIndex>,
+    pub cdc_salt: [u8; 32],
 }
 
 pub fn process_secure_chunk<F>(
@@ -29,26 +31,39 @@ pub fn process_secure_chunk<F>(
     cipher_len: usize,
     nonce: &[u8; crate::crypto::XNONCE_LEN],
     unlocked_vault: &crate::crypto::UnlockedVault,
+    chunk_offset: u64,
     action: F,   
 ) -> std::io::Result<()> where F: FnOnce(&[u8]), {
     let mut cipher_buffer = vec![0u8; cipher_len];
     physical_vault.read_exact(&mut cipher_buffer)?;
 
-    let secure_plaintext = crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce)
+    let mut secure_plaintext = crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce, chunk_offset)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Decryption error: {:?}", e)))?;
     
-    unsafe {
-        libc::mlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len());
+    let mlock_result = unsafe {
+        libc::mlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len())
+    };
+    if mlock_result != 0 {
+        return Err(std::io::Error::last_os_error());
     }
 
-    action(&secure_plaintext);
+    let action_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        action(&secure_plaintext);
+    }));
+
+    secure_plaintext.zeroize();
 
     unsafe {
         libc::munlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len());
     }
 
+    if let Err(err) = action_result {
+        std::panic::resume_unwind(err);
+    }
+
     Ok(())
 }
+
 
 pub struct MemFile {
     fd: OwnedFd,
@@ -61,8 +76,9 @@ impl MemFile {
         let vault_name = CString::new(vault_name)?;
 
         // we want from linux to create an empty file for us
-        let fd = memfd_create(&vault_name, MemFdCreateFlag::MFD_CLOEXEC)?;
-        
+        let flags = MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING;
+        let fd = memfd_create(&vault_name, flags)?;
+
         // we want vault to be fixed size
         ftruncate(&fd, vault_size as i64)?;
 
@@ -81,7 +97,14 @@ impl MemFile {
             return Err(Box::new(std::io::Error::last_os_error()));
         }
 
-        // FIX: Struct'tan sildiğimiz alanları constructor'dan da temizledik
+        unsafe {
+            libc::fcntl(
+                fd.as_raw_fd(),
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL
+            );
+        }
+
         Ok(Self { 
             fd, 
             fixed_size: vault_size,
@@ -93,6 +116,7 @@ impl MemFile {
 impl Drop for MemFile {
     fn drop(&mut self) {
         unsafe {
+            self.memory_ptr.as_ptr().write_bytes(0, self.fixed_size);
             libc::munmap(self.memory_ptr.as_ptr(), self.fixed_size);
         }
     }

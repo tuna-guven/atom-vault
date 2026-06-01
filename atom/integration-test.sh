@@ -33,7 +33,6 @@ echo -e "Initial Empty Vault Size: ${BLUE}$INITIAL_SIZE bytes${NC}"
 echo -e "\n${YELLOW}[Step 3] Firing up Ephemeral REPL Shell Execution Loop...${NC}"
 
 ./target/debug/atom enter --vault-path test_vault.aegis <<-'EOF'
-securepassword123
 import secret_input.txt vfs_file.txt
 ls
 cat vfs_file.txt

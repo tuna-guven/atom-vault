@@ -20,7 +20,7 @@ pub fn start_interactive_shell(
         print!("atom-vault> ");
         io::stdout().flush()?;
         
-        let mut input = String::new();
+        let mut input = zeroize::Zeroizing::new(String::new());
         io::stdin().read_line(&mut input)?;
         
         let trimmed_input = input.trim();
@@ -66,7 +66,7 @@ pub fn start_interactive_shell(
                         metadata,
                         physical_vault,
                         unlocked_vault,
-                        current_payload_offset,
+                        &mut current_payload_offset,
                     )?;
                 }
             }
@@ -133,7 +133,11 @@ pub fn start_interactive_shell(
             }
             
             _ => {
-                println!("Unknown command: '{}'. Type 'help' for available commands.", parts[0]);
+                let sanitized_name: String = parts[0]
+                    .chars()
+                    .map(|c| if c.is_ascii_control() { '?' } else { c })
+                    .collect();
+                println!("Unknown command: '{}'. Type 'help' for available commands.", sanitized_name);
             }
         }
     }
