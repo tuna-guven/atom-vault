@@ -28,47 +28,27 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Create a new, empty secure vault container file
+    Create {
+        #[arg(long, default_value = ".")]
+        vault_path: String,
+
+        #[arg(long, value_parser = parse_vault_name)]
+        vault_name: String,
+    },
+
+    /// Unlock a vault and enter its cryptographically isolated interactive shell
+    Enter {
+        #[arg(long, default_value = "my_data.aegis", value_parser = parse_vault_path)]
+        vault_path: String,
+    },
+
+    // --- P2P PROTOCOL COMMANDS ---
     /// Show your own Atom ID and connection link to share with friends
     Id,
 
+    /// Start the embedded Tor background daemon
     Daemon,
-
-    /// List all files currently mounted inside the vault
-    Ls,
-
-    /// Import a physical file from hard disk into the secure vault (Ingress)
-    Import {
-        /// Path to the local file on your hard disk
-        #[arg(long)]
-        from_disk: String,
-
-        /// Target name inside the secure VFS
-        #[arg(long, value_parser = parse_vault_name)]
-        vfs_name: String,
-    },
-
-    /// Unlock a vault and mount it to volatile memory layout
-    Unlock {
-        /// Path to the .aegis vault file on disk
-        #[arg(long, default_value = "my_data.aegis")]
-        path: String,
-    },
-
-    /// Export a file from the secure vault back to the local hard disk (Egress)
-    Export {
-        /// Name of the file inside the VFS
-        #[arg(long)]
-        vfs_name: String,
-
-        /// Target path on the local hard disk
-        #[arg(long)]
-        to_disk: String,
-    },
-
-    /// Securely wipe a file from the vault
-    Rm {
-        vfs_name: String,
-    },
 
     /// Manage P2P connections and friends
     Friend {
@@ -83,7 +63,8 @@ pub enum Commands {
             value_name = "VAULT_PATH",
             required = true,
             index = 1,
-            default_value = "my_data.aegis"
+            default_value = "my_data.aegis",
+            value_parser = parse_vault_path
         )]
         vault_path: String,
 
@@ -95,7 +76,7 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum FriendCommands {
-    /// Add a new friend using their atom:// link
+    /// Add or update a friend using their atom:// link
     Add {
         /// The connection link provided by your friend (must start with atom://)
         #[arg(value_parser = parse_atom_url)]
@@ -112,11 +93,29 @@ pub enum FriendCommands {
 // --- Validators ---
 
 fn parse_vault_name(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("Vault name cannot be empty".to_string());
+    }
     if s.len() > 32 {
         return Err("Vault name cannot exceed 32 characters".to_string());
     }
     if !s.is_ascii() {
-        return Err("Vault name must contain only ASCII characters".to_string());
+        return Err("Vault name must contain only ASCII".to_string());
+    }
+    if s.chars()
+        .any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    {
+        return Err("Vault name can only contain alphanumeric characters, _, or -".to_string());
+    }
+    Ok(s.to_string())
+}
+
+fn parse_vault_path(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err("Vault path cannot be empty".to_string());
+    }
+    if s.len() > 4096 {
+        return Err("Vault path is too long".to_string());
     }
     Ok(s.to_string())
 }

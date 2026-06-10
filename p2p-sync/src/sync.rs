@@ -28,6 +28,7 @@ pub struct FileIndex {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct VaultMetadata {
     pub file_table: Vec<FileIndex>,
+    pub cdc_salt: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize, Debug)]

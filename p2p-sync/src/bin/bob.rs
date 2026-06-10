@@ -47,6 +47,7 @@ async fn main() {
                 nonce: bob_nonce,
             }],
         }],
+        cdc_salt: [0u8; 32],
     };
 
     // The SyncManager starts its daemon automatically when instantiated

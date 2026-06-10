@@ -87,6 +87,7 @@ async fn main() {
                 },
             ],
         }],
+        cdc_salt: [0u8; 32],
     };
 
     let vault_path = std::path::PathBuf::from("mock_test_vault.aegis");
