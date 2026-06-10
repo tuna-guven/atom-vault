@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use yamux::{Config, Connection, Mode, Stream};
+use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub struct Control {
@@ -41,11 +42,21 @@ where
     let transport_arc = Arc::new(Mutex::new(transport));
     let transport_inbound = transport_arc.clone();
 
+    // =========================================================================
+    // BACKGROUND TASK 1: OUTBOUND PUMP (Yamux -> Tor Network)
+    // =========================================================================
     tokio::spawn(async move {
-        let mut plain_buf = vec![0u8; 65000];
+        // SECURE: Wrap plaintext in Zeroizing. Ciphertext is public and doesn't need wrapping.
+        let mut plain_buf = Zeroizing::new(vec![0u8; 65000]);
         let mut cipher_buf = vec![0u8; 65535];
+
+        // SECURE: Pin the plaintext buffer to physical RAM, preventing OS swap leakage
+        unsafe {
+            libc::mlock(plain_buf.as_ptr() as *const libc::c_void, plain_buf.len());
+        }
+
         loop {
-            let n = match router_rx.read(&mut plain_buf).await {
+            let n = match router_rx.read(&mut *plain_buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
@@ -67,11 +78,27 @@ where
                 break;
             }
         }
+
+        // SECURE: Unpin the memory so OS can reclaim it.
+        // Zeroizing will automatically wipe the bytes when `plain_buf` drops.
+        unsafe {
+            libc::munlock(plain_buf.as_ptr() as *const libc::c_void, plain_buf.len());
+        }
     });
 
+    // =========================================================================
+    // BACKGROUND TASK 2: INBOUND PUMP (Tor Network -> Yamux)
+    // =========================================================================
     tokio::spawn(async move {
         let mut cipher_buf = vec![0u8; 65535];
-        let mut plain_buf = vec![0u8; 65535];
+        // SECURE: Use Zeroizing to contain decrypted cleartext from the peer
+        let mut plain_buf = Zeroizing::new(vec![0u8; 65535]);
+
+        // SECURE: Pin the receiving buffer to physical RAM
+        unsafe {
+            libc::mlock(plain_buf.as_ptr() as *const libc::c_void, plain_buf.len());
+        }
+
         loop {
             let cipher_len = match tcp_rx.read_u16().await {
                 Ok(len) => len as usize,
@@ -87,7 +114,7 @@ where
             }
 
             let mut ts = transport_inbound.lock().await;
-            let plain_len = match ts.read_message(&cipher_buf[..cipher_len], &mut plain_buf) {
+            let plain_len = match ts.read_message(&cipher_buf[..cipher_len], &mut *plain_buf) {
                 Ok(len) => len,
                 Err(_) => break,
             };
@@ -96,6 +123,11 @@ where
             if router_tx.write_all(&plain_buf[..plain_len]).await.is_err() {
                 break;
             }
+        }
+
+        // SECURE: Safely release the pinned memory right before Zeroizing destruction
+        unsafe {
+            libc::munlock(plain_buf.as_ptr() as *const libc::c_void, plain_buf.len());
         }
     });
 
@@ -115,8 +147,6 @@ where
         let mut pending_opens: VecDeque<oneshot::Sender<Result<Stream, yamux::ConnectionError>>> =
             VecDeque::new();
 
-        // THE FIX: Pure, blocking poll_fn.
-        // Wakers are perfectly preserved and Yamux will pull data instantly.
         poll_fn(|cx| {
             while let Poll::Ready(Some(reply_tx)) = control_rx.poll_recv(cx) {
                 pending_opens.push_back(reply_tx);

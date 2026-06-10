@@ -1,11 +1,13 @@
 use crate::transport::Control;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use yamux::Stream;
+use zeroize::Zeroizing;
 
 type SyncResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -19,6 +21,7 @@ pub struct ChunkEntry {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct FileIndex {
     pub vfs_name: String,
+    pub last_modified_unix: u64, // Vector clock for conflict resolution
     pub chunks: Vec<ChunkEntry>,
 }
 
@@ -42,9 +45,9 @@ pub enum SyncMessage {
 #[derive(Clone)]
 pub struct SyncManager {
     control: Control,
-    local_metadata: Arc<VaultMetadata>,
-    #[allow(dead_code)]
-    local_storage: Arc<HashMap<[u8; 24], Vec<u8>>>,
+    pub local_metadata: Arc<RwLock<VaultMetadata>>,
+    pub vault_path: PathBuf,
+    pub write_lock: Arc<Mutex<()>>, // Crucial: Prevents concurrent downloads from corrupting SSD file appends
 }
 
 impl SyncManager {
@@ -52,14 +55,15 @@ impl SyncManager {
         control: Control,
         mut inbound_rx: mpsc::Receiver<Stream>,
         local_metadata: VaultMetadata,
-        local_storage: HashMap<[u8; 24], Vec<u8>>,
+        vault_path: PathBuf,
     ) -> Self {
-        let local_metadata = Arc::new(local_metadata);
-        let local_storage = Arc::new(local_storage);
-        let control_clone = control.clone();
+        let local_metadata = Arc::new(RwLock::new(local_metadata));
+        let write_lock = Arc::new(Mutex::new(()));
 
+        let control_clone = control.clone();
         let meta_clone = local_metadata.clone();
-        let storage_clone = local_storage.clone();
+        let path_clone = vault_path.clone();
+        let lock_clone = write_lock.clone();
 
         tokio::spawn(async move {
             println!("🎧 [Listener] Background daemon active. Waiting for incoming streams...");
@@ -68,130 +72,188 @@ impl SyncManager {
                 println!("🔌 [Listener] New inbound Yamux stream received from multiplexer!");
                 let mut tokio_stream = stream.compat();
                 let meta = meta_clone.clone();
-                let storage = storage_clone.clone();
                 let ctrl = control_clone.clone();
+                let path = path_clone.clone();
+                let w_lock = lock_clone.clone();
 
                 tokio::spawn(async move {
-                    println!("📥 [Listener] Waiting to read message on new stream...");
+                    if let Ok(msg) = Self::recv_msg(&mut tokio_stream).await {
+                        match msg {
+                            SyncMessage::MetadataExchange(remote_meta) => {
+                                println!(
+                                    "🔄 [Listener] Remote metadata received! Sending local reply..."
+                                );
 
-                    let msg_result = Self::recv_msg(&mut tokio_stream).await;
+                                let meta_guard = meta.read().await;
+                                let reply = SyncMessage::MetadataExchange((*meta_guard).clone());
+                                let _ = Self::send_msg(&mut tokio_stream, &reply).await;
 
-                    match msg_result {
-                        Ok(msg) => {
-                            println!("✅ [Listener] Message successfully decoded!");
-                            match msg {
-                                SyncMessage::MetadataExchange(remote_meta) => {
-                                    println!(
-                                        "🔄 [Listener] Remote metadata received! Sending local reply..."
-                                    );
-                                    let reply = SyncMessage::MetadataExchange((*meta).clone());
+                                let mut missing_chunks_info = Vec::new();
+                                for remote_file in &remote_meta.file_table {
+                                    let local_file_opt = meta_guard
+                                        .file_table
+                                        .iter()
+                                        .find(|f| f.vfs_name == remote_file.vfs_name);
 
-                                    if let Err(e) = Self::send_msg(&mut tokio_stream, &reply).await
-                                    {
-                                        println!(
-                                            "❌ [Listener] Failed to send metadata reply: {}",
-                                            e
-                                        );
-                                    } else {
-                                        println!("✅ [Listener] Local metadata reply sent!");
-                                    }
+                                    let is_newer = local_file_opt.map_or(true, |f| {
+                                        remote_file.last_modified_unix > f.last_modified_unix
+                                    });
 
-                                    let mut missing_nonces = Vec::new();
-                                    for remote_file in &remote_meta.file_table {
-                                        let local_file_opt = meta
-                                            .file_table
-                                            .iter()
-                                            .find(|f| f.vfs_name == remote_file.vfs_name);
+                                    if is_newer {
                                         for remote_chunk in &remote_file.chunks {
-                                            let chunk_exists_locally =
-                                                local_file_opt.map_or(false, |f| {
-                                                    f.chunks
-                                                        .iter()
-                                                        .any(|c| c.nonce == remote_chunk.nonce)
-                                                });
-                                            if !chunk_exists_locally {
-                                                missing_nonces.push(remote_chunk.nonce);
+                                            let chunk_exists = local_file_opt.map_or(false, |f| {
+                                                f.chunks
+                                                    .iter()
+                                                    .any(|c| c.nonce == remote_chunk.nonce)
+                                            });
+                                            if !chunk_exists {
+                                                missing_chunks_info.push((
+                                                    remote_chunk.nonce,
+                                                    remote_file.vfs_name.clone(),
+                                                    remote_file.last_modified_unix,
+                                                ));
                                             }
                                         }
                                     }
+                                }
+                                drop(meta_guard); // Free lock early so UI can keep using vault
 
-                                    if !missing_nonces.is_empty() {
-                                        println!(
-                                            "📦 [Listener] Identified {} missing chunks. Requesting...",
-                                            missing_nonces.len()
-                                        );
-                                        for nonce in missing_nonces {
-                                            let c = ctrl.clone();
-                                            tokio::spawn(async move {
-                                                let chunk_stream = match c.open_stream().await {
-                                                    Ok(s) => s,
-                                                    Err(e) => {
-                                                        println!(
-                                                            "❌ [Listener] Failed to open sub-stream for chunk: {}",
-                                                            e
-                                                        );
-                                                        return;
-                                                    }
-                                                };
+                                if !missing_chunks_info.is_empty() {
+                                    println!(
+                                        "📦 [Listener] Identified {} missing chunks. Requesting...",
+                                        missing_chunks_info.len()
+                                    );
+                                    let semaphore = Arc::new(Semaphore::new(50));
 
-                                                let mut chunk_stream = chunk_stream.compat();
+                                    for (nonce, vfs_name, last_mod) in missing_chunks_info {
+                                        let c = ctrl.clone();
+                                        let permit =
+                                            semaphore.clone().acquire_owned().await.unwrap();
+                                        let p = path.clone();
+                                        let l = w_lock.clone();
+                                        let m = meta.clone();
+
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            if let Ok(s) = c.open_stream().await {
+                                                let mut chunk_stream = s.compat();
                                                 let _ = Self::send_msg(
                                                     &mut chunk_stream,
                                                     &SyncMessage::ChunkRequest { nonce },
                                                 )
                                                 .await;
 
-                                                match Self::recv_msg(&mut chunk_stream).await {
-                                                    Ok(SyncMessage::ChunkTransfer {
-                                                        ciphertext,
-                                                        ..
-                                                    }) => {
-                                                        println!(
-                                                            "📥 [Listener] Received chunk ({} bytes)",
-                                                            ciphertext.len()
-                                                        );
+                                                if let Ok(Ok(SyncMessage::ChunkTransfer {
+                                                    ciphertext,
+                                                    ..
+                                                })) = tokio::time::timeout(
+                                                    std::time::Duration::from_secs(60),
+                                                    Self::recv_msg(&mut chunk_stream),
+                                                )
+                                                .await
+                                                {
+                                                    println!(
+                                                        "📥 [Listener] Received chunk ({} bytes). Writing to disk...",
+                                                        ciphertext.len()
+                                                    );
+
+                                                    // DISK I/O: Append securely to EOF
+                                                    let _guard = l.lock().await;
+                                                    if let Ok(mut file) = OpenOptions::new()
+                                                        .write(true)
+                                                        .append(true)
+                                                        .create(true)
+                                                        .open(&p)
+                                                        .await
+                                                    {
+                                                        if let Ok(offset) = file
+                                                            .seek(std::io::SeekFrom::End(0))
+                                                            .await
+                                                        {
+                                                            if file
+                                                                .write_all(&ciphertext)
+                                                                .await
+                                                                .is_ok()
+                                                                && file.sync_all().await.is_ok()
+                                                            {
+                                                                // Update RAM Metadata
+                                                                let mut mg = m.write().await;
+                                                                if let Some(f) =
+                                                                    mg.file_table.iter_mut().find(
+                                                                        |f| f.vfs_name == vfs_name,
+                                                                    )
+                                                                {
+                                                                    f.last_modified_unix = last_mod;
+                                                                    f.chunks.push(ChunkEntry {
+                                                                        cipher_len: ciphertext
+                                                                            .len(),
+                                                                        offset,
+                                                                        nonce,
+                                                                    });
+                                                                } else {
+                                                                    mg.file_table.push(FileIndex {
+                                                                        vfs_name: vfs_name.clone(),
+                                                                        last_modified_unix:
+                                                                            last_mod,
+                                                                        chunks: vec![ChunkEntry {
+                                                                            cipher_len: ciphertext
+                                                                                .len(),
+                                                                            offset,
+                                                                            nonce,
+                                                                        }],
+                                                                    });
+                                                                }
+                                                            }
+                                                        }
                                                     }
-                                                    Ok(_) => println!(
-                                                        "❌ [Listener] Expected ChunkTransfer, got different message."
-                                                    ),
-                                                    Err(e) => println!(
-                                                        "❌ [Listener] Failed to receive chunk transfer: {}",
-                                                        e
-                                                    ),
                                                 }
-                                            });
-                                        }
-                                    } else {
-                                        println!(
-                                            "🚀 [Listener] No missing chunks identified. Fully synced."
-                                        );
+                                            }
+                                        });
                                     }
-                                }
-                                SyncMessage::ChunkRequest { nonce } => {
+                                } else {
                                     println!(
-                                        "📦 [Listener] Remote requested a chunk. Sending payload..."
+                                        "🚀 [Listener] No missing chunks identified. Fully synced."
                                     );
-                                    if let Some(ciphertext) = storage.get(&nonce) {
-                                        let reply = SyncMessage::ChunkTransfer {
-                                            nonce,
-                                            ciphertext: ciphertext.clone(),
-                                        };
-                                        if let Err(e) =
-                                            Self::send_msg(&mut tokio_stream, &reply).await
-                                        {
-                                            println!("❌ [Listener] Failed to upload chunk: {}", e);
+                                }
+                            }
+                            SyncMessage::ChunkRequest { nonce } => {
+                                // DISK I/O: Find chunk offset in metadata and stream directly from SSD
+                                println!(
+                                    "📦 [Listener] Remote requested chunk. Reading from disk..."
+                                );
+                                let meta_guard = meta.read().await;
+                                let mut chunk_info = None;
+                                for f in &meta_guard.file_table {
+                                    for c in &f.chunks {
+                                        if c.nonce == nonce {
+                                            chunk_info = Some((c.offset, c.cipher_len));
+                                            break;
                                         }
-                                    } else {
-                                        println!(
-                                            "❌ [Listener] Remote requested a chunk we don't have!"
-                                        );
+                                    }
+                                    if chunk_info.is_some() {
+                                        break;
                                     }
                                 }
-                                _ => println!("⚠️ [Listener] Received unexpected message type"),
+                                drop(meta_guard);
+
+                                if let Some((offset, cipher_len)) = chunk_info {
+                                    if let Ok(mut file) = File::open(&path).await {
+                                        if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok()
+                                        {
+                                            let mut buffer = vec![0u8; cipher_len];
+                                            if file.read_exact(&mut buffer).await.is_ok() {
+                                                let reply = SyncMessage::ChunkTransfer {
+                                                    nonce,
+                                                    ciphertext: buffer,
+                                                };
+                                                let _ =
+                                                    Self::send_msg(&mut tokio_stream, &reply).await;
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        }
-                        Err(e) => {
-                            println!("❌ [Listener] Task died! Failed to receive message: {}", e);
+                            _ => {}
                         }
                     }
                 });
@@ -204,7 +266,8 @@ impl SyncManager {
         Self {
             control,
             local_metadata,
-            local_storage,
+            vault_path,
+            write_lock,
         }
     }
 
@@ -212,15 +275,17 @@ impl SyncManager {
         stream: &mut S,
         msg: &SyncMessage,
     ) -> SyncResult<()> {
-        let bytes = bincode::serialize(msg)
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+        let bytes = Zeroizing::new(
+            bincode::serialize(msg)
+                .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?,
+        );
         let len = bytes.len() as u32;
 
-        let mut payload = Vec::with_capacity(4 + bytes.len());
+        let mut payload = Zeroizing::new(Vec::with_capacity(4 + bytes.len()));
         payload.extend_from_slice(&len.to_le_bytes());
         payload.extend_from_slice(&bytes);
 
-        stream.write_all(&payload).await?;
+        stream.write_all(&*payload).await?;
         stream.flush().await?;
 
         Ok(())
@@ -231,8 +296,16 @@ impl SyncManager {
         stream.read_exact(&mut len_buf).await?;
         let len = u32::from_le_bytes(len_buf) as usize;
 
-        let mut data_buf = vec![0u8; len];
-        stream.read_exact(&mut data_buf).await?;
+        const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
+        if len > MAX_PAYLOAD_SIZE {
+            return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "Payload exceeds safe memory limits: {} bytes",
+                len
+            )));
+        }
+
+        let mut data_buf = Zeroizing::new(vec![0u8; len]);
+        stream.read_exact(&mut *data_buf).await?;
 
         let msg = bincode::deserialize(&data_buf)
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
@@ -244,132 +317,154 @@ impl SyncManager {
         let control = self.control.clone();
 
         println!("⏳ [Dialer] Requesting new Yamux stream allocation...");
-        let mut meta_stream = match control.open_stream().await {
-            Ok(s) => {
-                println!("✅ [Dialer] Yamux stream successfully allocated!");
-                s.compat()
-            }
-            Err(e) => {
-                return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "Yamux open_stream error: {}",
-                    e
-                )));
-            }
-        };
+        let mut meta_stream = control.open_stream().await?.compat();
 
         println!("⏳ [Dialer] Sending local metadata payload...");
+        let meta_guard = self.local_metadata.read().await;
         Self::send_msg(
             &mut meta_stream,
-            &SyncMessage::MetadataExchange((*self.local_metadata).clone()),
+            &SyncMessage::MetadataExchange((*meta_guard).clone()),
         )
         .await?;
+        drop(meta_guard);
+
         println!("✅ [Dialer] Local metadata sent! Awaiting Bob's reply (60s Tor wait limit)...");
 
-        // The 60 second timeout accounts for Tor's multi-hop latency and circuit routing
-        let remote_meta = match tokio::time::timeout(
+        if let Ok(Ok(SyncMessage::MetadataExchange(remote_meta))) = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             Self::recv_msg(&mut meta_stream),
         )
         .await
         {
-            Ok(Ok(SyncMessage::MetadataExchange(meta))) => {
-                println!("✅ [Dialer] Bob's metadata reply received and decoded!");
-                meta
-            }
-            Ok(Ok(_)) => {
-                return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                    "Expected MetadataExchange, got something else",
-                ));
-            }
-            Ok(Err(e)) => {
-                return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "Failed to receive Bob's metadata: {}",
-                    e
-                )));
-            }
-            Err(_) => {
-                return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                    "Metadata exchange timed out after 60 seconds",
-                ));
-            }
-        };
+            println!("✅ [Dialer] Remote metadata reply received and decoded!");
 
-        println!("🔍 [Dialer] Computing missing chunks...");
+            let mut missing_chunks_info = Vec::new();
+            let meta_guard = self.local_metadata.read().await;
 
-        let mut missing_nonces = Vec::new();
-        for remote_file in &remote_meta.file_table {
-            let local_file_opt = self
-                .local_metadata
-                .file_table
-                .iter()
-                .find(|f| f.vfs_name == remote_file.vfs_name);
-            for remote_chunk in &remote_file.chunks {
-                let chunk_exists_locally = local_file_opt.map_or(false, |f| {
-                    f.chunks.iter().any(|c| c.nonce == remote_chunk.nonce)
+            for remote_file in &remote_meta.file_table {
+                let local_file_opt = meta_guard
+                    .file_table
+                    .iter()
+                    .find(|f| f.vfs_name == remote_file.vfs_name);
+
+                let is_newer = local_file_opt.map_or(true, |f| {
+                    remote_file.last_modified_unix > f.last_modified_unix
                 });
-                if !chunk_exists_locally {
-                    missing_nonces.push(remote_chunk.nonce);
+
+                if is_newer {
+                    for remote_chunk in &remote_file.chunks {
+                        let chunk_exists = local_file_opt.map_or(false, |f| {
+                            f.chunks.iter().any(|c| c.nonce == remote_chunk.nonce)
+                        });
+                        if !chunk_exists {
+                            missing_chunks_info.push((
+                                remote_chunk.nonce,
+                                remote_file.vfs_name.clone(),
+                                remote_file.last_modified_unix,
+                            ));
+                        }
+                    }
                 }
             }
-        }
+            drop(meta_guard);
 
-        if missing_nonces.is_empty() {
-            println!("🚀 [Dialer] Vaults are fully synchronized.");
-            return Ok(());
-        }
+            if missing_chunks_info.is_empty() {
+                println!("🚀 [Dialer] Vaults are fully synchronized.");
+                return Ok(());
+            }
 
-        println!(
-            "📦 [Dialer] Identified {} missing chunks. Requesting concurrently...",
-            missing_nonces.len()
-        );
+            println!(
+                "📦 [Dialer] Identified {} missing chunks. Requesting concurrently...",
+                missing_chunks_info.len()
+            );
 
-        let mut handles = Vec::new();
-        for nonce in missing_nonces {
-            let control = self.control.clone();
-            let handle = tokio::spawn(async move {
-                let stream = match control.open_stream().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        println!("❌ [Dialer] Failed to open Yamux sub-stream: {}", e);
-                        return;
+            let mut handles = Vec::new();
+            let semaphore = Arc::new(Semaphore::new(50));
+
+            for (nonce, vfs_name, last_mod) in missing_chunks_info {
+                let control = self.control.clone();
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let p = self.vault_path.clone();
+                let l = self.write_lock.clone();
+                let m = self.local_metadata.clone();
+
+                let handle = tokio::spawn(async move {
+                    let _permit = permit;
+
+                    if let Ok(stream) = control.open_stream().await {
+                        let mut chunk_stream = stream.compat();
+                        let _ =
+                            Self::send_msg(&mut chunk_stream, &SyncMessage::ChunkRequest { nonce })
+                                .await;
+
+                        if let Ok(Ok(SyncMessage::ChunkTransfer {
+                            ciphertext,
+                            nonce: returned_nonce,
+                        })) = tokio::time::timeout(
+                            std::time::Duration::from_secs(60),
+                            Self::recv_msg(&mut chunk_stream),
+                        )
+                        .await
+                        {
+                            assert_eq!(nonce, returned_nonce);
+                            println!(
+                                "📥 [Dialer] Received and validated chunk ({} bytes). Writing to disk...",
+                                ciphertext.len()
+                            );
+
+                            // DISK I/O: Append securely to EOF
+                            let _guard = l.lock().await;
+                            if let Ok(mut file) = OpenOptions::new()
+                                .write(true)
+                                .append(true)
+                                .create(true)
+                                .open(&p)
+                                .await
+                            {
+                                if let Ok(offset) = file.seek(std::io::SeekFrom::End(0)).await {
+                                    if file.write_all(&ciphertext).await.is_ok()
+                                        && file.sync_all().await.is_ok()
+                                    {
+                                        // Update RAM Metadata
+                                        let mut mg = m.write().await;
+                                        if let Some(f) = mg
+                                            .file_table
+                                            .iter_mut()
+                                            .find(|f| f.vfs_name == vfs_name)
+                                        {
+                                            f.last_modified_unix = last_mod;
+                                            f.chunks.push(ChunkEntry {
+                                                cipher_len: ciphertext.len(),
+                                                offset,
+                                                nonce,
+                                            });
+                                        } else {
+                                            mg.file_table.push(FileIndex {
+                                                vfs_name: vfs_name.clone(),
+                                                last_modified_unix: last_mod,
+                                                chunks: vec![ChunkEntry {
+                                                    cipher_len: ciphertext.len(),
+                                                    offset,
+                                                    nonce,
+                                                }],
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                };
+                });
+                handles.push(handle);
+            }
 
-                let mut chunk_stream = stream.compat();
-                let _ =
-                    Self::send_msg(&mut chunk_stream, &SyncMessage::ChunkRequest { nonce }).await;
+            for handle in handles {
+                let _ = handle.await;
+            }
 
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
-                    Self::recv_msg(&mut chunk_stream),
-                )
-                .await
-                {
-                    Ok(Ok(SyncMessage::ChunkTransfer {
-                        nonce: returned_nonce,
-                        ciphertext,
-                    })) => {
-                        assert_eq!(nonce, returned_nonce);
-                        println!(
-                            "📥 [Dialer] Received and validated chunk ({} bytes)",
-                            ciphertext.len()
-                        );
-                    }
-                    Ok(Ok(_)) => {
-                        println!("❌ [Dialer] Expected ChunkTransfer, got different message.")
-                    }
-                    Ok(Err(e)) => println!("❌ [Dialer] Failed to receive chunk transfer: {}", e),
-                    Err(_) => println!("❌ [Dialer] TIMEOUT: Chunk stream stalled!"),
-                }
-            });
-            handles.push(handle);
+            println!("🎉 [Dialer] Synchronization complete!");
         }
 
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        println!("🎉 [Dialer] Synchronization complete!");
         Ok(())
     }
 }

@@ -1,10 +1,10 @@
-use std::os::fd::{OwnedFd, AsRawFd}; 
-use std::ffi::CString;
-use std::io::{self, Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind};
-use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
-use nix::unistd::{ftruncate, lseek, Whence};
 use crate::crypto::{self, UnlockedVault, XNONCE_LEN};
-use serde::{Serialize, Deserialize};
+use nix::sys::memfd::{MemFdCreateFlag, memfd_create};
+use nix::unistd::{Whence, ftruncate, lseek};
+use serde::{Deserialize, Serialize};
+use std::ffi::CString;
+use std::io::{self, Error, ErrorKind, Read, Result as IoResult, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChunkEntry {
@@ -17,6 +17,7 @@ pub struct ChunkEntry {
 pub struct FileIndex {
     pub vfs_name: String,
     pub chunks: Vec<ChunkEntry>,
+    pub last_modified_unix: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -29,19 +30,30 @@ pub fn process_secure_chunk<F>(
     cipher_len: usize,
     nonce: &[u8; XNONCE_LEN],
     unlocked_vault: &UnlockedVault,
-    action: F,   
-) -> io::Result<()> where F: FnOnce(&[u8]), {
+    action: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&[u8]),
+{
     // read the encrypted data from vfs into the buffer
     let mut cipher_buffer = vec![0u8; cipher_len];
     vault.read_exact(&mut cipher_buffer)?;
 
     // decrypt the file
-    let secure_plaintext = crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Decryption error: {:?}", e)))?;
-    
+    let secure_plaintext =
+        crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Decryption error: {:?}", e),
+            )
+        })?;
+
     // lock on ram to prevent swap leakage
     unsafe {
-        libc::mlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len());
+        libc::mlock(
+            secure_plaintext.as_ptr() as *const libc::c_void,
+            secure_plaintext.len(),
+        );
     }
 
     // execute closure with the locked plaintext
@@ -49,7 +61,10 @@ pub fn process_secure_chunk<F>(
 
     // unpin memory
     unsafe {
-        libc::munlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len());
+        libc::munlock(
+            secure_plaintext.as_ptr() as *const libc::c_void,
+            secure_plaintext.len(),
+        );
     }
 
     Ok(())
@@ -68,18 +83,18 @@ impl MemFile {
 
         // we want from linux to create an empty file for us
         let fd = memfd_create(&vault_name, MemFdCreateFlag::MFD_CLOEXEC)?;
-        
+
         // we want vault to be fixed size
         ftruncate(&fd, vault_size as i64)?;
 
         let raw_ptr = unsafe {
             libc::mmap(
-                std::ptr::null_mut(),                 // OS shall pick an address which is empty
-                vault_size,                           // Memory size to be mapped
-                libc::PROT_READ | libc::PROT_WRITE,   // both write and read permissions
-                libc::MAP_SHARED,                     // changes shall affect the file
-                fd.as_raw_fd(),                       // our ram file's ID
-                0                                     // offset from the doc header
+                std::ptr::null_mut(),               // OS shall pick an address which is empty
+                vault_size,                         // Memory size to be mapped
+                libc::PROT_READ | libc::PROT_WRITE, // both write and read permissions
+                libc::MAP_SHARED,                   // changes shall affect the file
+                fd.as_raw_fd(),                     // our ram file's ID
+                0,                                  // offset from the doc header
             )
         };
 
@@ -88,11 +103,11 @@ impl MemFile {
         }
 
         // FIX: Struct'tan sildiğimiz alanları constructor'dan da temizledik
-        Ok(Self { 
-            fd, 
+        Ok(Self {
+            fd,
             fixed_size: vault_size,
             memory_ptr: std::ptr::NonNull::new(raw_ptr).unwrap(),
-        })        
+        })
     }
 }
 
@@ -104,12 +119,12 @@ impl Drop for MemFile {
     }
 }
 
-// we are making a contract with the trait of std::io::write so that our file is not just any file but can write 
+// we are making a contract with the trait of std::io::write so that our file is not just any file but can write
 impl Write for MemFile {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        let written_size = nix::unistd::write(&self.fd, buf)
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
-        Ok(written_size)     
+        let written_size =
+            nix::unistd::write(&self.fd, buf).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        Ok(written_size)
     }
 
     fn flush(&mut self) -> IoResult<()> {

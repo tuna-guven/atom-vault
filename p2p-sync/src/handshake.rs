@@ -1,6 +1,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use snow::{Builder, HandshakeState, TransportState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 // We use the XX pattern: both parties send their static keys to each other.
 // X25519 is used for the ephemeral Diffie-Hellman key exchange.
@@ -13,17 +14,18 @@ static NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 /// that we will use to derive our daily Tor addresses in `address.rs`.
 pub struct VaultSession {
     pub transport: TransportState,
-    pub master_secret: [u8; 32],
+    pub master_secret: Zeroizing<[u8; 32]>, // SECURE: Protected against memory leaks/swap space dumps
     pub remote_static_key: VerifyingKey,
 }
 
 /// Executes the P2P cryptographic handshake over a raw async stream (like a Tor SOCKS5 TCP stream).
+// FIX: Added `+ Send + Sync` to the Error return type so Tokio can safely pass it between threads
 pub async fn execute_handshake<S>(
     stream: &mut S,
     is_initiator: bool,
     local_identity_key: &SigningKey,
     expected_remote_pubkey: &VerifyingKey,
-) -> Result<VaultSession, Box<dyn std::error::Error>>
+) -> Result<VaultSession, Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -34,8 +36,6 @@ where
     let builder = Builder::new(NOISE_PATTERN.parse()?);
 
     // We generate completely random, temporary X25519 keys just for this connection.
-    // This ensures that even if our long-term vault keys are stolen later,
-    // an attacker cannot decrypt past sync traffic.
     let temp_keys = builder.generate_keypair()?;
 
     // Initialize the state machine
@@ -49,10 +49,10 @@ where
             .build_responder()?
     };
 
-    let mut buf = vec![0u8; 65535];
+    // SECURE: Wrap the general handshake buffer in Zeroizing
+    let mut buf = Zeroizing::new(vec![0u8; 65535]);
 
     // Execute the 3-message XX pattern exchange.
-    // This establishes the encrypted tunnel using our temporary keys.
     if is_initiator {
         send_message(stream, &mut noise, &[], &mut buf).await?;
         recv_message(stream, &mut noise, &mut buf).await?;
@@ -68,20 +68,17 @@ where
     // =========================================================================
 
     // The handshake hash is a mathematically unique fingerprint of the exchange
-    // we just completed. No two connections will ever have the same hash.
     let handshake_hash = noise.get_handshake_hash();
 
     // We sign this unique hash using our long-term Ed25519 vault identity.
-    // This proves: "The person controlling this temporary encrypted tunnel
-    // is the true owner of the atom:// link."
     let signature = local_identity_key.sign(handshake_hash);
 
     // Save this hash to use as our Master Secret for address.rs later
     let mut master_secret = [0u8; 32];
     master_secret.copy_from_slice(handshake_hash);
 
-    // Pack our Ed25519 Public Key (32 bytes) and Signature (64 bytes) into a payload
-    let mut my_auth_payload = [0u8; 96];
+    // SECURE: Pack our Ed25519 Public Key and Signature into a Zeroizing payload
+    let mut my_auth_payload = Zeroizing::new([0u8; 96]);
     my_auth_payload[..32].copy_from_slice(local_identity_key.verifying_key().as_bytes());
     my_auth_payload[32..].copy_from_slice(&signature.to_bytes());
 
@@ -92,9 +89,7 @@ where
     // PHASE 3: THE ENCRYPTED PAYLOAD EXCHANGE
     // =========================================================================
 
-    // Now that the tunnel is encrypted, we safely exchange our identities.
-    // (Both peers write and read their 96-byte payloads)
-    let len = transport.write_message(&my_auth_payload, &mut buf)?;
+    let len = transport.write_message(&*my_auth_payload, &mut buf)?;
     stream.write_u16(len as u16).await?;
     stream.write_all(&buf[..len]).await?;
     stream.flush().await?;
@@ -102,11 +97,14 @@ where
     let len = stream.read_u16().await? as usize;
     stream.read_exact(&mut buf[..len]).await?;
 
-    let mut plain_payload = vec![0u8; 65535];
+    // SECURE: Use Zeroizing to hold the incoming decrypted payload
+    let mut plain_payload = Zeroizing::new(vec![0u8; 65535]);
     let payload_len = transport.read_message(&buf[..len], &mut plain_payload)?;
 
     if payload_len != 96 {
-        return Err("Invalid authentication payload length".into());
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "Invalid authentication payload length",
+        ));
     }
 
     // Extract the peer's public key and signature from their payload
@@ -125,18 +123,22 @@ where
 
     // 1. Did we connect to the correct person from the atom:// link?
     if remote_pubkey != *expected_remote_pubkey {
-        return Err("Peer identity mismatch! Possible MITM attack.".into());
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "Peer identity mismatch! Possible MITM attack.",
+        ));
     }
 
     // 2. Did they actually hold the private key to sign this exact session's hash?
     if let Err(_) = remote_pubkey.verify_strict(&master_secret, &remote_sig) {
-        return Err("Invalid signature! The peer could not prove their identity.".into());
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "Invalid signature! The peer could not prove their identity.",
+        ));
     }
 
     // Success! We have a perfectly forward-secret, mutually authenticated connection.
     Ok(VaultSession {
         transport,
-        master_secret,
+        master_secret: Zeroizing::new(master_secret),
         remote_static_key: remote_pubkey,
     })
 }
@@ -146,12 +148,13 @@ where
 // =============================================================================
 
 /// Writes a Noise message over the TCP stream with a 2-byte length prefix.
+// FIX: Added + Send + Sync
 async fn send_message<S>(
     stream: &mut S,
     noise: &mut HandshakeState,
     payload: &[u8],
     buf: &mut [u8],
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncWriteExt + Unpin,
 {
@@ -163,18 +166,19 @@ where
 }
 
 /// Reads a length-prefixed Noise message from the TCP stream.
+// FIX: Added + Send + Sync
 async fn recv_message<S>(
     stream: &mut S,
     noise: &mut HandshakeState,
     buf: &mut [u8],
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncReadExt + Unpin,
 {
     let len = stream.read_u16().await? as usize;
     stream.read_exact(&mut buf[..len]).await?;
 
-    let mut payload = vec![0u8; 65535];
+    let mut payload = Zeroizing::new(vec![0u8; 65535]);
     noise.read_message(&buf[..len], &mut payload)?;
     Ok(())
 }

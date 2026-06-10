@@ -31,6 +31,8 @@ pub enum Commands {
     /// Show your own Atom ID and connection link to share with friends
     Id,
 
+    Daemon,
+
     /// List all files currently mounted inside the vault
     Ls,
 
@@ -64,7 +66,9 @@ pub enum Commands {
     },
 
     /// Securely wipe a file from the vault
-    Rm { vfs_name: String },
+    Rm {
+        vfs_name: String,
+    },
 
     /// Manage P2P connections and friends
     Friend {
@@ -75,10 +79,16 @@ pub enum Commands {
     /// Synchronize your vault with a connected friend
     Sync {
         /// Path to the .aegis vault file to sync
-        #[arg(default_value = "my_data.aegis")]
+        #[arg(
+            value_name = "VAULT_PATH",
+            required = true,
+            index = 1,
+            default_value = "my_data.aegis"
+        )]
         vault_path: String,
 
         /// The nickname of the friend you want to sync with
+        #[arg(value_name = "FRIEND_NICKNAME", required = true, index = 2)]
         friend_nickname: String,
     },
 }

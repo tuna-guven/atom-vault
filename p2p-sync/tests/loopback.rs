@@ -10,7 +10,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 async fn test_encrypted_multiplexer_loopback() {
     let alice_key = SigningKey::from_bytes(&[1u8; 32]);
     let bob_key = SigningKey::from_bytes(&[2u8; 32]);
-    
+
     let alice_pub = alice_key.verifying_key();
     let bob_pub = bob_key.verifying_key();
 
@@ -27,17 +27,22 @@ async fn test_encrypted_multiplexer_loopback() {
             .await
             .expect("Bob handshake failed");
 
-        let (_control, mut inbound_rx) = transport::start_multiplexer(socket, session.transport, false);
+        let (_control, mut inbound_rx) =
+            transport::start_multiplexer(socket, session.transport, false);
 
         // Append .compat() to convert the Futures stream into a Tokio stream!
-        let mut sync_stream = inbound_rx.recv().await.expect("Bob didn't get a stream").compat();
-        
+        let mut sync_stream = inbound_rx
+            .recv()
+            .await
+            .expect("Bob didn't get a stream")
+            .compat();
+
         let mut buf = vec![0u8; 1024];
         let n = sync_stream.read(&mut buf).await.unwrap();
         let message = String::from_utf8_lossy(&buf[..n]);
-        
+
         assert_eq!(message, "HELLO FROM ALICE'S VAULT!");
-        
+
         sync_stream.write_all(b"BLOCKS RECEIVED").await.unwrap();
         sync_stream.flush().await.unwrap();
     });
@@ -46,7 +51,9 @@ async fn test_encrypted_multiplexer_loopback() {
     // ALICE'S VAULT (The Initiator / Dialer)
     // =========================================================================
     let alice_task = tokio::spawn(async move {
-        let mut socket = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+        let mut socket = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
 
         let session = handshake::execute_handshake(&mut socket, true, &alice_key, &bob_pub)
             .await
@@ -55,15 +62,22 @@ async fn test_encrypted_multiplexer_loopback() {
         let (control, _inbound_rx) = transport::start_multiplexer(socket, session.transport, true);
 
         // Append .compat() here as well!
-        let mut diff_stream = control.open_stream().await.expect("Alice stream open failed").compat();
+        let mut diff_stream = control
+            .open_stream()
+            .await
+            .expect("Alice stream open failed")
+            .compat();
 
-        diff_stream.write_all(b"HELLO FROM ALICE'S VAULT!").await.unwrap();
+        diff_stream
+            .write_all(b"HELLO FROM ALICE'S VAULT!")
+            .await
+            .unwrap();
         diff_stream.flush().await.unwrap();
 
         let mut buf = vec![0u8; 1024];
         let n = diff_stream.read(&mut buf).await.unwrap();
         let message = String::from_utf8_lossy(&buf[..n]);
-        
+
         assert_eq!(message, "BLOCKS RECEIVED");
     });
 

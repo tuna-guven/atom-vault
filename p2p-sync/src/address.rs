@@ -4,6 +4,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 /// A Tor v3 Onion address string (e.g., "pg6mm...pscryd.onion")
 pub type OnionAddress = String;
@@ -45,10 +46,14 @@ pub fn derive_daily_key(
 
     // 5. Expand the secret via HKDF-SHA256
     let hk = Hkdf::<Sha256>::new(None, master_secret);
-    let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm).expect("Valid length for SHA256");
 
-    SigningKey::from_bytes(&okm)
+    // SECURE: Wrap the Output Keying Material (OKM) in Zeroizing.
+    // This array holds the raw Tor private key bytes before they are loaded into the SigningKey struct.
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(&info, &mut *okm)
+        .expect("Valid length for SHA256");
+
+    SigningKey::from_bytes(&*okm)
 }
 
 /// Converts a raw Ed25519 public key into a Tor v3 Onion address.
@@ -65,6 +70,7 @@ pub fn format_onion_address(pubkey: &VerifyingKey) -> OnionAddress {
     let checksum = hasher.finalize();
 
     // 2. Construct the raw byte payload
+    // (Note: No zeroizing needed here because public keys and onion addresses are public data)
     let mut raw_bytes = Vec::with_capacity(35); // 32 (pubkey) + 2 (checksum) + 1 (version)
     raw_bytes.extend_from_slice(pubkey.as_bytes());
     raw_bytes.extend_from_slice(&checksum[0..2]);

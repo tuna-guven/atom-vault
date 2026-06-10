@@ -7,14 +7,20 @@ use p2p_sync::{
 };
 use std::collections::HashMap;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+use zeroize::Zeroizing;
 
 #[tokio::main]
 async fn main() {
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    // SECURE: Wrap the raw private key bytes in Zeroizing as they are loaded into RAM.
+    // In production, these bytes would be decrypted from your local keystore.
+    let key_bytes = Zeroizing::new([1u8; 32]);
+    let alice_key = SigningKey::from_bytes(&*key_bytes);
+
+    // SAFE: Bob's identity is a Public Key. It does not need memory protection.
     let bob_pub = SigningKey::from_bytes(&[2u8; 32]).verifying_key();
 
     // Your active Bob address from the logs
-    let onion_addr = "rv3txodaquwo6qr4tx4upypi6qhojsof4ieshebkn7gs46dl3udlewqd.onion";
+    let onion_addr = "l7p2kxjaabxbvnmi3lwyejsdindzdldzzoo5tpupl3jgccvhkxdnbmid.onion";
 
     println!("🧅 Bootstrapping Arti Tor client (this takes ~10 seconds)...");
     let mut config_builder = TorClientConfig::builder();
@@ -58,12 +64,16 @@ async fn main() {
     let chunk1_nonce = [1u8; 24];
     let chunk2_nonce = [2u8; 24];
     let mut alice_storage = HashMap::new();
+
+    // SAFE: This represents encrypted Vault Ciphertext.
+    // Ciphertext is mathematically safe to reside in standard OS-managed memory or swap space.
     alice_storage.insert(chunk1_nonce, b"ALICE'S ENCRYPTED CHUNK 1".to_vec());
     alice_storage.insert(chunk2_nonce, b"ALICE'S ENCRYPTED CHUNK 2".to_vec());
 
     let alice_metadata = VaultMetadata {
         file_table: vec![FileIndex {
             vfs_name: "alice_vacation.mp4".to_string(),
+            last_modified_unix: 1700000000,
             chunks: vec![
                 ChunkEntry {
                     cipher_len: 25,
@@ -79,11 +89,23 @@ async fn main() {
         }],
     };
 
-    let sync_manager = SyncManager::new(control, inbound_rx, alice_metadata, alice_storage);
+    let vault_path = std::path::PathBuf::from("mock_test_vault.aegis");
+    let sync_manager = SyncManager::new(control, inbound_rx, alice_metadata, vault_path);
 
     println!("🚀 Opening Yamux stream and initiating concurrent metadata sync...");
     sync_manager.synchronize().await.unwrap();
 
-    // Keep alive briefly to serve inbound requests if Bob needs files
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    let sm_clone = sync_manager.clone();
+    tokio::spawn(async move {
+        loop {
+            // Mocking a local file system change every 45 seconds
+            tokio::time::sleep(tokio::time::Duration::from_secs(45)).await;
+
+            println!("📝 Alice edited a file! Pinging Bob to synchronize...");
+            let _ = sm_clone.synchronize().await;
+        }
+    });
+
+    // Keep the application running so background threads can talk to each other
+    tokio::signal::ctrl_c().await.unwrap();
 }
