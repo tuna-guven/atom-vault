@@ -10,8 +10,7 @@ use cli::{Cli, Commands};
 use secrecy::SecretString;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // SECURITY: Global panic hook to intercept unexpected crashes and ensure
-    // we don't leave sensitive traces on standard output if something fails deep inside.
+    // Enable raw standard panic hooks to prevent sensitive data leaks during crashes
     std::panic::set_hook(Box::new(|panic_info| {
         eprintln!("\n[FATAL] Atom Vault encountered a critical runtime failure.");
         if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
@@ -20,29 +19,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Purging volatile process memory and enforcing immediate emergency exit.");
     }));
 
+    // Parse command line arguments using our secure customized styling interface
     let args = Cli::parse();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Route system execution to targeted synchronous sub-command handlers
         match args.command {
             Commands::Create {
                 vault_path,
                 vault_name,
-            } => commands::create::handle_create(vault_path, vault_name),
-
+            } => commands::create::handle_create(&vault_path, &vault_name),
             Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
 
-            // --- SECURE P2P ROUTING ---
+            // --- DECOUPLED P2P ROUTING ---
             Commands::Daemon => commands::daemon::handle_daemon(),
-
             Commands::Id => commands::id::handle_id(),
-
             Commands::Friend { command } => commands::friend::handle_friend(command),
-
             Commands::Sync {
                 vault_path,
                 friend_nickname,
             } => {
-                // Securely prompt for password (no terminal echo)
+                // Securely prompt for the vault password (no terminal echo)
                 let pass = rpassword::prompt_password("🔐 Enter Vault Password: ")
                     .expect("Failed to read password from terminal");
 
@@ -56,12 +53,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match result {
         Ok(sub_command_result) => {
-            // Unpack the actual Result returned by the command handlers
             sub_command_result?;
         }
         Err(_) => {
             eprintln!(
-                "\n[FATAL] Process memory safely purged via unwinding. Emergency exit enforced."
+                "[FATAL] Process memory safely purged via unwinding. Emergency exit enforced."
             );
             std::process::exit(1);
         }
