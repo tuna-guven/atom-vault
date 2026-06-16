@@ -71,8 +71,11 @@ pub fn handle_friend(command: FriendCommands) -> Result<(), Box<dyn std::error::
                     url: url.clone(),
                 });
                 println!("✅ Friend '{}' securely added!", nickname);
+                println!(
+                    "⚠️ Make sure {} adds your atom link too before you can start messaging.",
+                    nickname
+                );
             }
-
             // Note: Ensure `save_friends` writes the file with 0o600 permissions
             save_friends(&friends);
         }

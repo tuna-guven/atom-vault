@@ -118,59 +118,22 @@ pub fn save_friends(friends: &[FriendRecord]) {
 }
 
 // ============================================================================
-// 3. VAULT METADATA PARSING & TRANSLATION STUBS
+// 3. VAULT METADATA TRANSLATION STUBS
 // ============================================================================
 
-// TODO: Replace these with your actual struct definitions
-#[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
-pub struct VaultMetadata {
-    pub version: u32,
-    pub entries: usize,
-}
+// Import your actual file allocation table structure!
+use crate::vfs::VaultMetadata;
 
-// FIX: Changed from P2PMetaData to P2PMetadata to match the function signatures
 pub type P2PMetadata = p2p_sync::sync::VaultMetadata;
 
-/// Loads and decrypts the vault metadata from the physical file.
-pub fn load_vault_metadata(
-    _physical_vault: &mut std::fs::File,
-    _raw_dek: &[u8],
-) -> Result<(VaultMetadata, u64), Box<dyn std::error::Error>> {
-    println!("⚠️  [STUB] Loading vault metadata...");
-
-    // TODO: Implement your actual file-reading and AEAD decryption here.
-    // For now, we return a dummy metadata object and an EOF offset of 0 so it compiles.
-    let dummy_meta = VaultMetadata::default();
-    let dummy_eof = 0;
-
-    Ok((dummy_meta, dummy_eof))
-}
-
-/// Encrypts and saves the vault metadata to the physical file.
-pub fn save_vault_metadata(
-    _physical_vault: &mut std::fs::File,
-    _meta: &VaultMetadata,
-    _raw_dek: &[u8],
-    _eof: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("⚠️  [STUB] Saving vault metadata...");
-
-    // TODO: Implement AEAD encryption and writing to the file stream here.
-    Ok(())
-}
-
+/// Translates local vault metadata into the P2P networking format.
 pub fn to_p2p_meta(_local_meta: &VaultMetadata) -> P2PMetadata {
-    // TODO: Map fields. Assuming P2PMetadata has a new() or default() method.
-    // If P2PMetadata does not implement Default, replace this with its actual constructor!
-    todo!("Implement P2PMetadata mapping")
+    // TODO: Map the fields from your real `vfs::VaultMetadata` to `p2p_sync::sync::VaultMetadata`
+    todo!("Implement local -> P2P metadata mapping")
 }
 
 /// Translates incoming P2P networking metadata back into the local vault format.
 pub fn to_atom_meta(_p2p_meta: &P2PMetadata) -> VaultMetadata {
-    // TODO: Map fields from network format back to your local vault format
-    VaultMetadata {
-        version: 0,
-        entries: 0,
-    }
+    // TODO: Map the fields from the network `p2p_sync::sync::VaultMetadata` back to `vfs::VaultMetadata`
+    todo!("Implement P2P -> local metadata mapping")
 }

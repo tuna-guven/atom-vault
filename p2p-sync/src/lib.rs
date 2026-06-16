@@ -86,7 +86,12 @@ impl AtomSyncManager {
         let handshake_timeout = Duration::from_secs(15);
         let session = timeout(
             handshake_timeout,
-            handshake::execute_handshake(&mut stream, true, &self.local_identity, friend_identity),
+            handshake::execute_handshake(
+                &mut stream,
+                true,
+                &self.local_identity,
+                std::slice::from_ref(friend_identity),
+            ),
         )
         .await
         .map_err(|_| "Noise handshake timed out. Peer may be stalling or malicious.")??;

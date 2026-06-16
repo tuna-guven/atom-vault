@@ -32,28 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
 
             // --- SECURE P2P ROUTING ---
-            Commands::Daemon => {
-                // Securely prompt for password (no terminal echo)
-                let pass = rpassword::prompt_password("🔐 Enter Vault Password: ")
-                    .expect("Failed to read password from terminal");
-
-                // Immediately wrap the password in Zeroizing memory
-                let secret_pass = SecretString::from(pass);
-
-                // Load the address book and parse all friend URIs to extract their Ed25519 Public Keys.
-                // If a URI is corrupted, we simply skip it during the filter_map phase.
-                let friends = commands::p2p_utils::load_friends();
-                let auth_keys: Vec<ed25519_dalek::VerifyingKey> = friends
-                    .into_iter()
-                    .filter_map(|f| {
-                        commands::p2p_utils::parse_atom_uri(&f.url)
-                            .ok()
-                            .map(|(_, key)| key)
-                    })
-                    .collect();
-
-                commands::daemon::handle_daemon(secret_pass, auth_keys)
-            }
+            Commands::Daemon => commands::daemon::handle_daemon(),
 
             Commands::Id => commands::id::handle_id(),
 
