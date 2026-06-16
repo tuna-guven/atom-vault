@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::commands::daemon::get_or_create_identity;
 use crate::commands::p2p_utils::{load_friends, parse_atom_uri, to_p2p_meta};
 use crate::vfs::VaultMetadata;
+use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
 pub fn handle_sync(
     vault_path: &str,
@@ -23,7 +24,7 @@ pub fn handle_sync(
     let (onion_address, friend_pubkey) = parse_atom_uri(&friend.url)?;
 
     // 1. OPEN VAULT AS A RAW PROTECTED FILE (NO PASSWORD/DECRYPTION)
-    let mut _physical_vault = OpenOptions::new().read(true).write(true).open(vault_path)?;
+    let _physical_vault = OpenOptions::new().read(true).write(true).open(vault_path)?;
 
     // 2. LOAD THE DECOUPLED NETWORK IDENTITY
     let local_identity = get_or_create_identity()?;
@@ -48,44 +49,53 @@ pub fn handle_sync(
     };
     let p2p_compatible_metadata = to_p2p_meta(&empty_local_meta);
 
+    let _ = p2p_compatible_metadata;
+
     let rt = tokio::runtime::Runtime::new()?;
 
-    // 4. EXECUTE BLIND BLOCK TRANSMISSION
+    // 4. EXECUTE RAW BINARY TRANSMISSION OVER TOR
     rt.block_on(async {
         let atom_net = p2p_sync::AtomSyncManager::new(local_identity, client_state_dir);
-
-        // Derive the ephemeral transport master secret
         let dummy_master_secret = zeroize::Zeroizing::new([0u8; 32]);
 
-        let (control, inbound_rx) = atom_net
+        let (control, _inbound_rx) = atom_net
             .connect_to_friend(&onion_address, &friend_pubkey, &dummy_master_secret)
             .await
-            .map_err(|e| {
-                format!(
-                    "Network connection failed (Is your friend's daemon online?): {}",
-                    e
-                )
-            })?;
+            .map_err(|e| format!("Network connection failed: {}", e))?;
 
-        println!("🔗 Tor tunnel established! Syncing encrypted data allocations blindly...");
+        println!("🔗 Tor tunnel established! Opening raw data stream...");
 
-        let sync_manager = p2p_sync::sync::SyncManager::new(
-            control,
-            inbound_rx,
-            p2p_compatible_metadata,
-            physical_vault_path,
+        // Open a direct Yamux multiplexed stream to Bob
+        let mut data_stream = control
+            .open_stream()
+            .await
+            .map_err(|e| format!("Failed to open Yamux stream: {}", e))?
+            .compat_write();
+
+        // Open the physical file asynchronously
+        let mut file = tokio::fs::File::open(&physical_vault_path).await?;
+
+        println!("⏳ Pumping raw ciphertext blocks over Tor...");
+
+        // Pipe the file directly into the Tor stream
+        let bytes_sent = tokio::io::copy(&mut file, &mut data_stream).await?;
+
+        // Gracefully shut down the stream so Bob knows the file is finished
+        use tokio::io::AsyncWriteExt;
+        data_stream.shutdown().await?;
+
+        println!(
+            "🎉 Blind file transfer complete! Pushed {} bytes.",
+            bytes_sent
         );
 
-        sync_manager
-            .synchronize()
-            .await
-            .map_err(|e| format!("Synchronization failed: {}", e))?;
-
-        println!("⏳ Finalizing block commitment and closing stream gracefully...");
+        // CRITICAL FIX: Ensure Arti flushes its Tor buffers before the runtime closes.
+        println!("⏳ Finalizing block commitment and gracefully closing circuit...");
+        drop(control);
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
 
-    println!("🎉 Blind block layer successfully synchronized and saved!");
     Ok(())
 }
