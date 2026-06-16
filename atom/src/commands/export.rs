@@ -1,7 +1,7 @@
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
 use crate::crypto::UnlockedVault;
 use crate::vfs::VaultMetadata;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 pub fn handle_export(
     vfs_name: String,
@@ -10,11 +10,7 @@ pub fn handle_export(
     physical_vault: &mut File,
     unlocked_vault: &UnlockedVault,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
-    let file_entry = metadata
-        .file_table
-        .iter()
-        .find(|f| f.vfs_name == vfs_name);
+    let file_entry = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name);
 
     let target_file = match file_entry {
         Some(file) => file,

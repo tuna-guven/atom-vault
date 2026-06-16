@@ -1,13 +1,12 @@
-use std::fs::File;
-use std::io::{Read, Write, Seek, SeekFrom};
 use crate::vfs::VaultMetadata;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 pub fn handle_vacuum(
     vault_path: &str,
     metadata: &mut VaultMetadata,
     physical_vault: &mut File,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
     let tmp_path = format!("{}.tmp", vault_path);
     let mut tmp_file = std::fs::OpenOptions::new()
         .read(true)
@@ -16,7 +15,7 @@ pub fn handle_vacuum(
         .open(&tmp_path)
         .map_err(|e| format!("Failed to create vacuum temp file: {:?}", e))?;
 
-    let header_size: u64 = 112; 
+    let header_size: u64 = 112;
     tmp_file.write_all(&header_size.to_le_bytes())?;
 
     physical_vault.seek(SeekFrom::Start(8))?;
@@ -29,7 +28,7 @@ pub fn handle_vacuum(
     for file_index in &mut metadata.file_table {
         for chunk in &mut file_index.chunks {
             physical_vault.seek(SeekFrom::Start(chunk.offset))?;
-            
+
             let mut cipher_buffer = vec![0u8; chunk.cipher_len];
             physical_vault.read_exact(&mut cipher_buffer)?;
 

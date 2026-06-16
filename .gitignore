@@ -1,2 +1,5 @@
-atom/target/
+Cargo.lock
 target/
+atom/target/
+p2p-sync/target/
+atom/*.aegis

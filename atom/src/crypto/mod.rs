@@ -34,14 +34,13 @@ pub fn derive_kek(password: &str, salt: &Salt) -> Result<VaultKey, argon2::Error
 
     // 3. Hash the password into a 32-byte array
     // Zafiyet Düzeltmesi: Hata durumunda KEK'in RAM'de kalmaması için Zeroizing ile sarmalandı.
-    // Derleyici Hatası Çözümü: `&mut kek[..]` ile açıkça slice referansına dönüştürüldü.
     let mut kek = Zeroizing::new([0u8; KEY_LEN]);
     argon2.hash_password_into(password.as_bytes(), salt, &mut kek[..])?;
 
     // 4. Return the resulting KEK
     let mut final_kek = [0u8; KEY_LEN];
     final_kek.copy_from_slice(&kek[..]);
-    
+
     Ok(final_kek)
 }
 
@@ -73,7 +72,6 @@ pub fn wrap_dek(
     let nonce = XNonce::from_slice(&nonce_bytes);
 
     // 3. Encrypt the DEK.
-    // The `.encrypt()` method automatically appends a 16-byte Poly1305 Auth Tag.
     let wrapped_dek = cipher.encrypt(nonce, dek.as_ref())?;
 
     // Return the ciphertext and the nonce so your friend can save them to the .aeigs file header
@@ -86,11 +84,10 @@ pub fn unwrap_dek(
     wrapped_dek: &[u8],
     nonce_bytes: &[u8; XNONCE_LEN],
 ) -> Result<UnlockedVault, chacha20poly1305::Error> {
-    // 1. Initialize the cipher with the KEK
     let cipher = XChaCha20Poly1305::new(kek.into());
     let nonce = XNonce::from_slice(nonce_bytes);
 
-    // 2. Attempt to decrypt and verify the Auth Tag simultaneously
+    // Attempt to decrypt and verify the Auth Tag simultaneously
     let decrypted_dek_vec = Zeroizing::new(cipher.decrypt(nonce, wrapped_dek)?);
 
     // Güvenlik: Eksik veya bozuk veri kopyalamasını engellemek için tam boyut kontrolü
@@ -98,44 +95,37 @@ pub fn unwrap_dek(
         return Err(chacha20poly1305::Error);
     }
 
-    // 3. Convert the Vec<u8> back into our strict 32-byte VaultKey array
+    // Convert the Vec<u8> back into our strict 32-byte VaultKey array
     let mut raw_dek = [0u8; KEY_LEN];
     raw_dek.copy_from_slice(&decrypted_dek_vec[..]);
 
-    // 4. Return it wrapped in our Zeroize-protected struct
     Ok(UnlockedVault { dek: raw_dek })
 }
 
 /// Encrypts a single chunk of file data.
-/// Returns a tuple: (The Encrypted Chunk with Auth Tag, The Nonce used for this chunk)
+/// Binds the chunk's offset as Additional Authenticated Data (AAD) to prevent reordering attacks.
 pub fn encrypt_chunk(
     unlocked_vault: &UnlockedVault,
     chunk_plaintext: &[u8],
     chunk_offset: u64,
 ) -> Result<(Vec<u8>, [u8; XNONCE_LEN]), chacha20poly1305::Error> {
-    // 1. Initialize the XChaCha20Poly1305 cipher using the DEK inside unlocked_vault
     let cipher = XChaCha20Poly1305::new(unlocked_vault.dek.as_ref().into());
-
-    // 2. Generate a random nonce using our helper
     let nonce_bytes = generate_xnonce();
     let nonce = XNonce::from_slice(&nonce_bytes);
 
+    // Bind the offset cryptographically to this specific chunk
     let offset_bytes = chunk_offset.to_le_bytes();
     let payload = Payload {
         msg: chunk_plaintext,
         aad: &offset_bytes,
     };
 
-    // 3. Encrypt the chunk_plaintext
-    // The encrypt() function automatically appends the 16-byte Poly1305 Auth Tag
-    // to the end of the returned Vec<u8>.
     let ciphertext = cipher.encrypt(nonce, payload)?;
-
-    // 4. Return the (ciphertext, nonce_bytes)
     Ok((ciphertext, nonce_bytes))
 }
 
 /// Decrypts a single chunk of file data.
+/// Verifies the chunk_offset AAD to ensure the chunk wasn't moved.
 pub fn decrypt_chunk(
     unlocked_vault: &UnlockedVault,
     chunk_ciphertext: &[u8],
@@ -151,9 +141,6 @@ pub fn decrypt_chunk(
         aad: &offset_bytes,
     };
 
-    // Decrypt the data directly
     let plaintext_vec = cipher.decrypt(nonce, payload)?;
-
-    // Wrap immediately into a Zeroizing container to seal the memory
     Ok(Zeroizing::new(plaintext_vec))
 }

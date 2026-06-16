@@ -1,9 +1,9 @@
+mod chunker;
 mod cli;
 mod commands;
 mod crypto;
-mod vfs;
 mod storage;
-mod chunker;
+mod vfs;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -24,12 +24,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Route system execution to targeted synchronous sub-command handlers
         match args.command {
-            Commands::Create { vault_path, vault_name } => {
-                commands::create::handle_create(vault_path, vault_name)
-            }
-            Commands::Enter { vault_path } => {
-                commands::enter::handle_enter(vault_path)
-            }
+            Commands::Create {
+                vault_path,
+                vault_name,
+            } => commands::create::handle_create(&vault_path, &vault_name),
+            Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
+
+            // --- DECOUPLED P2P ROUTING ---
+            Commands::Daemon => commands::daemon::handle_daemon(),
+            Commands::Id => commands::id::handle_id(),
+            Commands::Friend { command } => commands::friend::handle_friend(command),
+            Commands::Sync {
+                vault_path,
+                friend_nickname,
+            } => commands::sync::handle_sync(&vault_path, &friend_nickname),
         }
     }));
 

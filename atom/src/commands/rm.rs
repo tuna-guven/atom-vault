@@ -1,13 +1,13 @@
-use std::fs::File;
 use crate::crypto::UnlockedVault;
 use crate::vfs::VaultMetadata;
+use std::fs::File;
 
 pub fn handle_rm(
-    vfs_name: String, 
-    metadata: &mut VaultMetadata, 
-    physical_vault: &mut File, 
-    unlocked_vault: &UnlockedVault, 
-    current_payload_offset: &mut u64
+    vfs_name: String,
+    metadata: &mut VaultMetadata,
+    physical_vault: &mut File,
+    unlocked_vault: &UnlockedVault,
+    current_payload_offset: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "[Wiping] Commencing SSD-Safe Crypto-Shredding for '{}'...",
