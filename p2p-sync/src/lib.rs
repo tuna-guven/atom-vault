@@ -5,17 +5,16 @@ pub mod transport;
 
 use arti_client::{TorClient, TorClientConfig};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use tokio::time::{Duration, timeout};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use zeroize::Zeroizing; // <-- SECURE IMPORT
+use zeroize::Zeroizing;
 
 pub struct AtomSyncManager {
     local_identity: SigningKey,
-    // Store the isolated state directory path
     client_state_dir: std::path::PathBuf,
 }
 
 impl AtomSyncManager {
-    // Catch both arguments here
     pub fn new(local_identity: SigningKey, client_state_dir: std::path::PathBuf) -> Self {
         Self {
             local_identity,
@@ -25,8 +24,8 @@ impl AtomSyncManager {
 
     pub async fn connect_to_friend(
         &self,
+        onion_address: &str,
         friend_identity: &VerifyingKey,
-        // SECURE API CONTRACT: Enforce type-level zeroization bound on the caller
         _master_secret: &Zeroizing<[u8; 32]>,
     ) -> Result<
         (
@@ -35,39 +34,62 @@ impl AtomSyncManager {
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        // --- BYPASS BRIAR DAILY KEY DERIVATION ---
-        // Your daemon is listening on its static Arti address, not the stealth daily key!
-        // So we format the friend's actual static Tor public key directly into the dialable onion link.
-        let onion_addr = address::format_onion_address(friend_identity);
+        println!("Dialing friend directly at: {}:80", onion_address);
 
-        println!("Dialing friend directly at: {}:80", onion_addr);
+        // 1. SAFE PATH PARSING (No panics on invalid OS paths)
+        let state_dir_str = self
+            .client_state_dir
+            .to_str()
+            .ok_or("Client state directory path contains invalid UTF-8")?;
 
-        // --- ISOLATED TOR CONFIGURATION ---
-        // Inject our isolated client_state_dir to bypass the SQLite collision!
         let config_json = serde_json::json!({
             "storage": {
-                "state_dir": self.client_state_dir.to_str().unwrap()
+                "state_dir": state_dir_str
             }
         });
 
         let default_builder = TorClientConfig::builder();
         let config_builder = serde_json::from_value(config_json).unwrap_or(default_builder);
-        let config = config_builder.build().expect("Failed to build Tor config");
+        let config = config_builder
+            .build()
+            .map_err(|e| format!("Failed to build Tor config: {}", e))?;
 
         println!("Bootstrapping onto the Tor network...");
-        let tor_client = TorClient::create_bootstrapped(config).await?;
 
-        let arti_stream = tor_client.connect((onion_addr.as_str(), 80)).await?;
+        // 2. DOS PREVENTION: TIMEOUT ON BOOTSTRAP
+        let bootstrap_timeout = Duration::from_secs(60);
+        let tor_client = timeout(bootstrap_timeout, TorClient::create_bootstrapped(config))
+            .await
+            .map_err(|_| "Tor bootstrap timed out after 60s. Check network connection.")??;
+
+        // 3. DEFENSE IN DEPTH: PREVENT CLEARNET LEAKAGE
+        if !onion_address.ends_with(".onion") {
+            return Err(
+                "Security Violation: Attempted to dial a non-onion clearnet address".into(),
+            );
+        }
+
+        println!("Building circuit to hidden service...");
+
+        // 4. DOS PREVENTION: TIMEOUT ON CONNECTION
+        let connect_timeout = Duration::from_secs(45);
+        let arti_stream = timeout(connect_timeout, tor_client.connect((onion_address, 80)))
+            .await
+            .map_err(|_| "Circuit timeout. Friend may be offline or unreachable.")??;
+
         let mut stream = arti_stream.compat();
 
-        // THE FIX: In our local test, Alice and Bob share the same Vault DEK.
-        // Therefore, Alice should expect Bob to authenticate using the identical derived identity,
-        // instead of the Tor public key from the atom:// link!
-        let _expected_bob_identity = self.local_identity.verifying_key();
+        println!("Executing cryptographic handshake...");
 
-        let session =
-            handshake::execute_handshake(&mut stream, true, &self.local_identity, friend_identity)
-                .await?;
+        // 5. DOS PREVENTION: TIMEOUT ON HANDSHAKE
+        // Prevents an attacker from holding the Tor socket open while refusing to speak Noise
+        let handshake_timeout = Duration::from_secs(15);
+        let session = timeout(
+            handshake_timeout,
+            handshake::execute_handshake(&mut stream, true, &self.local_identity, friend_identity),
+        )
+        .await
+        .map_err(|_| "Noise handshake timed out. Peer may be stalling or malicious.")??;
 
         let (yamux_control, inbound_rx) =
             transport::start_multiplexer(stream, session.transport, true);
