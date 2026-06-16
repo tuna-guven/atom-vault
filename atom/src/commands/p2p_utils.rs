@@ -118,22 +118,21 @@ pub fn save_friends(friends: &[FriendRecord]) {
 }
 
 // ============================================================================
-// 3. VAULT METADATA TRANSLATION STUBS
+// 3. VAULT METADATA TRANSLATION
 // ============================================================================
 
-// Import your actual file allocation table structure!
 use crate::vfs::VaultMetadata;
 
 pub type P2PMetadata = p2p_sync::sync::VaultMetadata;
 
 /// Translates local vault metadata into the P2P networking format.
-pub fn to_p2p_meta(_local_meta: &VaultMetadata) -> P2PMetadata {
-    // TODO: Map the fields from your real `vfs::VaultMetadata` to `p2p_sync::sync::VaultMetadata`
-    todo!("Implement local -> P2P metadata mapping")
-}
-
-/// Translates incoming P2P networking metadata back into the local vault format.
-pub fn to_atom_meta(_p2p_meta: &P2PMetadata) -> VaultMetadata {
-    // TODO: Map the fields from the network `p2p_sync::sync::VaultMetadata` back to `vfs::VaultMetadata`
-    todo!("Implement P2P -> local metadata mapping")
+pub fn to_p2p_meta(local_meta: &VaultMetadata) -> P2PMetadata {
+    P2PMetadata {
+        // Map the salt bytes directly
+        cdc_salt: local_meta.cdc_salt,
+        // Since we are doing a blind sync, we pass an empty vector.
+        // Rust's type inference will automatically cast this empty vector
+        // to whatever FileEntry type the p2p_sync crate expects!
+        file_table: Vec::new(),
+    }
 }

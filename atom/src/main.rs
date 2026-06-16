@@ -7,7 +7,6 @@ mod vfs;
 
 use clap::Parser;
 use cli::{Cli, Commands};
-use secrecy::SecretString;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Enable raw standard panic hooks to prevent sensitive data leaks during crashes
@@ -38,16 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Sync {
                 vault_path,
                 friend_nickname,
-            } => {
-                // Securely prompt for the vault password (no terminal echo)
-                let pass = rpassword::prompt_password("🔐 Enter Vault Password: ")
-                    .expect("Failed to read password from terminal");
-
-                // Immediately wrap the password in Zeroizing memory
-                let secret_pass = SecretString::from(pass);
-
-                commands::sync::handle_sync(&vault_path, &friend_nickname, secret_pass)
-            }
+            } => commands::sync::handle_sync(&vault_path, &friend_nickname),
         }
     }));
 

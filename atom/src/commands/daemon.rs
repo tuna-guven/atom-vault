@@ -100,8 +100,7 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(rend_request) = stream_requests.next().await {
             println!("🔌 Incoming Tor circuit rendezvous request...");
             
-            // Dynamically load friends right when the connection hits, so you don't need to restart 
-            // the daemon if you add a friend in another terminal window!
+            // Dynamically load friends right when the connection hits
             let friends = load_friends();
             let mut authorized_keys: Vec<VerifyingKey> = Vec::new();
             for f in &friends {
@@ -129,12 +128,45 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                                     parse_atom_uri(&f.url).map(|(_, k)| k == session.remote_static_key).unwrap_or(false)
                                 });
                                 
-                                let nick = connected_friend.map(|f| f.nickname.as_str()).unwrap_or("Unknown Friend");
+                                let nick = connected_friend.map(|f| f.nickname.clone()).unwrap_or_else(|| "Unknown".to_string());
                                 println!("🎉 {} is online! Handshake successful. Secure messaging channel established.", nick);
                                 
-                                // Spawn SyncManager here...
-                                // let (control, inbound_rx) = p2p_sync::transport::start_multiplexer(stream, session.transport, false);
-                                // ...
+                                // 1. Setup Bob's Inbox File Destination
+                                let mut inbox_path = dirs::home_dir().unwrap();
+                                inbox_path.push(".atom_vault/Inbox");
+                                fs::create_dir_all(&inbox_path).unwrap_or_default();
+                                
+                                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                                inbox_path.push(format!("{}_vault_{}.aegis", nick, timestamp));
+                                
+                                // Create the empty file so the SyncManager can write to it
+                                let _ = OpenOptions::new().write(true).create(true).truncate(true).open(&inbox_path).unwrap();
+
+                                // 2. Construct the empty metadata payload for Bob's reply
+                                let empty_local_meta = crate::vfs::VaultMetadata {
+                                    file_table: Vec::new(),
+                                    cdc_salt: [0u8; 32],
+                                };
+                                let p2p_compatible_metadata = crate::commands::p2p_utils::to_p2p_meta(&empty_local_meta);
+
+                                // 3. Start the Multiplexer & SyncManager
+                                let (control, inbound_rx) = p2p_sync::transport::start_multiplexer(stream, session.transport, false);
+
+                                let sync_manager = p2p_sync::sync::SyncManager::new(
+                                    control,
+                                    inbound_rx,
+                                    p2p_compatible_metadata,
+                                    inbox_path.clone(),
+                                );
+
+                                // 4. Spawn background async task to handle the actual two-way transfer
+                                tokio::spawn(async move {
+                                    println!("🔄 [Listener] Yamux stream wired to Inbox... Replying to metadata request...");
+                                    match sync_manager.synchronize().await {
+                                        Ok(_) => println!("📥 Successfully saved incoming vault to Inbox: {:?}", inbox_path.display()),
+                                        Err(e) => println!("❌ Sync transfer interrupted: {}", e),
+                                    }
+                                });
                             }
                             Err(e) => println!("❌ Handshake rejected: {}", e),
                         }
