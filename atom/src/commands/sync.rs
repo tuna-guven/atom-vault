@@ -81,6 +81,8 @@ pub fn handle_sync(
             .await
             .map_err(|e| format!("Synchronization failed: {}", e))?;
 
+        println!("⏳ Finalizing block commitment and closing stream gracefully...");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
 

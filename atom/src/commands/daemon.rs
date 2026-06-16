@@ -160,13 +160,15 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                                 );
 
                                 // 4. Spawn background async task to handle the actual two-way transfer
-                                tokio::spawn(async move {
-                                    println!("🔄 [Listener] Yamux stream wired to Inbox... Replying to metadata request...");
-                                    match sync_manager.synchronize().await {
-                                        Ok(_) => println!("📥 Successfully saved incoming vault to Inbox: {:?}", inbox_path.display()),
-                                        Err(e) => println!("❌ Sync transfer interrupted: {}", e),
+                                // RUN IT DIRECTLY IN THE WORKER THREAD:
+                                println!("🔄 [Listener] Yamux stream wired to Inbox... Executing blind block sync replication...");
+                                match sync_manager.synchronize().await {
+                                    Ok(_) => {
+                                        println!("📥 Success! Full payload written to disk.");
+                                        println!("💾 Destination: {:?}", inbox_path.display());
                                     }
-                                });
+                                    Err(e) => println!("❌ Sync transfer failed or was cut short: {}", e),
+                                };
                             }
                             Err(e) => println!("❌ Handshake rejected: {}", e),
                         }
