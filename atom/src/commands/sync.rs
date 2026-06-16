@@ -2,9 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 
 use crate::commands::daemon::get_or_create_identity;
-use crate::commands::p2p_utils::{load_friends, parse_atom_uri, to_p2p_meta};
-use crate::vfs::VaultMetadata;
-use tokio_util::compat::FuturesAsyncWriteCompatExt;
+use crate::commands::p2p_utils::{SyncMessage, load_friends, parse_atom_uri};
 
 pub fn handle_sync(
     vault_path: &str,
@@ -23,13 +21,9 @@ pub fn handle_sync(
 
     let (onion_address, friend_pubkey) = parse_atom_uri(&friend.url)?;
 
-    // 1. OPEN VAULT AS A RAW PROTECTED FILE (NO PASSWORD/DECRYPTION)
     let _physical_vault = OpenOptions::new().read(true).write(true).open(vault_path)?;
-
-    // 2. LOAD THE DECOUPLED NETWORK IDENTITY
     let local_identity = get_or_create_identity()?;
 
-    // 3. SET UP SYNC STATE DIRECTORY
     let mut client_state_dir = dirs::home_dir().ok_or("Could not find home directory")?;
     client_state_dir.push(".atom_vault/arti_client_state");
     fs::create_dir_all(&client_state_dir)?;
@@ -42,19 +36,21 @@ pub fn handle_sync(
 
     let physical_vault_path = PathBuf::from(vault_path);
 
-    // Create a blank local metadata state and translate it to appease the SyncManager
-    let empty_local_meta = VaultMetadata {
-        file_table: Vec::new(),
-        cdc_salt: [0u8; 32],
-    };
-    let p2p_compatible_metadata = to_p2p_meta(&empty_local_meta);
-
-    let _ = p2p_compatible_metadata;
-
     let rt = tokio::runtime::Runtime::new()?;
 
-    // 4. EXECUTE RAW BINARY TRANSMISSION OVER TOR
     rt.block_on(async {
+        // Evaluate the local vault metrics to construct the Proposal
+        let metadata = tokio::fs::metadata(&physical_vault_path).await?;
+        let last_modified = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let filename = physical_vault_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
         let atom_net = p2p_sync::AtomSyncManager::new(local_identity, client_state_dir);
         let dummy_master_secret = zeroize::Zeroizing::new([0u8; 32]);
 
@@ -63,33 +59,65 @@ pub fn handle_sync(
             .await
             .map_err(|e| format!("Network connection failed: {}", e))?;
 
-        println!("🔗 Tor tunnel established! Opening raw data stream...");
+        println!("🔗 Tor tunnel established! Negotiating sync parameters...");
 
-        // Open a direct Yamux multiplexed stream to Bob
-        let mut data_stream = control
+        // Open the multiplexed stream and wrap it for bi-directional JSON reading/writing
+        use tokio_util::compat::FuturesAsyncReadCompatExt;
+        let data_stream = control
             .open_stream()
             .await
             .map_err(|e| format!("Failed to open Yamux stream: {}", e))?
-            .compat_write();
+            .compat();
 
-        // Open the physical file asynchronously
-        let mut file = tokio::fs::File::open(&physical_vault_path).await?;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let mut stream_io = BufReader::new(data_stream);
 
-        println!("⏳ Pumping raw ciphertext blocks over Tor...");
-
-        // Pipe the file directly into the Tor stream
-        let bytes_sent = tokio::io::copy(&mut file, &mut data_stream).await?;
-
-        // Gracefully shut down the stream so Bob knows the file is finished
-        use tokio::io::AsyncWriteExt;
-        data_stream.shutdown().await?;
+        // 1. Send the Consent Proposal
+        let proposal = SyncMessage::Proposal {
+            filename,
+            last_modified,
+        };
+        let proposal_json = format!("{}\n", serde_json::to_string(&proposal)?);
+        stream_io.write_all(proposal_json.as_bytes()).await?;
+        stream_io.flush().await?;
 
         println!(
-            "🎉 Blind file transfer complete! Pushed {} bytes.",
-            bytes_sent
+            "⏳ Waiting for {} to accept the vault transfer...",
+            friend_nickname
         );
 
-        // CRITICAL FIX: Ensure Arti flushes its Tor buffers before the runtime closes.
+        // 2. Await Bob's decision
+        let mut reply_line = String::new();
+        stream_io.read_line(&mut reply_line).await?;
+
+        if let Ok(reply) = serde_json::from_str::<SyncMessage>(&reply_line) {
+            match reply {
+                SyncMessage::Accept { action: _ } => {
+                    println!(
+                        "✅ {} accepted the sync! Pumping raw ciphertext blocks...",
+                        friend_nickname
+                    );
+
+                    let mut file = tokio::fs::File::open(&physical_vault_path).await?;
+                    let bytes_sent = tokio::io::copy(&mut file, &mut stream_io).await?;
+
+                    println!(
+                        "🎉 Blind file transfer complete! Pushed {} bytes.",
+                        bytes_sent
+                    );
+                }
+                SyncMessage::Reject => {
+                    println!("❌ {} rejected the sync request.", friend_nickname);
+                }
+                _ => println!(
+                    "❌ Received an invalid protocol response from {}.",
+                    friend_nickname
+                ),
+            }
+        } else {
+            println!("❌ Connection dropped or invalid data received during negotiation.");
+        }
+
         println!("⏳ Finalizing block commitment and gracefully closing circuit...");
         drop(control);
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;

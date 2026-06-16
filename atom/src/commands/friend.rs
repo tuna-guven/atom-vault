@@ -69,6 +69,7 @@ pub fn handle_friend(command: FriendCommands) -> Result<(), Box<dyn std::error::
                 friends.push(FriendRecord {
                     nickname: nickname.clone(),
                     url: url.clone(),
+                    shared_vaults: Vec::new(),
                 });
                 println!("✅ Friend '{}' securely added!", nickname);
                 println!(

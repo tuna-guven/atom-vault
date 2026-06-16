@@ -72,13 +72,36 @@ pub fn parse_atom_uri(onion_url: &str) -> Result<(String, VerifyingKey), AtomUri
 }
 
 // ============================================================================
-// 2. PEER ADDRESS BOOK (FRIENDS)
+// 2. PEER ADDRESS BOOK & PROTOCOL STATE
 // ============================================================================
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SharedVault {
+    pub original_name: String,
+    pub label: String,
+    pub local_path: String,
+    pub last_modified: u64,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FriendRecord {
     pub nickname: String,
     pub url: String,
+    // The default macro ensures old address books won't crash when loading
+    #[serde(default)]
+    pub shared_vaults: Vec<SharedVault>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub enum SyncMessage {
+    Proposal {
+        filename: String,
+        last_modified: u64,
+    },
+    Accept {
+        action: String,
+    },
+    Reject,
 }
 
 fn get_friends_path() -> PathBuf {
@@ -99,7 +122,7 @@ pub fn load_friends() -> Vec<FriendRecord> {
             }
         }
     }
-    vec![] // Return empty list if file doesn't exist or is corrupted
+    vec![]
 }
 
 pub fn save_friends(friends: &[FriendRecord]) {
@@ -110,7 +133,7 @@ pub fn save_friends(friends: &[FriendRecord]) {
     opts.write(true).create(true).truncate(true);
 
     #[cfg(unix)]
-    opts.mode(0o600); // Secure permissions: only owner can read/write address book
+    opts.mode(0o600);
 
     if let Ok(mut file) = opts.open(path) {
         let _ = file.write_all(json.as_bytes());
@@ -125,14 +148,9 @@ use crate::vfs::VaultMetadata;
 
 pub type P2PMetadata = p2p_sync::sync::VaultMetadata;
 
-/// Translates local vault metadata into the P2P networking format.
 pub fn to_p2p_meta(local_meta: &VaultMetadata) -> P2PMetadata {
     P2PMetadata {
-        // Map the salt bytes directly
         cdc_salt: local_meta.cdc_salt,
-        // Since we are doing a blind sync, we pass an empty vector.
-        // Rust's type inference will automatically cast this empty vector
-        // to whatever FileEntry type the p2p_sync crate expects!
         file_table: Vec::new(),
     }
 }

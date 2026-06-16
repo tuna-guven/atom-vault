@@ -1,14 +1,30 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::{rngs::OsRng, RngCore};
 use std::fs::{self, OpenOptions};
+use std::path::PathBuf;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::commands::p2p_utils::{load_friends, parse_atom_uri};
+use crate::commands::p2p_utils::{load_friends, parse_atom_uri, save_friends, SharedVault, SyncMessage};
 
-/// Loads the standalone P2P Identity, or generates a new one if it doesn't exist.
+/// Asynchronously prompts the user in the terminal using a blocking thread
+/// so the main Tokio Tor event loop is never paused.
+async fn ask_user(prompt: String) -> String {
+    tokio::task::spawn_blocking(move || {
+        use std::io::{self, Write};
+        print!("{}", prompt);
+        io::stdout().flush().unwrap();
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf).unwrap();
+        buf.trim().to_string()
+    })
+    .await
+    .unwrap()
+}
+
 pub fn get_or_create_identity() -> Result<SigningKey, Box<dyn std::error::Error>> {
     let mut path = dirs::home_dir().ok_or("Could not find home directory")?;
     path.push(".atom_vault");
@@ -70,7 +86,6 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
             .build()?;
         let (svc, mut stream_requests) = client.launch_onion_service(svc_config)?.unwrap();
 
-        // Checksum generation & Tor v3 generation logic
         let onion_addr = svc.onion_address().unwrap();
         let pubkey_bytes = onion_addr.as_ref();
         use sha3::Digest;
@@ -84,15 +99,8 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
         v3_address.extend_from_slice(&hasher.finalize()[0..2]);
         v3_address.push(0x03);
 
-        let clean_onion = format!(
-            "{}.onion",
-            data_encoding::BASE32_NOPAD
-                .encode(&v3_address)
-                .to_lowercase()
-        );
-        let identity_b32 = data_encoding::BASE32_NOPAD
-            .encode(local_identity.verifying_key().as_bytes())
-            .to_lowercase();
+        let clean_onion = format!("{}.onion", data_encoding::BASE32_NOPAD.encode(&v3_address).to_lowercase());
+        let identity_b32 = data_encoding::BASE32_NOPAD.encode(local_identity.verifying_key().as_bytes()).to_lowercase();
         let final_link = format!("atom://{}/{}", clean_onion, identity_b32);
 
         let mut onion_file_path = dirs::home_dir().unwrap();
@@ -110,11 +118,7 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
         println!("🔗 Your Identity: {}\n", final_link);
         println!("🎧 Listening for incoming mutual friends...");
 
-
         while let Some(rend_request) = futures::StreamExt::next(&mut stream_requests).await {
-            println!("🔌 Incoming Tor circuit rendezvous request...");
-
-            // Dynamically load friends right when the connection hits
             let friends = load_friends();
             let mut authorized_keys: Vec<VerifyingKey> = Vec::new();
             for f in &friends {
@@ -132,69 +136,115 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                         use tokio_util::compat::FuturesAsyncReadCompatExt;
                         let mut stream = arti_stream.compat();
 
-                        match p2p_sync::handshake::execute_handshake(
-                            &mut stream,
-                            false,
-                            &local_identity,
-                            &authorized_keys,
-                        )
-                        .await
-                        {
+                        match p2p_sync::handshake::execute_handshake(&mut stream, false, &local_identity, &authorized_keys).await {
                             Ok(session) => {
                                 let connected_friend = friends.iter().find(|f| {
-                                    parse_atom_uri(&f.url)
-                                        .map(|(_, k)| k == session.remote_static_key)
-                                        .unwrap_or(false)
+                                    parse_atom_uri(&f.url).map(|(_, k)| k == session.remote_static_key).unwrap_or(false)
                                 });
 
-                                let nick = connected_friend
-                                    .map(|f| f.nickname.clone())
-                                    .unwrap_or_else(|| "Unknown".to_string());
-                                println!(
-                                    "🎉 {} is online! Secure messaging channel established.",
-                                    nick
-                                );
+                                let nick = connected_friend.map(|f| f.nickname.clone()).unwrap_or_else(|| "Unknown".to_string());
+                                println!("🎉 {} is online! Secure messaging channel established.", nick);
 
-                                // 1. Setup Bob's Inbox File Destination
-                                let mut inbox_path = dirs::home_dir().unwrap();
-                                inbox_path.push(".atom_vault/Inbox");
-                                fs::create_dir_all(&inbox_path).unwrap_or_default();
-
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs();
-                                inbox_path.push(format!("{}_vault_{}.aegis", nick, timestamp));
-
-                                // 2. Start the Yamux Multiplexer
                                 let (control, inbound_rx) = p2p_sync::transport::start_multiplexer(stream, session.transport, false);
                                 let mut inbound_stream = ReceiverStream::new(inbound_rx);
 
-                                // 3. Spawn the background listener, injecting `control` so it stays alive!
                                 tokio::spawn(async move {
-                                    let _keep_alive = control; // CRITICAL: This prevents Yamux from dropping the connection!
-                                    
-                                    println!("🔄 [Listener] Yamux active. Waiting for Alice's data stream...");
-                                    
-                                    // FIX 1: Disambiguate next()
-                                    if let Some(data_stream) = tokio_stream::StreamExt::next(&mut inbound_stream).await {
-                                        
-                                        // FIX 2: Import the Correct Write Extension
-                                        use tokio_util::compat::FuturesAsyncWriteCompatExt;
-                                        let mut data_stream = data_stream.compat_write();
+                                    let _keep_alive = control;
 
-                                        let mut file = tokio::fs::File::create(&inbox_path).await.unwrap();
+                                    if let Some(data_stream) = tokio_stream::StreamExt::next(&mut inbound_stream).await {
+                                        use tokio_util::compat::FuturesAsyncReadCompatExt;
+                                        let data_stream = data_stream.compat();
                                         
-                                        println!("⏳ Receiving encrypted payload...");
-                                        match tokio::io::copy(&mut data_stream, &mut file).await {
-                                            Ok(bytes) => {
-                                                println!("📥 Success! {} bytes written to disk.", bytes);
-                                                println!("💾 Destination: {:?}", inbox_path.display());
+                                        // Wrap the stream in a buffered reader to intercept the JSON line
+                                        let mut stream_io = tokio::io::BufReader::new(data_stream);
+                                        let mut line = String::new();
+
+                                        if let Ok(_) = stream_io.read_line(&mut line).await {
+                                            if let Ok(msg) = serde_json::from_str::<SyncMessage>(&line) {
+                                                if let SyncMessage::Proposal { filename, last_modified } = msg {
+                                                    println!("📥 Received sync proposal for '{}' from {}", filename, nick);
+
+                                                    let mut friends_db = load_friends();
+                                                    let mut is_new = true;
+                                                    let mut local_save_path = String::new();
+
+                                                    // Check if we already know this vault
+                                                    if let Some(friend) = friends_db.iter_mut().find(|f| f.nickname == nick) {
+                                                        if let Some(vault) = friend.shared_vaults.iter_mut().find(|v| v.original_name == filename) {
+                                                            is_new = false;
+                                                            local_save_path = vault.local_path.clone();
+                                                            vault.last_modified = last_modified;
+                                                        }
+                                                    }
+
+                                                    let mut accepted = false;
+
+                                                    // Request Consent and Metadata Configuration
+                                                    if is_new {
+                                                        let prompt = format!("{} wants to sync {} with you. Do you accept? [Y/n]: ", nick, filename);
+                                                        let ans = ask_user(prompt).await;
+                                                        
+                                                        if ans.to_lowercase() == "y" || ans.is_empty() {
+                                                            let label = ask_user("What is the label for this vault?: ".to_string()).await;
+
+                                                            let mut default_path = dirs::home_dir().unwrap();
+                                                            default_path.push(format!("Downloads/{}/{}", nick, filename));
+                                                            
+                                                            let path_prompt = format!("What is the folder path for the vault? [{}]: ", default_path.display());
+                                                            let mut path_ans = ask_user(path_prompt).await;
+
+                                                            if path_ans.is_empty() {
+                                                                path_ans = default_path.to_string_lossy().to_string();
+                                                            }
+
+                                                            local_save_path = path_ans.clone();
+                                                            accepted = true;
+
+                                                            // Save new vault into the address book
+                                                            if let Some(friend) = friends_db.iter_mut().find(|f| f.nickname == nick) {
+                                                                friend.shared_vaults.push(SharedVault {
+                                                                    original_name: filename.clone(),
+                                                                    label,
+                                                                    local_path: local_save_path.clone(),
+                                                                    last_modified,
+                                                                });
+                                                            }
+                                                            save_friends(&friends_db);
+                                                        }
+                                                    } else {
+                                                        // Automatically accept known synchronized folders
+                                                        accepted = true;
+                                                    }
+
+                                                    // Execute Data Pipeline
+                                                    if accepted {
+                                                        let reply = SyncMessage::Accept { action: "pull_from_you".to_string() };
+                                                        let reply_json = format!("{}\n", serde_json::to_string(&reply).unwrap());
+                                                        stream_io.write_all(reply_json.as_bytes()).await.unwrap();
+                                                        stream_io.flush().await.unwrap();
+
+                                                        let path = PathBuf::from(&local_save_path);
+                                                        if let Some(parent) = path.parent() {
+                                                            fs::create_dir_all(parent).unwrap_or_default();
+                                                        }
+
+                                                        let mut file = tokio::fs::File::create(&local_save_path).await.unwrap();
+                                                        println!("⏳ Receiving encrypted payload into {}...", local_save_path);
+                                                        
+                                                        match tokio::io::copy(&mut stream_io, &mut file).await {
+                                                            Ok(bytes) => println!("📥 Success! {} bytes written to disk.", bytes),
+                                                            Err(e) => println!("❌ Transfer failed: {}", e),
+                                                        }
+                                                    } else {
+                                                        let reply = SyncMessage::Reject;
+                                                        let reply_json = format!("{}\n", serde_json::to_string(&reply).unwrap());
+                                                        stream_io.write_all(reply_json.as_bytes()).await.unwrap();
+                                                        stream_io.flush().await.unwrap();
+                                                        println!("❌ Rejected sync proposal.");
+                                                    }
+                                                }
                                             }
-                                            Err(e) => println!("❌ Transfer failed: {}", e),
                                         }
-                                    } else {
-                                        println!("❌ Connection dropped before data stream was established.");
                                     }
                                 });
                             }
