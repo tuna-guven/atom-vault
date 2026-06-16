@@ -117,20 +117,13 @@ fn parse_vault_path(s: &str) -> Result<String, String> {
     if s.len() > 4096 {
         return Err("Vault path is too long".to_string());
     }
-    if s.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '-') {
-        return Err("Vault name can only contain alphanumeric characters, underscores, or dashes".to_string());
-    }
-    Ok(s.to_string())
-}
-
-
-fn parse_vault_path(s: &str) -> Result<String, String> {
-    if s.is_empty() {
-        return Err("Vault path cannot be empty".to_string());
-    }
-
-    if s.len() > 4096 {
-        return Err("Vault path is too long".to_string());
+    if s.chars()
+        .any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    {
+        return Err(
+            "Vault name can only contain alphanumeric characters, underscores, or dashes"
+                .to_string(),
+        );
     }
     Ok(s.to_string())
 }

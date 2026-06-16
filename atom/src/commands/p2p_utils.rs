@@ -139,18 +139,3 @@ pub fn save_friends(friends: &[FriendRecord]) {
         let _ = file.write_all(json.as_bytes());
     }
 }
-
-// ============================================================================
-// 3. VAULT METADATA TRANSLATION
-// ============================================================================
-
-use crate::vfs::VaultMetadata;
-
-pub type P2PMetadata = p2p_sync::sync::VaultMetadata;
-
-pub fn to_p2p_meta(local_meta: &VaultMetadata) -> P2PMetadata {
-    P2PMetadata {
-        cdc_salt: local_meta.cdc_salt,
-        file_table: Vec::new(),
-    }
-}

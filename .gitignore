@@ -1,4 +1,5 @@
 Cargo.lock
+atom/Cargo.lock
 target/
 atom/target/
 p2p-sync/target/
