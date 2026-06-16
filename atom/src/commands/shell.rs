@@ -104,6 +104,32 @@ pub fn start_interactive_shell(
                     )?;
                 }
             }
+            "view" => {
+                if parts.len() < 2 {
+                    println!("Error: Missing argument.");
+                    println!("Usage: view <vfs_name>");
+                } else {
+                    let vfs_name = parts[1];
+
+                    if let Some(file_index) = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name) {
+                        
+                        // KORUMA 1: Okumadan önce bekleyen tüm 'import' yazma işlemlerini diske zorla (Flush)
+                        let _ = physical_vault.sync_all();
+
+                        // KORUMA 2: '?' kullanmıyoruz! Hata gelirse ekrana basıp loop'a (shell'e) devam ediyoruz.
+                        if let Err(e) = crate::commands::view::execute(
+                            physical_vault,
+                            file_index,
+                            unlocked_vault,
+                        ) {
+                            eprintln!("❌ View Error: {}", e);
+                        }
+                        
+                    } else {
+                        println!("Error: File '{}' not found inside the vault.", vfs_name);
+                    }
+                }
+            }
             "vacuum" => {
                 crate::commands::vacuum::handle_vacuum(
                     &vault_path,

@@ -4,6 +4,7 @@ mod crypto;
 mod vfs;
 mod storage;
 mod chunker;
+pub mod sandbox;
 
 use clap::Parser;
 use cli::{Cli, Commands};
