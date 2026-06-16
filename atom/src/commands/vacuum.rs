@@ -50,9 +50,7 @@ pub fn handle_vacuum(
     physical_vault.read_exact(&mut metadata_nonce)?;
 
     let mut encrypted_metadata = Vec::new();
-    physical_vault
-        .take(10 * 1024 * 1024)
-        .read_to_end(&mut encrypted_metadata)?;
+    physical_vault.take(10 * 1024 * 1024).read_to_end(&mut encrypted_metadata)?;
 
     tmp_file.seek(SeekFrom::Start(new_payload_offset))?;
     tmp_file.write_all(&metadata_nonce)?;
@@ -60,14 +58,12 @@ pub fn handle_vacuum(
 
     tmp_file.seek(SeekFrom::Start(0))?;
     tmp_file.write_all(&new_payload_offset.to_le_bytes())?;
-
+    
     tmp_file.sync_all()?;
     drop(tmp_file);
-
+    
     std::fs::rename(&tmp_path, vault_path)?;
 
-    println!(
-        "[Vacuum] Optimization complete. Discarded dead zones and atomically defragmented storage container."
-    );
+    println!("[Vacuum] Optimization complete. Discarded dead zones and atomically defragmented storage container.");
     Ok(())
 }

@@ -34,16 +34,14 @@ pub fn load_vault_metadata(
     file.read_exact(&mut metadata_nonce)?;
 
     let mut encrypted_metadata = Vec::new();
-    file.take(10 * 1024 * 1024)
-        .read_to_end(&mut encrypted_metadata)?;
+    file.take(10 * 1024 * 1024).read_to_end(&mut encrypted_metadata)?;
 
     let decrypted_metadata_bytes = crate::crypto::decrypt_chunk(
         &unlocked_vault,
         &encrypted_metadata,
         &metadata_nonce,
         master_pointer,
-    )
-    .map_err(|e| format!("Metadata decrypt error: {:?}", e))?;
+    ).map_err(|e| format!("Metadata decrypt error: {:?}", e))?;
 
     let metadata: VaultMetadata = bincode::deserialize(&decrypted_metadata_bytes)?;
 

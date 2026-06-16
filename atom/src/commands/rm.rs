@@ -13,14 +13,11 @@ pub fn handle_rm(
         "[Wiping] Commencing SSD-Safe Crypto-Shredding for '{}'...",
         vfs_name
     );
-
-    let to_be_removed_file_position = metadata
-        .file_table
-        .iter()
-        .position(|f| f.vfs_name == vfs_name);
+    
+    let to_be_removed_file_position = metadata.file_table.iter().position(|f| f.vfs_name == vfs_name);
     if let Some(index) = to_be_removed_file_position {
         metadata.file_table.remove(index);
-
+        
         crate::storage::save_vault_metadata(
             physical_vault,
             metadata,

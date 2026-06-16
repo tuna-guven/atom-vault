@@ -70,36 +70,31 @@ fn test_bincode_vault_metadata_serialization_loop() {
     // Write the 8-byte master pointer at offset 0 pointing to metadata position (offset 8)
     file.write_all(&payload_end_offset.to_le_bytes()).unwrap();
 
-    // Write the encrypted metadata payload at the specified offset
+    // Write encrypted metadata payload at target offset
     file.seek(SeekFrom::Start(payload_end_offset)).unwrap();
-    file.write_all(&ciphertext_len.to_le_bytes()).unwrap();
     file.write_all(&metadata_nonce).unwrap();
     file.write_all(&ciphertext).unwrap();
 
-    // 3. Simulating app restart: read the 8-byte master pointer first
+    // Parse the 8-byte master pointer
     file.seek(SeekFrom::Start(0)).unwrap();
     let mut ptr_bytes = [0u8; 8];
     file.read_exact(&mut ptr_bytes).unwrap();
     let read_metadata_offset = u64::from_le_bytes(ptr_bytes);
     assert_eq!(read_metadata_offset, payload_end_offset);
 
-    // Seek directly to the dynamic tail location using the parsed pointer
+    // Read metadata nonce and ciphertext
     file.seek(SeekFrom::Start(read_metadata_offset)).unwrap();
-    let mut len_bytes = [0u8; 8];
-    file.read_exact(&mut len_bytes).unwrap();
-    let read_cipher_len = u64::from_le_bytes(len_bytes) as usize;
-
     let mut read_nonce = [0u8; crypto::XNONCE_LEN];
     file.read_exact(&mut read_nonce).unwrap();
 
-    let mut read_cipher_buffer = vec![0u8; read_cipher_len];
-    file.read_exact(&mut read_cipher_buffer).unwrap();
+    let mut read_cipher_buffer = Vec::new();
+    file.read_to_end(&mut read_cipher_buffer).unwrap();
 
     let decrypted_bytes =
         crypto::decrypt_chunk(&unlocked_vault, &read_cipher_buffer, &read_nonce).unwrap();
     let parsed_metadata: VaultMetadata = bincode::deserialize(&decrypted_bytes).unwrap();
 
-    // 4. Structural Verification
+    // Structural Verification
     assert_eq!(parsed_metadata.file_table.len(), 1);
     assert_eq!(parsed_metadata.file_table[0].vfs_name, "secure_payload.bin");
     assert_eq!(parsed_metadata.file_table[0].chunks.len(), 2);
@@ -119,7 +114,7 @@ fn test_process_secure_chunk_callback_execution() {
     let (wrapped_dek, dek_nonce) = crypto::wrap_dek(&kek, &raw_dek).unwrap();
     let unlocked_vault = crypto::unwrap_dek(&kek, &wrapped_dek, &dek_nonce).unwrap();
 
-    // 1. Write encrypted dummy data to simulated RAM disk
+    let mock_chunk_offset = 112u64;
     let raw_payload = b"SECRET_CHUNK_DATA";
     let secure_buffer = Zeroizing::new(raw_payload.to_vec());
     let (ciphertext, chunk_nonce) = crypto::encrypt_chunk(&unlocked_vault, &secure_buffer).unwrap();
@@ -127,19 +122,19 @@ fn test_process_secure_chunk_callback_execution() {
     mem_file.write_all(&ciphertext).unwrap();
     mem_file.seek(SeekFrom::Start(0)).unwrap();
 
-    // 2. Execute process_secure_chunk and capture decrypted plaintext inside closure
+    // Execute safe pipeline and capture plaintext via callback enclosure
     let mut validated_data = Vec::new();
     process_secure_chunk(
-        &mut mem_file,
+        &mut physical_file,
         ciphertext.len(),
         &chunk_nonce,
         &unlocked_vault,
+        mock_chunk_offset,
         |plaintext| {
             validated_data.extend_from_slice(plaintext);
         },
     )
     .unwrap();
 
-    // 3. Assert callback executed successfully with correct context match
     assert_eq!(validated_data, raw_payload);
 }

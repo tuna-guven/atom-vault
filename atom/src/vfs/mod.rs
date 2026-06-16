@@ -25,7 +25,6 @@ pub struct FileIndex {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VaultMetadata {
     pub file_table: Vec<FileIndex>,
-    // KEPT FROM MAIN BRANCH: Required for the MaskedReader chunking security
     pub cdc_salt: [u8; 32],
 }
 
@@ -84,8 +83,13 @@ where
         std::panic::resume_unwind(err);
     }
 
+    if let Err(err) = action_result {
+        std::panic::resume_unwind(err);
+    }
+
     Ok(())
 }
+
 
 pub struct MemFile {
     fd: OwnedFd,
@@ -97,11 +101,11 @@ impl MemFile {
     pub fn new(vault_name: &str, vault_size: usize) -> Result<Self, Box<dyn std::error::Error>> {
         let vault_name = CString::new(vault_name)?;
 
-        // Request an empty file from Linux, explicitly allowing Seals
+        // we want from linux to create an empty file for us
         let flags = MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING;
         let fd = memfd_create(&vault_name, flags)?;
 
-        // Lock vault to a fixed size
+        // we want vault to be fixed size
         ftruncate(&fd, vault_size as i64)?;
 
         let raw_ptr = unsafe {

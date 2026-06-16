@@ -46,9 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sub_command_result?;
         }
         Err(_) => {
-            eprintln!(
-                "[FATAL] Process memory safely purged via unwinding. Emergency exit enforced."
-            );
+            eprintln!("[FATAL] Process memory safely purged via unwinding. Emergency exit enforced.");
             std::process::exit(1);
         }
     }

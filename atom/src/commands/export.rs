@@ -22,14 +22,9 @@ pub fn handle_export(
 
     let mut output_file = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create_new(true) 
         .open(&to_disk)
-        .map_err(|e| {
-            format!(
-                "Failed to create output file '{}' (it might already exist): {:?}",
-                to_disk, e
-            )
-        })?;
+        .map_err(|e| format!("Failed to create output file '{}' (it might already exist): {:?}", to_disk, e))?;
 
     for chunk in &target_file.chunks {
         physical_vault.seek(SeekFrom::Start(chunk.offset))?;
@@ -43,17 +38,14 @@ pub fn handle_export(
                 &cipher_buffer,
                 &chunk.nonce,
                 chunk.offset,
-            )
-            .map_err(|e| format!("Decryption error: {:?}", e))?,
+            ).map_err(|e| format!("Decryption error: {:?}", e))?
         );
 
         output_file.write_all(&decrypted_bytes)?;
+        
     }
     output_file.sync_all()?;
 
-    println!(
-        "[Success] File '{}' successfully exported and decrypted.",
-        vfs_name
-    );
+    println!("[Success] File '{}' successfully exported and decrypted.", vfs_name);
     Ok(())
 }

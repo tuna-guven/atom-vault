@@ -144,10 +144,7 @@ pub fn start_interactive_shell(
                     .chars()
                     .map(|c| if c.is_ascii_control() { '?' } else { c })
                     .collect();
-                println!(
-                    "Unknown command: '{}'. Type 'help' for available commands.",
-                    sanitized_name
-                );
+                println!("Unknown command: '{}'. Type 'help' for available commands.", sanitized_name);
             }
         }
     }

@@ -26,12 +26,12 @@ pub fn handle_create(vault_path: &str, vault_name: &str) -> Result<(), Box<dyn s
 
     let salt = crate::crypto::generate_32_bytes();
     let dek = Zeroizing::new(crate::crypto::generate_32_bytes());
-
+    
     let kek = crate::crypto::derive_kek(&password, &salt)
         .map_err(|e| format!("Argon2 error: {:?}", e))?;
-
-    let (wrapped_dek, dek_nonce) =
-        crate::crypto::wrap_dek(&kek, &dek).map_err(|e| format!("Encryption error: {:?}", e))?;
+        
+    let (wrapped_dek, dek_nonce) = crate::crypto::wrap_dek(&kek, &dek)
+        .map_err(|e| format!("Encryption error: {:?}", e))?;
 
     let unlocked_vault = crate::crypto::unwrap_dek(&kek, &wrapped_dek, &dek_nonce)
         .map_err(|e| format!("DEK unwrap error: {:?}", e))?;
@@ -41,15 +41,10 @@ pub fn handle_create(vault_path: &str, vault_name: &str) -> Result<(), Box<dyn s
         .write(true)
         .create_new(true) // Dosya halihazırda varsa hata döndürür
         .open(&actual_file_path)
-        .map_err(|e| {
-            format!(
-                "Failed to create vault file (it might already exist): {:?}",
-                e
-            )
-        })?;
-
-    let payload_offset: u64 = 112;
-
+        .map_err(|e| format!("Failed to create vault file (it might already exist): {:?}", e))?;
+    
+    let payload_offset: u64 = 112; 
+    
     file.write_all(&payload_offset.to_le_bytes())?;
     file.write_all(&salt)?;
     file.write_all(&dek_nonce)?;
