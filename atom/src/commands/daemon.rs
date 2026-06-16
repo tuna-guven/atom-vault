@@ -28,7 +28,6 @@ pub fn get_or_create_identity() -> Result<SigningKey, Box<dyn std::error::Error>
 
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    
     #[cfg(unix)]
     opts.mode(0o600);
 
@@ -44,7 +43,7 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
 
     let local_identity = get_or_create_identity()?;
 
-    let mut state_dir = dirs::home_dir().unwrap();
+    let mut state_dir = dirs::home_dir().ok_or("Could not find home directory")?;
     state_dir.push(".atom_vault/arti_state");
     fs::create_dir_all(&state_dir)?;
     
