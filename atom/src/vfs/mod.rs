@@ -2,7 +2,7 @@ use nix::sys::memfd::{MemFdCreateFlag, memfd_create};
 use nix::unistd::{Whence, ftruncate, lseek};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
-use std::io::{Error, ErrorKind, Read, Result as IoResult, Seek, SeekFrom, Write};
+use std::io::{Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind};
 use std::os::fd::{AsRawFd, OwnedFd};
 use zeroize::Zeroize;
 
@@ -10,7 +10,7 @@ use zeroize::Zeroize;
 pub struct ChunkEntry {
     pub cipher_len: usize,
     pub offset: u64,
-    // with merkle tree we would get deterministic nonce here instead of creating totally random bytes
+    // TODO: Replace random bytes with deterministic nonce generation using a Merkle tree approach
     pub nonce: [u8; crate::crypto::XNONCE_LEN],
 }
 
@@ -28,31 +28,26 @@ pub struct VaultMetadata {
     pub cdc_salt: [u8; 32],
 }
 
+/// Decrypts a chunk directly into memory, locks it to prevent swapping, 
+/// executes the provided closure, and guarantees memory zeroing even on panic.
 pub fn process_secure_chunk<F>(
     physical_vault: &mut std::fs::File, // Bypass RAM disk and read straight from SSD
     cipher_len: usize,
     nonce: &[u8; crate::crypto::XNONCE_LEN],
     unlocked_vault: &crate::crypto::UnlockedVault,
-    chunk_offset: u64, // Required for the new AAD chunk reordering protection
-    action: F,
-) -> std::io::Result<()>
-where
-    F: FnOnce(&[u8]),
-{
+    chunk_offset: u64,
+    action: F,   
+) -> std::io::Result<()> where F: FnOnce(&[u8]), {
+
+    physical_vault.seek(SeekFrom::Start(chunk_offset))?;
+
     let mut cipher_buffer = vec![0u8; cipher_len];
     physical_vault.read_exact(&mut cipher_buffer)?;
 
-    let mut secure_plaintext =
-        crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce, chunk_offset).map_err(
-            |e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Decryption error: {:?}", e),
-                )
-            },
-        )?;
-
-    // Lock on ram to prevent swap leakage
+    let mut secure_plaintext = crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce, chunk_offset)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Decryption error: {:?}", e)))?;
+    
+    // Lock memory page to prevent OS from swapping plaintext to disk
     let mlock_result = unsafe {
         libc::mlock(
             secure_plaintext.as_ptr() as *const libc::c_void,
@@ -63,7 +58,7 @@ where
         return Err(std::io::Error::last_os_error());
     }
 
-    // Execute closure with panic-catching to guarantee zeroization even on crash
+    // Isolate execution to ensure sensitive data is wiped even if the action panics
     let action_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         action(&secure_plaintext);
     }));
@@ -83,6 +78,7 @@ where
         std::panic::resume_unwind(err);
     }
 
+    // Resume panic if the action failed, maintaining safety guarantees
     if let Err(err) = action_result {
         std::panic::resume_unwind(err);
     }
@@ -90,7 +86,7 @@ where
     Ok(())
 }
 
-
+/// A highly secure, memory-backed file representation using Linux memfd and mmap.
 pub struct MemFile {
     fd: OwnedFd,
     fixed_size: usize,
@@ -101,11 +97,11 @@ impl MemFile {
     pub fn new(vault_name: &str, vault_size: usize) -> Result<Self, Box<dyn std::error::Error>> {
         let vault_name = CString::new(vault_name)?;
 
-        // we want from linux to create an empty file for us
+        // Enforce CLOEXEC to prevent file descriptor leaking to child processes
         let flags = MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING;
         let fd = memfd_create(&vault_name, flags)?;
 
-        // we want vault to be fixed size
+        // Allocate strict file size
         ftruncate(&fd, vault_size as i64)?;
 
         let raw_ptr = unsafe {
@@ -123,7 +119,7 @@ impl MemFile {
             return Err(Box::new(std::io::Error::last_os_error()));
         }
 
-        // Apply OS-level seals to prevent the file from being resized or swapped
+        // Seal the file to prevent unauthorized resizing
         unsafe {
             libc::fcntl(
                 fd.as_raw_fd(),
@@ -140,6 +136,14 @@ impl MemFile {
     }
 }
 
+// Extract raw FD for Landlock isolation bindings
+impl std::os::fd::AsRawFd for MemFile {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+// Anti-forensics: Force overwrite mapped memory with zeros before unmapping
 impl Drop for MemFile {
     fn drop(&mut self) {
         unsafe {
@@ -150,12 +154,9 @@ impl Drop for MemFile {
     }
 }
 
-// Implement standard I/O traits
 impl Write for MemFile {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        let written_size =
-            nix::unistd::write(&self.fd, buf).map_err(|e| Error::new(ErrorKind::Other, e))?;
-        Ok(written_size)
+        nix::unistd::write(&self.fd, buf).map_err(|e| Error::new(ErrorKind::Other, e))
     }
 
     fn flush(&mut self) -> IoResult<()> {
@@ -165,9 +166,7 @@ impl Write for MemFile {
 
 impl Read for MemFile {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        let read_size = nix::unistd::read(self.fd.as_raw_fd(), buf)
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
-        Ok(read_size)
+        nix::unistd::read(self.fd.as_raw_fd(), buf).map_err(|e| Error::new(ErrorKind::Other, e))
     }
 }
 

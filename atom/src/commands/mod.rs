@@ -9,6 +9,7 @@ pub mod import;
 pub mod ls;
 pub mod p2p_utils;
 pub mod rm;
+pub mod vacuum;
+pub mod view;
 pub mod shell;
 pub mod sync;
-pub mod vacuum;
