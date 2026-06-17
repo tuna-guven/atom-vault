@@ -43,14 +43,16 @@ pub fn start_interactive_shell(
                     let from_disk = parts[1].to_string();
                     let vfs_name = parts[2].to_string();
                     
-                    crate::commands::import::handle_import(
+                    if let Err(e) = crate::commands::import::handle_import(
                         from_disk,
                         vfs_name,
                         physical_vault,
                         metadata,
                         unlocked_vault,
                         &mut current_payload_offset,
-                    )?;
+                    ) {
+                        eprintln!("{}", e);
+                    }
                 }
             }
             
@@ -74,18 +76,33 @@ pub fn start_interactive_shell(
             "export" => {
                 if parts.len() < 3 {
                     println!("Error: Missing arguments.");
-                    println!("Usage: export <vfs_name> <to_disk_path>");
+                    println!("Usage: export <vfs_name> <target_filename>");
                 } else {
                     let vfs_name = parts[1].to_string();
                     let to_disk = parts[2].to_string();
                     
-                    crate::commands::export::handle_export(
-                        vfs_name,
-                        to_disk,
-                        metadata,
-                        physical_vault,
-                        unlocked_vault,
-                    )?;
+                    print!("\n[WARNING] You are about to extract decrypted data to the physical disk (Staging Area).\nAre you sure you want to proceed? [y/N]: ");
+                    
+                    std::io::stdout().flush().unwrap_or_default();
+                    
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).unwrap_or_default();
+                    
+                    if input.trim().eq_ignore_ascii_case("y") {
+                        
+                        if let Err(e) = crate::commands::export::handle_export(
+                            vfs_name,
+                            to_disk,
+                            metadata,
+                            physical_vault,
+                            unlocked_vault,
+                        ) {
+                            eprintln!("{}", e);
+                        }
+                        
+                    } else {
+                        println!("Export operation cancelled by user. The vault remains secure.");
+                    }
                 }
             }
 

@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Write, Seek, SeekFrom};
+use std::path::Path;
 use crate::crypto::{self, UnlockedVault};
 use crate::vfs::{VaultMetadata, ChunkEntry, FileIndex};
 
@@ -11,6 +12,31 @@ pub fn handle_import(
     unlocked_vault: &UnlockedVault, 
     current_payload_offset: &mut u64
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let staging_dir_str = if let Ok(home) = std::env::var("HOME") {
+        format!("{}/atom_staging", home)
+    } else if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        format!("{}/atom_staging", xdg_runtime)
+    } else {
+        return Err("Security Error: Neither HOME nor XDG_RUNTIME_DIR environment variables are set.".into());
+    };
+    
+    let allowed_path = Path::new(&staging_dir_str).canonicalize()
+        .map_err(|_| "Fatal: Could not resolve staging directory path.")?;
+
+    let target_path = Path::new(&from_disk).canonicalize()
+        .map_err(|_| format!("Error: The file '{}' does not exist or cannot be resolved.", from_disk))?;
+
+    if !target_path.starts_with(&allowed_path) {
+        return Err(format!(
+            "Security Violation: Imports are strictly limited to the staging area.\n\
+             Please move your file to: {}\n\
+             Attempted to access: {}", 
+             staging_dir_str, 
+             target_path.display()
+        ).into());
+    }
+
+
     if metadata.file_table.iter().any(|f| f.vfs_name == vfs_name) {
         return Err(format!("Error: A file named '{}' already exists in the vault.", vfs_name).into());
     }

@@ -22,6 +22,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments using our secure customized styling interface
     let args = Cli::parse();
 
+    let staging_dir_str = if let Ok(home) = std::env::var("HOME") {
+        format!("{}/atom_staging", home)
+    } else if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        format!("{}/atom_staging", xdg_runtime)
+    } else {
+        return Err("Security Error: Neither HOME nor XDG_RUNTIME_DIR environment variables are set.".into());
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&staging_dir_str) {
+        eprintln!("Warning: Failed to create staging directory at {}: {}", staging_dir_str, e);
+    }
+    // --------------------------------------------------------------------
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Route system execution to targeted synchronous sub-command handlers
         match args.command {
