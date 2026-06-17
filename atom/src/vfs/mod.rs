@@ -1,9 +1,10 @@
-use std::os::fd::{OwnedFd, AsRawFd}; 
+use nix::sys::memfd::{MemFdCreateFlag, memfd_create};
+use nix::unistd::{Whence, ftruncate, lseek};
+use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::io::{Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind};
 use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
-use nix::unistd::{ftruncate, lseek, Whence};
-use serde::{Serialize, Deserialize};
+use std::os::fd::{AsRawFd, OwnedFd};
 use zeroize::Zeroize;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -18,6 +19,8 @@ pub struct ChunkEntry {
 pub struct FileIndex {
     pub vfs_name: String,
     pub chunks: Vec<ChunkEntry>,
+    // KEPT FROM P2P BRANCH: Required for Briar-style vector clock syncing
+    pub last_modified_unix: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -29,7 +32,7 @@ pub struct VaultMetadata {
 /// Decrypts a chunk directly into memory, locks it to prevent swapping, 
 /// executes the provided closure, and guarantees memory zeroing even on panic.
 pub fn process_secure_chunk<F>(
-    physical_vault: &mut std::fs::File,
+    physical_vault: &mut std::fs::File, // Bypass RAM disk and read straight from SSD
     cipher_len: usize,
     nonce: &[u8; crate::crypto::XNONCE_LEN],
     unlocked_vault: &crate::crypto::UnlockedVault,
@@ -47,7 +50,10 @@ pub fn process_secure_chunk<F>(
     
     // Lock memory page to prevent OS from swapping plaintext to disk
     let mlock_result = unsafe {
-        libc::mlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len())
+        libc::mlock(
+            secure_plaintext.as_ptr() as *const libc::c_void,
+            secure_plaintext.len(),
+        )
     };
     if mlock_result != 0 {
         return Err(std::io::Error::last_os_error());
@@ -58,11 +64,19 @@ pub fn process_secure_chunk<F>(
         action(&secure_plaintext);
     }));
 
-    // Zero-out the buffer immediately after use
+    // Securely overwrite the plaintext in RAM
     secure_plaintext.zeroize();
 
     unsafe {
-        libc::munlock(secure_plaintext.as_ptr() as *const libc::c_void, secure_plaintext.len());
+        libc::munlock(
+            secure_plaintext.as_ptr() as *const libc::c_void,
+            secure_plaintext.len(),
+        );
+    }
+
+    // Resume the panic if the closure failed
+    if let Err(err) = action_result {
+        std::panic::resume_unwind(err);
     }
 
     // Resume panic if the action failed, maintaining safety guarantees
@@ -93,12 +107,12 @@ impl MemFile {
 
         let raw_ptr = unsafe {
             libc::mmap(
-                std::ptr::null_mut(),                 
-                vault_size,                           
-                libc::PROT_READ | libc::PROT_WRITE,   
-                libc::MAP_SHARED,                     
-                fd.as_raw_fd(),                       
-                0                                     
+                std::ptr::null_mut(),               // OS shall pick an address which is empty
+                vault_size,                         // Memory size to be mapped
+                libc::PROT_READ | libc::PROT_WRITE, // both write and read permissions
+                libc::MAP_SHARED,                   // changes shall affect the file
+                fd.as_raw_fd(),                     // our ram file's ID
+                0,                                  // offset from the doc header
             )
         };
 
@@ -111,15 +125,15 @@ impl MemFile {
             libc::fcntl(
                 fd.as_raw_fd(),
                 libc::F_ADD_SEALS,
-                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL
+                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
             );
         }
 
-        Ok(Self { 
-            fd, 
+        Ok(Self {
+            fd,
             fixed_size: vault_size,
             memory_ptr: std::ptr::NonNull::new(raw_ptr).unwrap(),
-        })        
+        })
     }
 }
 
@@ -134,6 +148,7 @@ impl std::os::fd::AsRawFd for MemFile {
 impl Drop for MemFile {
     fn drop(&mut self) {
         unsafe {
+            // Explicitly wipe the mapped memory with 0s before unmapping
             self.memory_ptr.as_ptr().write_bytes(0, self.fixed_size);
             libc::munmap(self.memory_ptr.as_ptr(), self.fixed_size);
         }

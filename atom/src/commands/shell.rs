@@ -1,31 +1,30 @@
-use std::fs::File;
-use std::io::{self, Write};
 use crate::crypto::UnlockedVault;
 use crate::vfs::VaultMetadata;
+use std::fs::File;
+use std::io::{self, Write};
 
 pub fn start_interactive_shell(
     metadata: &mut VaultMetadata,
     physical_vault: &mut File,
     unlocked_vault: &UnlockedVault,
     mut current_payload_offset: u64,
-    vault_path: String, 
+    vault_path: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
     println!("\n==================================================");
     println!("      Welcome to Atom Vault Secure Shell!         ");
     println!("  Your cryptographically isolated workspace is ready. ");
     println!("==================================================\n");
 
-    loop { 
+    loop {
         print!("atom-vault> ");
         io::stdout().flush()?;
-        
+
         let mut input = zeroize::Zeroizing::new(String::new());
         io::stdin().read_line(&mut input)?;
-        
+
         let trimmed_input = input.trim();
         let parts: Vec<&str> = trimmed_input.split_whitespace().collect();
-        
+
         if parts.is_empty() {
             continue;
         }
@@ -34,7 +33,7 @@ pub fn start_interactive_shell(
             "ls" => {
                 crate::commands::ls::handle_ls(metadata);
             }
-            
+
             "import" => {
                 if parts.len() < 3 {
                     println!("Error: Missing arguments.");
@@ -55,14 +54,14 @@ pub fn start_interactive_shell(
                     }
                 }
             }
-            
+
             "rm" => {
                 if parts.len() < 2 {
                     println!("Error: Missing argument.");
                     println!("Usage: rm <vfs_name>");
                 } else {
                     let vfs_name = parts[1].to_string();
-                    
+
                     crate::commands::rm::handle_rm(
                         vfs_name,
                         metadata,
@@ -72,7 +71,7 @@ pub fn start_interactive_shell(
                     )?;
                 }
             }
-            
+
             "export" => {
                 if parts.len() < 3 {
                     println!("Error: Missing arguments.");
@@ -112,7 +111,7 @@ pub fn start_interactive_shell(
                     println!("Usage: cat <vfs_name>");
                 } else {
                     let vfs_name = parts[1].to_string();
-                    
+
                     crate::commands::cat::handle_cat(
                         vfs_name,
                         metadata,
@@ -148,33 +147,41 @@ pub fn start_interactive_shell(
                 }
             }
             "vacuum" => {
-                crate::commands::vacuum::handle_vacuum(
-                    &vault_path,
-                    metadata,
-                    physical_vault,
-                )?;
+                crate::commands::vacuum::handle_vacuum(&vault_path, metadata, physical_vault)?;
                 *physical_vault = File::options().read(true).write(true).open(&vault_path)?;
                 current_payload_offset = physical_vault.metadata()?.len();
             }
-            
+
             "help" => {
                 println!("\nAvailable Commands inside the Secure Shell:");
                 println!("  ls                                  - List all files inside the vault");
-                println!("  cat <vfs_name>                      - Read and display a file securely in RAM");
-                println!("  import <from_disk> <vfs_name>       - Encrypt and import a host file into the vault");
-                println!("  export <vfs_name> <to_disk>         - Decrypt and export a file back to the host disk");
-                println!("  rm <vfs_name>                       - Cryptographically shred a file reference from metadata");
-                println!("  vacuum                              - Defragment and shrink the physical .aegis container");
+                println!(
+                    "  cat <vfs_name>                      - Read and display a file securely in RAM"
+                );
+                println!(
+                    "  import <from_disk> <vfs_name>       - Encrypt and import a host file into the vault"
+                );
+                println!(
+                    "  export <vfs_name> <to_disk>         - Decrypt and export a file back to the host disk"
+                );
+                println!(
+                    "  rm <vfs_name>                       - Cryptographically shred a file reference from metadata"
+                );
+                println!(
+                    "  vacuum                              - Defragment and shrink the physical .aegis container"
+                );
                 println!("  help                                - Show this help menu");
-                println!("  exit                                - Lock vault, purge cryptographic keys, and exit\n");
+                println!(
+                    "  exit                                - Lock vault, purge cryptographic keys, and exit\n"
+                );
             }
-            
+
             "exit" => {
                 println!("[Wiping] Purging ephemeral keys from RAM...");
                 println!("Locking vault and exiting secure shell. Goodbye!");
-                break; 
+                break;
             }
-            
+
             _ => {
                 let sanitized_name: String = parts[0]
                     .chars()

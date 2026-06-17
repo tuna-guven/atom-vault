@@ -15,6 +15,12 @@ fn test_streaming_chunker_boundaries() {
     assert!(!chunk_boundaries.is_empty(), "Chunk stream should yield boundaries");
     
     let first_chunk_info = chunk_boundaries[0].as_ref().unwrap();
-    assert!(first_chunk_info.length > 0, "Chunk length must be greater than 0");
-    assert_eq!(first_chunk_info.offset, 0, "First chunk offset must start at 0");
+    assert!(
+        first_chunk_info.length > 0,
+        "Chunk length must be greater than 0"
+    );
+    assert_eq!(
+        first_chunk_info.offset, 0,
+        "First chunk offset must start at 0"
+    );
 }

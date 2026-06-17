@@ -9,11 +9,7 @@ pub fn handle_cat(
     physical_vault: &mut File,
     unlocked_vault: &UnlockedVault,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
-    let file_entry = metadata
-        .file_table
-        .iter()
-        .find(|f| f.vfs_name == vfs_name);
+    let file_entry = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name);
 
     let target_file = match file_entry {
         Some(file) => file,
@@ -30,7 +26,7 @@ pub fn handle_cat(
         physical_vault.seek(SeekFrom::Start(chunk.offset))?;
 
         crate::vfs::process_secure_chunk(
-            physical_vault, 
+            physical_vault,
             chunk.cipher_len,
             &chunk.nonce,
             unlocked_vault,
@@ -45,14 +41,17 @@ pub fn handle_cat(
 
     let final_pos = memfile.seek(SeekFrom::Current(0))?;
     memfile.seek(SeekFrom::Start(0))?;
-    
+
     let mut buffer = zeroize::Zeroizing::new(vec![0u8; final_pos as usize]);
     memfile.read_exact(&mut *buffer)?;
-    
+
     println!("\n--- Start of {} ---", vfs_name);
     let mut stdout = io::stdout().lock();
-    
-    let control_chars_count = buffer.iter().filter(|&&b| b < 32 && b != b'\n' && b != b'\t' && b != b'\r').count();
+
+    let control_chars_count = buffer
+        .iter()
+        .filter(|&&b| b < 32 && b != b'\n' && b != b'\t' && b != b'\r')
+        .count();
     let is_probably_binary = control_chars_count > (buffer.len() / 100); // %1 eşiği
 
     if is_probably_binary {
@@ -82,7 +81,7 @@ pub fn handle_cat(
             let _ = writeln!(stdout);
         }
     }
-    
+
     let _ = stdout.flush();
     println!("\n--- End of {} ---\n", vfs_name);
 

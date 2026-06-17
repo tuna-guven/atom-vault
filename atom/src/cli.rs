@@ -30,22 +30,67 @@ pub struct Cli {
 pub enum Commands {
     /// Create a new, empty secure vault container file
     Create {
-        /// Path to the new secure vault file on disk
         #[arg(long, default_value = ".")]
         vault_path: String,
 
-        /// Target name for the virtual memory layout (Max 32 ASCII chars)
         #[arg(long, value_parser = parse_vault_name)]
         vault_name: String,
     },
 
     /// Unlock a vault and enter its cryptographically isolated interactive shell
     Enter {
-        /// Path to the .aegis vault file on disk
         #[arg(long, default_value = "my_data.aegis", value_parser = parse_vault_path)]
         vault_path: String,
     },
+
+    // --- P2P PROTOCOL COMMANDS ---
+    /// Show your own Atom ID and connection link to share with friends
+    Id,
+
+    /// Start the embedded Tor background daemon
+    Daemon,
+
+    /// Manage P2P connections and friends
+    Friend {
+        #[command(subcommand)]
+        command: FriendCommands,
+    },
+
+    /// Synchronize your vault with a connected friend
+    Sync {
+        /// Path to the .aegis vault file to sync
+        #[arg(
+            value_name = "VAULT_PATH",
+            required = true,
+            index = 1,
+            default_value = "my_data.aegis",
+            value_parser = parse_vault_path
+        )]
+        vault_path: String,
+
+        /// The nickname of the friend you want to sync with
+        #[arg(value_name = "FRIEND_NICKNAME", required = true, index = 2)]
+        friend_nickname: String,
+    },
 }
+
+#[derive(Subcommand, Debug)]
+pub enum FriendCommands {
+    /// Add or update a friend using their atom:// link
+    Add {
+        /// The connection link provided by your friend (must start with atom://)
+        #[arg(value_parser = parse_atom_url)]
+        url: String,
+
+        /// A local nickname to easily identify this friend
+        nickname: String,
+    },
+
+    /// List all connected friends and their Tor .onion routing status
+    List,
+}
+
+// --- Validators ---
 
 fn parse_vault_name(s: &str) -> Result<String, String> {
     if s.trim().is_empty() {
@@ -55,22 +100,37 @@ fn parse_vault_name(s: &str) -> Result<String, String> {
         return Err("Vault name cannot exceed 32 characters".to_string());
     }
     if !s.is_ascii() {
-        return Err("Vault name must contain only ASCII characters".to_string());
+        return Err("Vault name must contain only ASCII".to_string());
     }
-    if s.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '-') {
-        return Err("Vault name can only contain alphanumeric characters, underscores, or dashes".to_string());
+    if s.chars()
+        .any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    {
+        return Err("Vault name can only contain alphanumeric characters, _, or -".to_string());
     }
     Ok(s.to_string())
 }
-
 
 fn parse_vault_path(s: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err("Vault path cannot be empty".to_string());
     }
-
     if s.len() > 4096 {
         return Err("Vault path is too long".to_string());
+    }
+    if s.chars()
+        .any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    {
+        return Err(
+            "Vault name can only contain alphanumeric characters, underscores, or dashes"
+                .to_string(),
+        );
+    }
+    Ok(s.to_string())
+}
+
+fn parse_atom_url(s: &str) -> Result<String, String> {
+    if !s.starts_with("atom://") {
+        return Err("Invalid format: Friend links must start with 'atom://'".to_string());
     }
     Ok(s.to_string())
 }

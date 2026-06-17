@@ -1,11 +1,20 @@
+use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::PathBuf;
 use zeroize::Zeroizing;
 
-pub fn handle_create(vault_path: String, vault_name: String) -> Result<(), Box<dyn std::error::Error>> {
-    let actual_file_path = Path::new(&vault_path).join(format!("{}.aegis", vault_name));
+pub fn handle_create(vault_path: &str, vault_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Build the path and ensure the parent directories exist
+    let mut actual_file_path = PathBuf::from(vault_path);
+    fs::create_dir_all(&actual_file_path)?;
 
-    println!("[Create] Creating a secure vault at '{}' ...", actual_file_path.display());
+    // 2. Append the target filename
+    actual_file_path.push(format!("{}.aegis", vault_name));
+
+    println!(
+        "[Create] Creating a secure vault at '{}' ...",
+        actual_file_path.display()
+    );
 
     print!("Enter a password: ");
     std::io::stdout().flush()?;
@@ -47,14 +56,14 @@ pub fn handle_create(vault_path: String, vault_name: String) -> Result<(), Box<d
     rand::rngs::OsRng.fill_bytes(&mut cdc_salt);
     // .......................
 
-    let metadata = crate::vfs::VaultMetadata { 
-        file_table: Vec::new() ,
+    let metadata = crate::vfs::VaultMetadata {
+        file_table: Vec::new(),
         cdc_salt,
     };
-    
+
     crate::storage::save_vault_metadata(&mut file, &metadata, &unlocked_vault, payload_offset)?;
 
-    file.sync_all()?; 
+    file.sync_all()?;
 
     println!("[Success] Vault successfully initialized.");
     Ok(())
