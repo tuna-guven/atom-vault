@@ -1,11 +1,11 @@
+use memfd::MemfdOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use memfd::MemfdOptions;
 use zeroize::Zeroize;
 
-use crate::vfs::{FileIndex, process_secure_chunk};
 use crate::crypto::UnlockedVault;
 use crate::sandbox;
+use crate::vfs::{FileIndex, process_secure_chunk};
 
 pub fn execute<F>(
     physical_vault: &mut std::fs::File,
@@ -20,9 +20,10 @@ where
     let memfd_name = format!("atom_vault_memfd_{}", file_index.vfs_name);
     let mut memfd_file = MemfdOptions::default()
         .close_on_exec(true)
+        .allow_sealing(true)
         .create(&memfd_name)?
         .into_file();
-    
+
     // 2. Decrypt and write chunks directly to volatile RAM
     for chunk in &file_index.chunks {
         process_secure_chunk(
@@ -32,7 +33,8 @@ where
             unlocked_vault,
             chunk.offset,
             |secure_plaintext| {
-                memfd_file.write_all(secure_plaintext)
+                memfd_file
+                    .write_all(secure_plaintext)
                     .expect("Fatal: Failed to write to RAM disk");
             },
         )?;
@@ -42,15 +44,15 @@ where
     memfd_file.flush()?;
     memfd_file.seek(SeekFrom::Start(0))?;
 
-    // 4. Enforce Kernel Seals and Spawn Sandbox
+    // 4. Enforce Strict Kernel Seals
     let target_raw_fd = memfd_file.as_raw_fd();
 
     unsafe {
         // Prevent external growing and new seals. 
         libc::fcntl(
-            target_raw_fd, 
-            libc::F_ADD_SEALS, 
-            libc::F_SEAL_GROW | libc::F_SEAL_SEAL
+            target_raw_fd,
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL,
         );
     }
 

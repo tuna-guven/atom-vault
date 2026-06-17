@@ -1,8 +1,35 @@
+use crate::crypto::UnlockedVault;
+use crate::vfs::VaultMetadata;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use crate::crypto::UnlockedVault;
-use crate::vfs::VaultMetadata;
+
+// RAII Guard using raw pointers to securely pin memory and prevent OS swap leaks
+struct MlockGuard {
+    ptr: *const libc::c_void,
+    len: usize,
+}
+
+impl MlockGuard {
+    fn new(slice: &[u8]) -> std::io::Result<Self> {
+        let ptr = slice.as_ptr() as *const libc::c_void;
+        let len = slice.len();
+        unsafe {
+            if libc::mlock(ptr, len) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(Self { ptr, len })
+    }
+}
+
+impl Drop for MlockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munlock(self.ptr, self.len);
+        }
+    }
+}
 
 pub fn handle_export(
     vfs_name: String,
@@ -11,13 +38,16 @@ pub fn handle_export(
     physical_vault: &mut File,
     unlocked_vault: &UnlockedVault,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
-    let staging_dir_str = if let Ok(home) = std::env::var("HOME") {
-        format!("{}/atom_staging", home)
-    } else if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+    // FIX 1: Sync staging path determination logic to prioritize volatile tmpfs
+    let staging_dir_str = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
         format!("{}/atom_staging", xdg_runtime)
+    } else if let Ok(home) = std::env::var("HOME") {
+        format!("{}/.atom_vault/staging", home)
     } else {
-        return Err("Security Error: Neither HOME nor XDG_RUNTIME_DIR environment variables are set.".into());
+        return Err(
+            "Security Error: Neither XDG_RUNTIME_DIR nor HOME environment variables are set."
+                .into(),
+        );
     };
 
     let safe_filename = Path::new(&to_disk)
@@ -26,10 +56,7 @@ pub fn handle_export(
 
     let target_path = Path::new(&staging_dir_str).join(safe_filename);
 
-    let file_entry = metadata
-        .file_table
-        .iter()
-        .find(|f| f.vfs_name == vfs_name);
+    let file_entry = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name);
 
     let target_file = match file_entry {
         Some(file) => file,
@@ -38,11 +65,23 @@ pub fn handle_export(
         }
     };
 
-    let mut output_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true) 
-        .open(&target_path)
-        .map_err(|e| format!("Failed to create output file at '{}' (it might already exist): {:?}", target_path.display(), e))?;
+    // FIX 2: Enforce strict 0600 file permissions for the exported plaintext
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600); // Owner Read/Write ONLY
+    }
+
+    let mut output_file = open_opts.open(&target_path).map_err(|e| {
+        format!(
+            "Failed to create secure output file at '{}' (it might already exist): {:?}",
+            target_path.display(),
+            e
+        )
+    })?;
 
     for chunk in &target_file.chunks {
         physical_vault.seek(SeekFrom::Start(chunk.offset))?;
@@ -56,13 +95,22 @@ pub fn handle_export(
                 &cipher_buffer,
                 &chunk.nonce,
                 chunk.offset,
-            ).map_err(|e| format!("Decryption error: {:?}", e))?
+            )
+            .map_err(|e| format!("Decryption error: {:?}", e))?,
         );
+
+        // FIX 3: Lock the plaintext buffer in RAM so it cannot be paged to the swap file
+        let _mlock_guard = MlockGuard::new(&decrypted_bytes)?;
 
         output_file.write_all(&decrypted_bytes)?;
     }
+
     output_file.sync_all()?;
 
-    println!("[Success] File '{}' successfully exported to staging area: {}", vfs_name, target_path.display());
+    println!(
+        "[Success] File '{}' successfully exported to secure staging area: {}",
+        vfs_name,
+        target_path.display()
+    );
     Ok(())
 }
