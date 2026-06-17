@@ -16,10 +16,9 @@ pub fn handle_create(vault_path: &str, vault_name: &str) -> Result<(), Box<dyn s
         actual_file_path.display()
     );
 
-    print!("Enter a password: ");
     std::io::stdout().flush()?;
 
-    let password = Zeroizing::new(rpassword::read_password()?);
+    let password = crate::secure_input::read_password_pinentry()?;
     if password.trim().is_empty() {
         return Err("Password cannot be empty or contain only spaces.".into());
     }

@@ -7,12 +7,15 @@ use crate::vfs::{FileIndex, process_secure_chunk};
 use crate::crypto::UnlockedVault;
 use crate::sandbox;
 
-pub fn execute(
+pub fn execute<F>(
     physical_vault: &mut std::fs::File,
     file_index: &FileIndex,
     unlocked_vault: &UnlockedVault,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    
+    on_close: F, // GUI'nin kilitlenmesini engelleyecek callback fonksiyonu
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
+where 
+    F: FnOnce() + Send + 'static, 
+{
     // 1. Create dynamic RAM disk with CLOEXEC to prevent FD leaking
     let memfd_name = format!("atom_vault_memfd_{}", file_index.vfs_name);
     let mut memfd_file = MemfdOptions::default()
@@ -44,7 +47,6 @@ pub fn execute(
 
     unsafe {
         // Prevent external growing and new seals. 
-        // F_SEAL_WRITE and F_SEAL_SHRINK are deliberately omitted to allow our own shredding.
         libc::fcntl(
             target_raw_fd, 
             libc::F_ADD_SEALS, 
@@ -53,35 +55,42 @@ pub fn execute(
     }
 
     println!("Starting secure sandbox mode...");
-    if let Err(e) = sandbox::spawn_in_sandbox(target_raw_fd) {
-        eprintln!("Sandbox error: {}", e);
-    }
+    // Sandbox'ı ayağa kaldırıp PID'yi hemen döndürüyoruz (senkron bloklamayı önlüyoruz)
+    let pid = sandbox::spawn_in_sandbox(target_raw_fd)?;
 
-    // 5. Zero-allocation RAM shredding (Anti-Forensics)
-    println!("Sandbox closed. Initiating memory shredding...");
-    
-    let size = memfd_file.seek(SeekFrom::End(0)).unwrap_or(0);
-    if size > 0 {
-        let _ = memfd_file.seek(SeekFrom::Start(0));
-        
-        let mut zero_page = [0u8; 4096];
-        let mut written = 0;
-        
-        // Overwrite volatile memory with zeros securely
-        while written < size {
-            let to_write = std::cmp::min(4096, size - written) as usize;
-            if memfd_file.write_all(&zero_page[..to_write]).is_err() {
-                break; // Break silently on write errors during teardown
-            }
-            written += to_write as u64;
+    // 5. Zero-allocation RAM shredding'i arka plan OS Thread'ine taşıyoruz
+    std::thread::spawn(move || {
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0); // Zathura kapanana kadar burada bekler
         }
-        let _ = memfd_file.flush();
-        zero_page.zeroize(); // Clear the zero_page buffer itself as a strict defensive measure
-    }
-    
-    // Truncate file at the kernel level to release memory pages immediately
-    let _ = memfd_file.set_len(0); 
-    
-    println!("Traces successfully removed.");
+
+        println!("Sandbox closed. Initiating memory shredding...");
+        
+        let size = memfd_file.seek(SeekFrom::End(0)).unwrap_or(0);
+        if size > 0 {
+            let _ = memfd_file.seek(SeekFrom::Start(0));
+            
+            let mut zero_page = [0u8; 4096];
+            let mut written = 0;
+            
+            while written < size {
+                let to_write = std::cmp::min(4096, size - written) as usize;
+                if memfd_file.write_all(&zero_page[..to_write]).is_err() {
+                    break; 
+                }
+                written += to_write as u64;
+            }
+            let _ = memfd_file.flush();
+            zero_page.zeroize(); 
+        }
+        
+        let _ = memfd_file.set_len(0); 
+        println!("Traces successfully removed.");
+        
+        // İşlem bittiğinde arka plandan AtomicBool bayrağını tetikler
+        on_close();
+    });
+
     Ok(())
 }

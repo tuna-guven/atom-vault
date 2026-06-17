@@ -78,10 +78,6 @@ pub fn process_secure_chunk<F>(
         std::panic::resume_unwind(err);
     }
 
-    // Resume panic if the action failed, maintaining safety guarantees
-    if let Err(err) = action_result {
-        std::panic::resume_unwind(err);
-    }
 
     Ok(())
 }

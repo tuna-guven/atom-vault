@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 argon2 = "0.5"             # The PHC winner for our KDF
 chacha20poly1305 = "0.10"  # Provides XChaCha20-Poly1305 for AEAD
-nix = { version = "0.29.0", features = ["fs", "user"] }
+nix = { version = "0.29.0", features = ["fs", "user", "term"] }
 rand = "0.8"               # For cryptographically secure random numbers (CSPRNG)
 zeroize = { version = "1.7", features = ["zeroize_derive"] } # To securely wipe the DEK from RAM
 fastcdc = "3.1.0"
@@ -34,3 +34,4 @@ landlock = "0.4.5"
 memfd = "0.6.5"
 secrecy = "0.10.3"
 tokio-stream = "0.1.18"
+gtk4 = "0.11.3"
