@@ -3,7 +3,6 @@ use nix::unistd::{Whence, ftruncate, lseek};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::io::{Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind};
-use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
 use std::os::fd::{AsRawFd, OwnedFd};
 use zeroize::Zeroize;
 
