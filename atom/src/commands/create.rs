@@ -3,7 +3,12 @@ use std::io::Write;
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
-pub fn handle_create(vault_path: &str, vault_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_create(
+    vault_path: &str, 
+    vault_name: &str,
+    gui_password: Option<Zeroizing<String>> // YENİ: GUI'den gelirse şifreyi buradan al
+) -> Result<(), Box<dyn std::error::Error>> {
+    
     // 1. Build the path and ensure the parent directories exist
     let mut actual_file_path = PathBuf::from(vault_path);
     fs::create_dir_all(&actual_file_path)?;
@@ -18,7 +23,12 @@ pub fn handle_create(vault_path: &str, vault_name: &str) -> Result<(), Box<dyn s
 
     std::io::stdout().flush()?;
 
-    let password = crate::secure_input::read_password_pinentry()?;
+    // YENİ: Şifre GUI'den verilmişse onu kullan, verilmemişse CLI TTY'den (pinentry) iste
+    let password = match gui_password {
+        Some(pw) => pw,
+        None => crate::secure_input::read_password_pinentry()?,
+    };
+
     if password.trim().is_empty() {
         return Err("Password cannot be empty or contain only spaces.".into());
     }
@@ -38,7 +48,7 @@ pub fn handle_create(vault_path: &str, vault_name: &str) -> Result<(), Box<dyn s
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .create_new(true) // Dosya halihazırda varsa hata döndürür
+        .create_new(true)
         .open(&actual_file_path)
         .map_err(|e| format!("Failed to create vault file (it might already exist): {:?}", e))?;
     
@@ -49,11 +59,9 @@ pub fn handle_create(vault_path: &str, vault_name: &str) -> Result<(), Box<dyn s
     file.write_all(&dek_nonce)?;
     file.write_all(&wrapped_dek)?;
 
-    // Tunanin buna uygun fonksiyonu olabilirrr
     use rand::RngCore;
     let mut cdc_salt = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut cdc_salt);
-    // .......................
 
     let metadata = crate::vfs::VaultMetadata {
         file_table: Vec::new(),

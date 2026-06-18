@@ -84,7 +84,6 @@ pub fn start_interactive_shell(
                     let to_disk = parts[2].to_string();
                     
                     print!("\n[WARNING] You are about to extract decrypted data to the physical disk (Staging Area).\nAre you sure you want to proceed? [y/N]: ");
-                    
                     std::io::stdout().flush().unwrap_or_default();
                     
                     let mut input = String::new();
@@ -92,14 +91,44 @@ pub fn start_interactive_shell(
                     
                     if input.trim().eq_ignore_ascii_case("y") {
                         
-                        if let Err(e) = crate::commands::export::handle_export(
-                            vfs_name,
-                            to_disk,
+                        // 1. ADIM: Normal deneme (force_overwrite: false)
+                        match crate::commands::export::handle_export(
+                            vfs_name.clone(),
+                            to_disk.clone(),
                             metadata,
                             physical_vault,
                             unlocked_vault,
+                            false 
                         ) {
-                            eprintln!("{}", e);
+                            Ok(_) => {}
+                            Err(e) => {
+                                // 2. ADIM: Dosya zaten varsa uyarı ver ve sor
+                                if e.to_string() == "ALREADY_EXISTS" {
+                                    print!("Warning: The file already exists in the staging area. Do you want to overwrite it? [y/N]: ");
+                                    std::io::stdout().flush().unwrap_or_default();
+                                    
+                                    let mut ow_input = String::new();
+                                    std::io::stdin().read_line(&mut ow_input).unwrap_or_default();
+                                    
+                                    if ow_input.trim().eq_ignore_ascii_case("y") {
+                                        // Kullanıcı zorla yaz dedi, parametreyi true gönder
+                                        if let Err(err2) = crate::commands::export::handle_export(
+                                            vfs_name,
+                                            to_disk,
+                                            metadata,
+                                            physical_vault,
+                                            unlocked_vault,
+                                            true // GÜÇLÜ YAZMA
+                                        ) {
+                                            eprintln!("Export failed: {}", err2);
+                                        }
+                                    } else {
+                                        println!("Export cancelled by user. Existing file was preserved.");
+                                    }
+                                } else {
+                                    eprintln!("Export failed: {}", e);
+                                }
+                            }
                         }
                         
                     } else {

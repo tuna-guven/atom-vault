@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args.command {
             Some(command) => {
                 match command {
-                    Commands::Create { vault_path, vault_name } => commands::create::handle_create(&vault_path, &vault_name),
+                    Commands::Create { vault_path, vault_name } => commands::create::handle_create(&vault_path, &vault_name, None),
                     Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
                     // P2P Commands
                     Commands::Daemon => commands::daemon::handle_daemon(),

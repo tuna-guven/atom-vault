@@ -37,7 +37,7 @@ fn build_login_ui(app: &Application) {
         .application(app)
         .title("Atom Vault - Login")
         .default_width(450)
-        .default_height(300)
+        .default_height(350)
         .build();
 
     let vbox = GtkBox::builder()
@@ -59,7 +59,8 @@ fn build_login_ui(app: &Application) {
     let select_btn = Button::builder().label("Select .aegis Vault").build();
     let pass_entry = PasswordEntry::builder().placeholder_text("Master Password").build();
     let unlock_btn = Button::builder().label("Unlock Vault").css_classes(["suggested-action"]).build();
-    let status_label = Label::builder().label("Please select a vault to begin.").build();
+    let create_btn = Button::builder().label("Create New Vault").css_classes(["flat"]).build();
+    let status_label = Label::builder().label("Please select or create a vault to begin.").build();
 
     // File selection
     let path_clone = Rc::clone(&selected_path);
@@ -143,17 +144,122 @@ fn build_login_ui(app: &Application) {
         }
     });
 
+    // Create New Vault
+    let create_window_weak = window.downgrade();
+    create_btn.connect_clicked(move |_| {
+        let chooser = FileChooserNative::new(
+            Some("Select Destination Folder"),
+            create_window_weak.upgrade().as_ref().map(|w| w.upcast_ref::<gtk::Window>()),
+            FileChooserAction::SelectFolder,
+            Some("_Select"),
+            Some("_Cancel"),
+        );
+
+        let parent_window_clone = create_window_weak.upgrade().unwrap();
+
+        chooser.connect_response(move |dialog, response| {
+            if response == ResponseType::Accept {
+                if let Some(file) = dialog.file() {
+                    if let Some(folder_path) = file.path() {
+                        show_create_vault_dialog(&parent_window_clone, folder_path);
+                    }
+                }
+            }
+            dialog.destroy();
+        });
+        chooser.show();
+    });
+
     vbox.append(&title);
     vbox.append(&select_btn);
     vbox.append(&pass_entry);
     vbox.append(&unlock_btn);
+    vbox.append(&create_btn);
     vbox.append(&status_label);
 
     window.set_child(Some(&vbox));
     window.present();
 }
 
-// --- SECURE VAULT EXPLORER VIEW ---
+// UI HELPER: Secure Vault Creation Dialog
+fn show_create_vault_dialog(parent: &ApplicationWindow, folder_path: PathBuf) {
+    let dialog = Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Initialize Secure Vault")
+        .default_width(350)
+        .destroy_with_parent(true)
+        .build();
+
+    let vbox = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(12)
+        .margin_top(16)
+        .margin_bottom(16)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+
+    let info_label = Label::builder().label(&format!("Path: {}", folder_path.display())).xalign(0.0).build();
+    let name_entry = Entry::builder().placeholder_text("Vault Name (e.g., personal)").build();
+    let pass_entry = PasswordEntry::builder().placeholder_text("Master Password").build();
+    let pass_confirm = PasswordEntry::builder().placeholder_text("Confirm Password").build();
+    let status_label = Label::builder().use_markup(true).build();
+    let confirm_btn = Button::builder().label("Create Vault").css_classes(["suggested-action"]).build();
+
+    vbox.append(&info_label);
+    vbox.append(&name_entry);
+    vbox.append(&pass_entry);
+    vbox.append(&pass_confirm);
+    vbox.append(&confirm_btn);
+    vbox.append(&status_label);
+    
+    dialog.set_child(Some(&vbox));
+
+    let dialog_clone = dialog.clone();
+    
+    confirm_btn.connect_clicked(move |_| {
+        let name = name_entry.text().to_string();
+        let pass1 = pass_entry.text().to_string();
+        let pass2 = pass_confirm.text().to_string();
+
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains('\0') {
+            status_label.set_label("<span foreground='red'>Invalid or empty vault name.</span>");
+            return;
+        }
+        if pass1.is_empty() {
+            status_label.set_label("<span foreground='red'>Password cannot be empty.</span>");
+            return;
+        }
+        if pass1 != pass2 {
+            status_label.set_label("<span foreground='red'>Passwords do not match.</span>");
+            return;
+        }
+
+        // Wrap securely
+        let secure_pass = zeroize::Zeroizing::new(pass1);
+
+        status_label.set_label("Deriving keys, please wait...");
+
+        match crate::commands::create::handle_create(
+            &folder_path.to_string_lossy(),
+            &name,
+            Some(secure_pass) 
+        ) {
+            Ok(_) => {
+                println!("[GUI] Vault successfully created via UI.");
+                dialog_clone.close();
+            }
+            Err(e) => {
+                status_label.set_label(&format!("<span foreground='red'>Error: {}</span>", e));
+            }
+        }
+    });
+
+    dialog.present();
+}
+
+// SECURE VAULT EXPLORER VIEW
 fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSession>>) {
     window.set_title(Some("Atom Vault - Secure Explorer"));
     window.set_default_width(650);
@@ -189,10 +295,9 @@ fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSes
     vbox.append(&action_status_label);
     vbox.append(&scrolled_window);
 
-    // Initial render
     refresh_file_list(&list_box, Rc::clone(&session), window.clone(), action_status_label.clone());
 
-    // --- EVENT HANDLER: Import Action ---
+    // Import Action
     let import_session = Rc::clone(&session);
     let import_window_weak = window.downgrade();
     let import_list_box = list_box.clone();
@@ -242,7 +347,7 @@ fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSes
         chooser.show();
     });
 
-    // --- EVENT HANDLER: Direct Export Action (Atom Staging) ---
+    // Direct Export Action
     let export_session = Rc::clone(&session);
     let export_list_box = list_box.clone();
     let export_status = action_status_label.clone();
@@ -265,23 +370,29 @@ fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSes
             let mut sess = session_alloc.borrow_mut();
             let VaultSession { ref mut file, ref metadata, ref unlocked_vault, .. } = *sess;
 
-            match crate::commands::export::handle_export(raw_vfs_name, target_path_str, metadata, file, unlocked_vault) {
+            match crate::commands::export::handle_export(raw_vfs_name, target_path_str, metadata, file, unlocked_vault, false) {
                 Ok(_) => export_status.set_label(&format!("<span foreground='green'>Success: Extracted to atom_staging/{}</span>", safe_vfs_name)),
-                Err(e) => export_status.set_label(&format!("<span foreground='red'>Export failed: {}</span>", e)),
+                Err(e) => {
+                    if e.to_string() == "ALREADY_EXISTS" {
+                        export_status.set_label("<span foreground='red'>Export failed: File already exists! Delete it first.</span>");
+                    } else {
+                        export_status.set_label(&format!("<span foreground='red'>Export failed: {}</span>", e));
+                    }
+                }
             }
         } else {
             export_status.set_label("<span foreground='orange'>Warning: Please select a file from the list first.</span>");
         }
     });
 
-    // --- EVENT HANDLER: Lock and Exit ---
+    // Lock and Exit
     let lock_window = window.clone();
     lock_btn.connect_clicked(move |_| { lock_window.close(); });
 
     window.set_child(Some(&vbox));
 }
 
-// --- UI HELPER: Dynamic List Renderer (WITH RENAME, OPEN & DELETE HOOKS) ---
+// UI HELPER: Dynamic List Renderer
 fn refresh_file_list(
     list_box: &ListBox, 
     session: Rc<RefCell<VaultSession>>, 
@@ -316,7 +427,7 @@ fn refresh_file_list(
         let open_btn = Button::builder().label("Open").css_classes(["flat"]).build();
         let delete_btn = Button::builder().label("Delete").css_classes(["destructive-action"]).build();
 
-        // --- 1. OPEN ACTION (Lock-Free Async Sandbox Hook) ---
+        // 1. OPEN ACTION
         let session_open = Rc::clone(&session);
         let status_open = status_label.clone();
         let vfs_name_open = file_index.vfs_name.clone();
@@ -329,7 +440,7 @@ fn refresh_file_list(
 
             if let Some(target_file_index) = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name_open) {
                 
-                // Thread-Safe ve Lock-Free Bayrak Yaratımı
+                // Lock-free flag
                 let done_flag = Arc::new(AtomicBool::new(false));
                 let done_flag_thread = Arc::clone(&done_flag);
                 
@@ -338,14 +449,14 @@ fn refresh_file_list(
                     target_file_index,
                     unlocked_vault,
                     move || {
-                        // İşlem bittiğinde arka plandan sinyali çak
+                        // Signal when done
                         done_flag_thread.store(true, Ordering::SeqCst);
                     }
                 ) {
                     eprintln!("[GUI Error] View failed: {}", e);
                     status_open.set_label(&format!("<span foreground='red'>Open failed: {}</span>", e));
                 } else {
-                    // Ana arayüz donmadan 100ms'de bir bayrağı kontrol et
+                    // Poll flag every 100ms
                     let status_open_async = status_open.clone();
                     let vfs_name_open_clone = vfs_name_open.clone();
                     
@@ -366,7 +477,7 @@ fn refresh_file_list(
             }
         });
 
-        // --- 2. RENAME ACTION (Double Click Gesture) ---
+        // 2. RENAME ACTION
         let gesture = GestureClick::new();
         gesture.set_button(1); 
         
@@ -436,7 +547,7 @@ fn refresh_file_list(
             }
         });
 
-        // --- 3. SECURE DELETE ACTION ---
+        // 3. SECURE DELETE ACTION
         let session_delete = Rc::clone(&session);
         let status_delete = status_label.clone();
         let list_box_delete = list_box.clone();
