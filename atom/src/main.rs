@@ -4,11 +4,10 @@ mod chunker;
 mod cli;
 mod commands;
 mod crypto;
+pub mod sandbox;
+pub mod secure_input;
 mod storage;
 mod vfs;
-pub mod sandbox; 
-pub mod gui;    
-pub mod secure_input;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -57,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match args.command {
-        Commands::Create {
+        Some(Commands::Create {
             vault_path,
             vault_name,
             kdf,
@@ -66,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             parallelism,
             generate_passphrase,
             decryption_time,
-        } => commands::create::handle_create(
+        }) => commands::create::handle_create(
             &vault_path,
             &vault_name,
             &kdf,
@@ -75,16 +74,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             parallelism,
             decryption_time,
             generate_passphrase,
-            None,
+            None, // <-- Explicitly pass None for gui_password when using CLI
         ),
-        Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
-        Commands::Daemon => commands::daemon::handle_daemon(),
-        Commands::Id => commands::id::handle_id(),
-        Commands::Friend { command } => commands::friend::handle_friend(command),
-        Commands::Sync {
+        Some(Commands::Enter { vault_path }) => commands::enter::handle_enter(vault_path),
+        Some(Commands::Daemon) => commands::daemon::handle_daemon(),
+        Some(Commands::Id) => commands::id::handle_id(),
+        Some(Commands::Friend { command }) => commands::friend::handle_friend(command),
+        Some(Commands::Sync {
             vault_path,
             friend_nickname,
-        } => commands::sync::handle_sync(&vault_path, &friend_nickname),
+        }) => commands::sync::handle_sync(&vault_path, &friend_nickname),
+        None => {
+            // Fallback if no command is provided
+            eprintln!("No command provided. Run 'atom --help' for usage.");
+            Ok(())
+        }
     }));
 
     match result {

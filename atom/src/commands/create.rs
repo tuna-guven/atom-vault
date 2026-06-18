@@ -19,9 +19,8 @@ pub fn handle_create(
     parallelism_arg: Option<u32>,
     decryption_time: u32,
     generate_passphrase: bool,
-    gui_password: Option<Zeroizing<String>>
+    gui_password: Option<Zeroizing<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
     // 1. Build the path and ensure the parent directories exist
     let mut actual_file_path = PathBuf::from(vault_path);
     fs::create_dir_all(&actual_file_path)?;
@@ -48,12 +47,45 @@ pub fn handle_create(
         settings.choice = KdfChoice::Argon2id;
         settings.memory_kib = memory_arg.unwrap_or(65536);
         settings.parallelism = parallelism_arg.unwrap_or(total_threads.max(1));
+    } // <-- FIXED: Added missing closing brace for the else block here
+
     std::io::stdout().flush()?;
 
-    // YENİ: Şifre GUI'den verilmişse onu kullan, verilmemişse CLI TTY'den (pinentry) iste
-    let password = match gui_password {
-        Some(pw) => pw,
-        None => crate::secure_input::read_password_pinentry()?,
+    // Determine password source or generate a passphrase
+    let password = if generate_passphrase {
+        let mut words = Vec::with_capacity(10);
+        for _ in 0..10 {
+            words.push(random_word());
+        }
+        let pass = words.join(" ");
+        println!("\n[SECURE PASSPHRASE GENERATED]");
+        println!(">>> {} <<<", pass);
+        println!("Please save this immediately. You will need it to unlock your vault.\n");
+        Zeroizing::new(pass)
+    } else if let Some(pw) = gui_password {
+        pw
+    } else {
+        // Fall back to CLI TTY pinentry or manual prompt if no GUI password provided
+        match crate::secure_input::read_password_pinentry() {
+            Ok(pin_pw) => pin_pw,
+            Err(_) => {
+                print!("Enter a password: ");
+                std::io::stdout().flush()?;
+                let pass = Zeroizing::new(rpassword::read_password()?);
+                if pass.trim().is_empty() {
+                    return Err("Password cannot be empty or contain only spaces.".into());
+                }
+
+                print!("Confirm password: ");
+                std::io::stdout().flush()?;
+                let confirm_pass = Zeroizing::new(rpassword::read_password()?);
+
+                if pass != confirm_pass {
+                    return Err("Security Error: Passwords do not match. Aborting creation.".into());
+                }
+                pass
+            }
+        }
     };
 
     if password.trim().is_empty() {
@@ -80,34 +112,6 @@ pub fn handle_create(
         settings.iterations,
         decryption_time as f64 / 1000.0
     );
-
-    let password = if generate_passphrase {
-        let mut words = Vec::with_capacity(10);
-        for _ in 0..10 {
-            words.push(random_word());
-        }
-        let pass = words.join(" ");
-        println!("\n[SECURE PASSPHRASE GENERATED]");
-        println!(">>> {} <<<", pass);
-        println!("Please save this immediately. You will need it to unlock your vault.\n");
-        Zeroizing::new(pass)
-    } else {
-        print!("Enter a password: ");
-        std::io::stdout().flush()?;
-        let pass = Zeroizing::new(rpassword::read_password()?);
-        if pass.trim().is_empty() {
-            return Err("Password cannot be empty or contain only spaces.".into());
-        }
-
-        print!("Confirm password: ");
-        std::io::stdout().flush()?;
-        let confirm_pass = Zeroizing::new(rpassword::read_password()?);
-
-        if pass != confirm_pass {
-            return Err("Security Error: Passwords do not match. Aborting creation.".into());
-        }
-        pass
-    };
 
     let salt = crate::crypto::generate_32_bytes();
     let dek = Zeroizing::new(crate::crypto::generate_32_bytes());
@@ -142,7 +146,6 @@ pub fn handle_create(
     file.write_all(&dek_nonce)?;
     file.write_all(&wrapped_dek)?;
 
-    use rand::RngCore;
     let mut cdc_salt = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut cdc_salt);
 
