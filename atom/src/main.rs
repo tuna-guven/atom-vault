@@ -2,9 +2,11 @@ mod chunker;
 mod cli;
 mod commands;
 mod crypto;
-pub mod sandbox;
 mod storage;
 mod vfs;
+pub mod sandbox; 
+pub mod gui;    
+pub mod secure_input;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -27,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Purging volatile process memory and enforcing immediate emergency exit.");
     }));
 
-    // Parse command line arguments using our secure customized styling interface
+    // Parse command line arguments
     let args = Cli::parse();
 
     // FIX 2: Prioritize XDG_RUNTIME_DIR (RAM/tmpfs) over HOME (Disk) for staging
@@ -60,22 +62,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Route system execution to targeted synchronous sub-command handlers
+        
         match args.command {
-            Commands::Create {
-                vault_path,
-                vault_name,
-            } => commands::create::handle_create(&vault_path, &vault_name),
-            Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
-
-            // --- DECOUPLED P2P ROUTING ---
-            Commands::Daemon => commands::daemon::handle_daemon(),
-            Commands::Id => commands::id::handle_id(),
-            Commands::Friend { command } => commands::friend::handle_friend(command),
-            Commands::Sync {
-                vault_path,
-                friend_nickname,
-            } => commands::sync::handle_sync(&vault_path, &friend_nickname),
+            Some(command) => {
+                match command {
+                    Commands::Create { vault_path, vault_name } => commands::create::handle_create(&vault_path, &vault_name, None),
+                    Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
+                    // P2P Commands
+                    Commands::Daemon => commands::daemon::handle_daemon(),
+                    Commands::Id => commands::id::handle_id(),
+                    Commands::Friend { command } => commands::friend::handle_friend(command),
+                    Commands::Sync { vault_path, friend_nickname } => commands::sync::handle_sync(&vault_path, &friend_nickname),
+                }
+            },
+            
+            None => {
+                println!("[INFO] No CLI arguments provided. Launching Graphical Interface...");
+                gui::run_gui()
+            }
         }
     }));
 
