@@ -1,6 +1,7 @@
+use eff_wordlist::large::random_word;
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, DropDown, Entry, FileChooserAction,
+    Application, ApplicationWindow, Box as GtkBox, Button, DropDown, Entry, Expander, FileChooserAction,
     FileChooserNative, GestureClick, Label, ListBox, Orientation, PasswordEntry, ResponseType,
     ScrolledWindow, Window,
 };
@@ -292,7 +293,6 @@ fn show_incoming_sync_dialog(
     let mut default_path = dirs::home_dir().unwrap_or_default();
     default_path.push(format!("Downloads/{}/{}", sender_nick, filename));
 
-    // Type conversion fix: Cow to String for the text builder
     let path_entry = Entry::builder()
         .text(default_path.to_string_lossy().to_string())
         .build();
@@ -380,7 +380,7 @@ fn show_create_vault_dialog(parent: &ApplicationWindow, folder_path: PathBuf) {
         .transient_for(parent)
         .modal(true)
         .title("Initialize Secure Vault")
-        .default_width(350)
+        .default_width(380)
         .destroy_with_parent(true)
         .build();
 
@@ -400,13 +400,65 @@ fn show_create_vault_dialog(parent: &ApplicationWindow, folder_path: PathBuf) {
     let name_entry = Entry::builder()
         .placeholder_text("Vault Name (e.g., personal)")
         .build();
+
+    // SADE VE MANTIKLI ŞİFRE KUTULARI (Göz ikonu kopyalamaya izin verir)
     let pass_entry = PasswordEntry::builder()
         .placeholder_text("Master Password")
+        .show_peek_icon(true)
         .build();
     let pass_confirm = PasswordEntry::builder()
         .placeholder_text("Confirm Password")
+        .show_peek_icon(true)
         .build();
+
+    let gen_btn = Button::builder()
+        .label("Generate Secure Passphrase")
+        .build();
+
     let status_label = Label::builder().use_markup(true).build();
+
+    // JENERATÖR BUTONU ETKİLEŞİMİ
+    let pass_entry_gen = pass_entry.clone();
+    let pass_confirm_gen = pass_confirm.clone();
+    let status_gen = status_label.clone();
+
+    gen_btn.connect_clicked(move |_| {
+        let mut words = Vec::with_capacity(10);
+        for _ in 0..10 {
+            words.push(random_word());
+        }
+        let pass = words.join(" ");
+        
+        pass_entry_gen.set_text(&pass);
+        pass_confirm_gen.set_text(&pass);
+        
+        status_gen.set_label("<span foreground='orange'><b>⚠️ Passphrase generated! Click the eye icon to view and copy.</b></span>");
+    });
+
+    // TÜM KRİPTOGRAFİ ÖZELLİKLERİNİ İÇEREN EXPANDER
+    let advanced_expander = Expander::builder().label("Advanced Crypto Settings").build();
+    let adv_box = GtkBox::builder().orientation(Orientation::Vertical).spacing(8).build();
+
+    let kdf_label = Label::builder().label("Key Derivation Function:").xalign(0.0).build();
+    let kdf_dropdown = DropDown::from_strings(&["Argon2id", "Scrypt"]);
+
+    let time_label = Label::builder().label("Target Decryption Time (ms):").xalign(0.0).build();
+    let time_entry = Entry::builder().text("1000").build();
+
+    let memory_entry = Entry::builder().placeholder_text("Memory (KiB) [Optional]").build();
+    let rounds_entry = Entry::builder().placeholder_text("Explicit Rounds [Optional]").build();
+    let threads_entry = Entry::builder().placeholder_text("Parallelism (Threads) [Optional]").build();
+
+    adv_box.append(&kdf_label);
+    adv_box.append(&kdf_dropdown);
+    adv_box.append(&time_label);
+    adv_box.append(&time_entry);
+    adv_box.append(&memory_entry);
+    adv_box.append(&rounds_entry);
+    adv_box.append(&threads_entry);
+    
+    advanced_expander.set_child(Some(&adv_box));
+
     let confirm_btn = Button::builder()
         .label("Create Vault")
         .css_classes(["suggested-action"])
@@ -416,43 +468,67 @@ fn show_create_vault_dialog(parent: &ApplicationWindow, folder_path: PathBuf) {
     vbox.append(&name_entry);
     vbox.append(&pass_entry);
     vbox.append(&pass_confirm);
+    vbox.append(&gen_btn);
+    vbox.append(&advanced_expander);
     vbox.append(&confirm_btn);
     vbox.append(&status_label);
 
     dialog.set_child(Some(&vbox));
 
     let dialog_clone = dialog.clone();
+    
+    // Girdileri GTK buffer'ından izole etmek için cloneluyoruz
+    let pass_entry_clone = pass_entry.clone();
+    let pass_confirm_clone = pass_confirm.clone();
+    let name_entry_clone = name_entry.clone();
+    let kdf_dropdown_clone = kdf_dropdown.clone();
+    let time_entry_clone = time_entry.clone();
+    let memory_entry_clone = memory_entry.clone();
+    let rounds_entry_clone = rounds_entry.clone();
+    let threads_entry_clone = threads_entry.clone();
 
     confirm_btn.connect_clicked(move |_| {
-        let name = name_entry.text().to_string();
-        let pass1 = pass_entry.text().to_string();
-        let pass2 = pass_confirm.text().to_string();
+        let name = name_entry_clone.text().to_string();
+        
+        let secure_pass = zeroize::Zeroizing::new(pass_entry_clone.text().to_string());
+        let secure_confirm = zeroize::Zeroizing::new(pass_confirm_clone.text().to_string());
+
+        // GTK Buffer Wipe (Zero-Trust Standardı)
+        pass_entry_clone.set_text("");
+        pass_confirm_clone.set_text("");
 
         if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains('\0') {
             status_label.set_label("<span foreground='red'>Invalid or empty vault name.</span>");
             return;
         }
-        if pass1.is_empty() {
+
+        if secure_pass.is_empty() {
             status_label.set_label("<span foreground='red'>Password cannot be empty.</span>");
             return;
         }
-        if pass1 != pass2 {
+        if *secure_pass != *secure_confirm {
             status_label.set_label("<span foreground='red'>Passwords do not match.</span>");
             return;
         }
 
-        let secure_pass = zeroize::Zeroizing::new(pass1);
+        // Tuna'nın Tüm Parametrelerini Okuma (Eğer boş ise handle_create tarafındaki defaultları kullanacak)
+        let kdf_choice = if kdf_dropdown_clone.selected() == 0 { "argon2id" } else { "scrypt" };
+        let dec_time: u32 = time_entry_clone.text().parse().unwrap_or(1000);
+        let mem_arg: Option<u32> = memory_entry_clone.text().parse().ok();
+        let rounds_arg: Option<u32> = rounds_entry_clone.text().parse().ok();
+        let threads_arg: Option<u32> = threads_entry_clone.text().parse().ok();
+
         status_label.set_label("Deriving keys, please wait...");
 
         match crate::commands::create::handle_create(
             &folder_path.to_string_lossy(),
             &name,
-            "argon2id", // kdf_choice
-            None,       // memory_arg
-            None,       // rounds_arg
-            None,       // parallelism_arg
-            1000,       // decryption_time
-            false,      // generate_passhrase
+            kdf_choice,
+            mem_arg,       
+            rounds_arg,       
+            threads_arg,       
+            dec_time,   
+            false,      
             Some(secure_pass),
         ) {
             Ok(_) => {
@@ -622,6 +698,7 @@ fn build_vault_explorer(
     let export_session = Rc::clone(&session);
     let export_list_box = list_box.clone();
     let export_status = action_status_label.clone();
+    let export_window_weak = window.downgrade();
 
     export_btn.connect_clicked(move |_| {
         let session_alloc = Rc::clone(&export_session);
@@ -640,11 +717,51 @@ fn build_vault_explorer(
             let mut sess = session_alloc.borrow_mut();
             let VaultSession { ref mut file, ref metadata, ref unlocked_vault, .. } = *sess;
 
-            match crate::commands::export::handle_export(raw_vfs_name, target_path_str, metadata, file, unlocked_vault, false) {
+            match crate::commands::export::handle_export(raw_vfs_name.clone(), target_path_str.clone(), metadata, file, unlocked_vault, false) {
                 Ok(_) => export_status.set_label(&format!("<span foreground='green'>Success: Extracted to atom_staging/{}</span>", safe_vfs_name)),
                 Err(e) => {
                     if e.to_string() == "ALREADY_EXISTS" {
-                        export_status.set_label("<span foreground='red'>Export failed: File already exists! Delete it first.</span>");
+                        let overwrite_dialog = Window::builder()
+                            .transient_for(&export_window_weak.upgrade().unwrap())
+                            .modal(true)
+                            .title("File Already Exists")
+                            .default_width(320)
+                            .build();
+
+                        let ov_vbox = GtkBox::builder().orientation(Orientation::Vertical).spacing(12).margin_top(16).margin_bottom(16).margin_start(16).margin_end(16).build();
+                        ov_vbox.append(&Label::builder().label("This file already exists in the staging area.\nDo you want to force overwrite it?").wrap(true).build());
+                        
+                        let ov_btn_box = GtkBox::builder().orientation(Orientation::Horizontal).spacing(8).build();
+                        let yes_btn = Button::builder().label("Yes, Overwrite").css_classes(["destructive-action"]).build();
+                        let no_btn = Button::builder().label("Cancel").build();
+                        
+                        ov_btn_box.append(&yes_btn);
+                        ov_btn_box.append(&no_btn);
+                        ov_vbox.append(&ov_btn_box);
+                        overwrite_dialog.set_child(Some(&ov_vbox));
+
+                        let dialog_clone = overwrite_dialog.clone();
+                        let status_clone = export_status.clone();
+                        let session_clone = Rc::clone(&session_alloc);
+                        let name_clone = raw_vfs_name.clone();
+                        let path_clone = target_path_str.clone();
+
+                        yes_btn.connect_clicked(move |_| {
+                            let mut inner_sess = session_clone.borrow_mut();
+                            let VaultSession { ref mut file, ref metadata, ref unlocked_vault, .. } = *inner_sess;
+                            
+                            match crate::commands::export::handle_export(name_clone.clone(), path_clone.clone(), metadata, file, unlocked_vault, true) {
+                                Ok(_) => status_clone.set_label("<span foreground='green'>Success: File securely overwritten in staging.</span>"),
+                                Err(err) => status_clone.set_label(&format!("<span foreground='red'>Overwrite failed: {}</span>", err)),
+                            }
+                            dialog_clone.close();
+                        });
+
+                        let dialog_clone_no = overwrite_dialog.clone();
+                        no_btn.connect_clicked(move |_| { dialog_clone_no.close(); });
+
+                        overwrite_dialog.present();
+                        export_status.set_label("<span foreground='orange'>Waiting for overwrite confirmation...</span>");
                     } else {
                         export_status.set_label(&format!("<span foreground='red'>Export failed: {}</span>", e));
                     }
@@ -705,11 +822,8 @@ fn show_p2p_dialog(parent: &ApplicationWindow, current_vault_path: String) {
 
     match crate::commands::id::get_id_string() {
         Ok(onion) => {
-            if onion.starts_with("atom://") {
-                id_entry.set_text(&onion);
-            } else {
-                id_entry.set_text(&format!("atom://{}", onion));
-            }
+            let clean_onion = onion.trim_start_matches("atom://");
+            id_entry.set_text(&format!("atom://{}", clean_onion));
         }
         Err(_) => id_entry.set_text("Identity not generated yet. Run daemon."),
     }

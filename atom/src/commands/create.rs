@@ -1,5 +1,3 @@
-// atom/src/commands/create.rs
-
 use eff_wordlist::large::random_word;
 use rand::RngCore;
 use std::fs;
@@ -47,7 +45,7 @@ pub fn handle_create(
         settings.choice = KdfChoice::Argon2id;
         settings.memory_kib = memory_arg.unwrap_or(65536);
         settings.parallelism = parallelism_arg.unwrap_or(total_threads.max(1));
-    } // <-- FIXED: Added missing closing brace for the else block here
+    } 
 
     std::io::stdout().flush()?;
 
@@ -63,29 +61,22 @@ pub fn handle_create(
         println!("Please save this immediately. You will need it to unlock your vault.\n");
         Zeroizing::new(pass)
     } else if let Some(pw) = gui_password {
-        pw
+        pw // GUI'den gelen, Zeroizing ile korunan şifre
     } else {
-        // Fall back to CLI TTY pinentry or manual prompt if no GUI password provided
-        match crate::secure_input::read_password_pinentry() {
-            Ok(pin_pw) => pin_pw,
-            Err(_) => {
-                print!("Enter a password: ");
-                std::io::stdout().flush()?;
-                let pass = Zeroizing::new(rpassword::read_password()?);
-                if pass.trim().is_empty() {
-                    return Err("Password cannot be empty or contain only spaces.".into());
-                }
-
-                print!("Confirm password: ");
-                std::io::stdout().flush()?;
-                let confirm_pass = Zeroizing::new(rpassword::read_password()?);
-
-                if pass != confirm_pass {
-                    return Err("Security Error: Passwords do not match. Aborting creation.".into());
-                }
-                pass
-            }
+        // Doğrudan sistem seviyesi TTY okuyucunu çağırıyoruz
+        let pass = crate::secure_input::read_password_pinentry()?;
+        
+        if pass.trim().is_empty() {
+            return Err("Password cannot be empty or contain only spaces.".into());
         }
+
+        println!("\n[Confirm] Please confirm your Master Password:");
+        let confirm_pass = crate::secure_input::read_password_pinentry()?;
+
+        if *pass != *confirm_pass {
+            return Err("Security Error: Passwords do not match. Aborting creation.".into());
+        }
+        pass
     };
 
     if password.trim().is_empty() {
@@ -158,7 +149,7 @@ pub fn handle_create(
     file.sync_all()?;
 
     println!(
-        "[Success] Vault successfully initialized with {:?}.",
+        "\n[Success] Vault successfully initialized with {:?}.",
         settings.choice
     );
     Ok(())

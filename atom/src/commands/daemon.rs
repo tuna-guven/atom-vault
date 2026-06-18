@@ -71,23 +71,23 @@ async fn ask_user_interactive(
             use std::io::{self, Write};
             
             print!("{} wants to sync {} with you. Accept? [Y/n]: ", sender_nick, filename);
-            io::stdout().flush().unwrap();
+            io::stdout().flush().unwrap_or_default();
             let mut ans = String::new();
-            io::stdin().read_line(&mut ans).unwrap();
+            io::stdin().read_line(&mut ans).unwrap_or_default();
             
             if ans.trim().to_lowercase() == "y" || ans.trim().is_empty() {
                 print!("Label for this vault?: ");
-                io::stdout().flush().unwrap();
+                io::stdout().flush().unwrap_or_default();
                 let mut label = String::new();
-                io::stdin().read_line(&mut label).unwrap();
+                io::stdin().read_line(&mut label).unwrap_or_default();
                 
-                let mut default_path = dirs::home_dir().unwrap();
+                let mut default_path = dirs::home_dir().unwrap_or_default();
                 default_path.push(format!("Downloads/{}/{}", sender_nick, filename));
                 
                 print!("Folder path? [{}]: ", default_path.display());
-                io::stdout().flush().unwrap();
+                io::stdout().flush().unwrap_or_default();
                 let mut path_ans = String::new();
-                io::stdin().read_line(&mut path_ans).unwrap();
+                io::stdin().read_line(&mut path_ans).unwrap_or_default();
                 
                 let final_path = if path_ans.trim().is_empty() {
                     default_path.to_string_lossy().to_string()
@@ -105,7 +105,7 @@ async fn ask_user_interactive(
             }
         })
         .await
-        .unwrap()
+        .unwrap_or(SyncResponse { accepted: false, label: None, save_path: None })
     }
 }
 
@@ -187,7 +187,7 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
         let identity_b32 = data_encoding::BASE32_NOPAD.encode(local_identity.verifying_key().as_bytes()).to_lowercase();
         let final_link = format!("atom://{}/{}", clean_onion, identity_b32);
 
-        let mut onion_file_path = dirs::home_dir().unwrap();
+        let mut onion_file_path = dirs::home_dir().unwrap_or_default();
         onion_file_path.push(".atom_vault/onion.txt");
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -265,7 +265,7 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                                                         let user_response = ask_user_interactive(nick.clone(), filename.clone()).await;
                                                         
                                                         if user_response.accepted {
-                                                            local_save_path = user_response.save_path.unwrap();
+                                                            local_save_path = user_response.save_path.unwrap_or_default();
                                                             accepted = true;
 
                                                             if let Some(friend) = friends_db.iter_mut().find(|f| f.nickname == nick) {
@@ -282,29 +282,40 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                                                         accepted = true;
                                                     }
 
-                                                    if accepted {
+                                                    if accepted && !local_save_path.is_empty() {
                                                         let reply = SyncMessage::Accept { action: "pull_from_you".to_string() };
-                                                        let reply_json = format!("{}\n", serde_json::to_string(&reply).unwrap());
-                                                        stream_io.write_all(reply_json.as_bytes()).await.unwrap();
-                                                        stream_io.flush().await.unwrap();
+                                                        let reply_json = format!("{}\n", serde_json::to_string(&reply).unwrap_or_default());
+                                                        
+                                                        // Ağ yazma hatalarını güvenli şekilde yakala
+                                                        if let Err(e) = stream_io.write_all(reply_json.as_bytes()).await {
+                                                            send_daemon_log(&format!("Failed to send Accept response: {}", e));
+                                                            return;
+                                                        }
+                                                        let _ = stream_io.flush().await;
 
                                                         let path = PathBuf::from(&local_save_path);
                                                         if let Some(parent) = path.parent() {
-                                                            fs::create_dir_all(parent).unwrap_or_default();
+                                                            let _ = fs::create_dir_all(parent);
                                                         }
 
-                                                        let mut file = tokio::fs::File::create(&local_save_path).await.unwrap();
-                                                        send_daemon_log(&format!("Receiving encrypted payload into {}...", local_save_path));
-                                                        
-                                                        match tokio::io::copy(&mut stream_io, &mut file).await {
-                                                            Ok(bytes) => send_daemon_log(&format!("Success! {} bytes written to disk.", bytes)),
-                                                            Err(e) => send_daemon_log(&format!("Transfer failed: {}", e)),
+                                                        // Dosya oluşturma hatasını güvenli şekilde yakala
+                                                        match tokio::fs::File::create(&local_save_path).await {
+                                                            Ok(mut file) => {
+                                                                send_daemon_log(&format!("Receiving encrypted payload into {}...", local_save_path));
+                                                                match tokio::io::copy(&mut stream_io, &mut file).await {
+                                                                    Ok(bytes) => send_daemon_log(&format!("Success! {} bytes written to disk.", bytes)),
+                                                                    Err(e) => send_daemon_log(&format!("Transfer failed: {}", e)),
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                send_daemon_log(&format!("File System Error: Cannot write to path ({}).", e));
+                                                            }
                                                         }
                                                     } else {
                                                         let reply = SyncMessage::Reject;
-                                                        let reply_json = format!("{}\n", serde_json::to_string(&reply).unwrap());
-                                                        stream_io.write_all(reply_json.as_bytes()).await.unwrap();
-                                                        stream_io.flush().await.unwrap();
+                                                        let reply_json = format!("{}\n", serde_json::to_string(&reply).unwrap_or_default());
+                                                        let _ = stream_io.write_all(reply_json.as_bytes()).await;
+                                                        let _ = stream_io.flush().await;
                                                         send_daemon_log("Rejected sync proposal.");
                                                     }
                                                 }

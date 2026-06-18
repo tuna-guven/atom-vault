@@ -1,9 +1,8 @@
-// atom/src/main.rs
-
 mod chunker;
 mod cli;
 mod commands;
 mod crypto;
+pub mod gui;
 pub mod sandbox;
 pub mod secure_input;
 mod storage;
@@ -13,6 +12,7 @@ use clap::Parser;
 use cli::{Cli, Commands};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Zero-Trust Panic Hook: Herhangi bir çökme anında bellek sızıntısını önler
     std::panic::set_hook(Box::new(|panic_info| {
         eprintln!("\n[FATAL] Atom Vault encountered a critical runtime failure.");
         let payload = panic_info.payload();
@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Cli::parse();
 
+    // Güvenli Staging Dizini (Geçici Dosya Çıkarma Alanı) Belirleme
     let staging_dir_str = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
         format!("{}/atom_staging", xdg_runtime)
     } else if let Ok(home) = std::env::var("HOME") {
@@ -45,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
+        // Sadece sahibinin okuyup/yazabileceği katı izinler (0700)
         dir_builder.mode(0o700);
     }
 
@@ -74,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             parallelism,
             decryption_time,
             generate_passphrase,
-            None, // <-- Explicitly pass None for gui_password when using CLI
+            None, // TTY tabanlı CLI için GUI şifresi 'None' geçilir
         ),
         Some(Commands::Enter { vault_path }) => commands::enter::handle_enter(vault_path),
         Some(Commands::Daemon) => commands::daemon::handle_daemon(),
@@ -85,9 +87,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             friend_nickname,
         }) => commands::sync::handle_sync(&vault_path, &friend_nickname),
         None => {
-            // Fallback if no command is provided
-            eprintln!("No command provided. Run 'atom --help' for usage.");
-            Ok(())
+            // Argüman yoksa varsayılan olarak GUI'yi ve arka plan P2P dinleyicisini başlat
+            println!("[INFO] No CLI arguments provided. Launching Graphical Interface...");
+            crate::gui::run_gui()
         }
     }));
 
