@@ -1,3 +1,5 @@
+// atom/src/storage.rs
+
 use crate::crypto::{UnlockedVault, XNONCE_LEN};
 use crate::vfs::VaultMetadata;
 use std::fs::File;
@@ -12,6 +14,10 @@ pub fn load_vault_metadata(
     file.read_exact(&mut master_ptr_bytes)?;
     let master_pointer = u64::from_le_bytes(master_ptr_bytes);
 
+    let mut kdf_bytes = [0u8; crate::crypto::KdfSettings::SIZE];
+    file.read_exact(&mut kdf_bytes)?;
+    let kdf_settings = crate::crypto::KdfSettings::from_bytes(&kdf_bytes)?;
+
     let mut salt = [0u8; 32];
     let mut dek_nonce = [0u8; XNONCE_LEN];
     let mut wrapped_dek = [0u8; 48];
@@ -20,8 +26,8 @@ pub fn load_vault_metadata(
     file.read_exact(&mut dek_nonce)?;
     file.read_exact(&mut wrapped_dek)?;
 
-    let kek =
-        crate::crypto::derive_kek(password, &salt).map_err(|e| format!("Argon2 error: {:?}", e))?;
+    let kek = crate::crypto::derive_kek(password, &salt, &kdf_settings)
+        .map_err(|e| format!("KDF error: {:?}", e))?;
 
     let unlocked_vault = crate::crypto::unwrap_dek(&kek, &wrapped_dek, &dek_nonce)
         .map_err(|e| format!("DEK unwrap error: {:?}", e))?;
@@ -34,14 +40,16 @@ pub fn load_vault_metadata(
     file.read_exact(&mut metadata_nonce)?;
 
     let mut encrypted_metadata = Vec::new();
-    file.take(10 * 1024 * 1024).read_to_end(&mut encrypted_metadata)?;
+    file.take(10 * 1024 * 1024)
+        .read_to_end(&mut encrypted_metadata)?;
 
     let decrypted_metadata_bytes = crate::crypto::decrypt_chunk(
         &unlocked_vault,
         &encrypted_metadata,
         &metadata_nonce,
         master_pointer,
-    ).map_err(|e| format!("Metadata decrypt error: {:?}", e))?;
+    )
+    .map_err(|e| format!("Metadata decrypt error: {:?}", e))?;
 
     let metadata: VaultMetadata = bincode::deserialize(&decrypted_metadata_bytes)?;
 

@@ -1,3 +1,5 @@
+// atom/src/main.rs
+
 mod chunker;
 mod cli;
 mod commands;
@@ -10,11 +12,8 @@ use clap::Parser;
 use cli::{Cli, Commands};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Enable raw standard panic hooks to prevent sensitive data leaks during crashes
     std::panic::set_hook(Box::new(|panic_info| {
         eprintln!("\n[FATAL] Atom Vault encountered a critical runtime failure.");
-
-        // FIX 1: Catch both static string slices (&str) and dynamically allocated Strings
         let payload = panic_info.payload();
         if let Some(s) = payload.downcast_ref::<&str>() {
             eprintln!("Reason: {}", s);
@@ -23,18 +22,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             eprintln!("Reason: Unknown error payload.");
         }
-
         eprintln!("Purging volatile process memory and enforcing immediate emergency exit.");
     }));
 
-    // Parse command line arguments using our secure customized styling interface
     let args = Cli::parse();
 
-    // FIX 2: Prioritize XDG_RUNTIME_DIR (RAM/tmpfs) over HOME (Disk) for staging
     let staging_dir_str = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
         format!("{}/atom_staging", xdg_runtime)
     } else if let Ok(home) = std::env::var("HOME") {
-        format!("{}/.atom_vault/staging", home) // Hidden fallback directory
+        format!("{}/.atom_vault/staging", home)
     } else {
         return Err(
             "Security Error: Neither XDG_RUNTIME_DIR nor HOME environment variables are set."
@@ -42,7 +38,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     };
 
-    // FIX 3: Enforce strict 0700 permissions on the staging directory
     let mut dir_builder = std::fs::DirBuilder::new();
     dir_builder.recursive(true);
 
@@ -59,24 +54,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Route system execution to targeted synchronous sub-command handlers
-        match args.command {
-            Commands::Create {
-                vault_path,
-                vault_name,
-            } => commands::create::handle_create(&vault_path, &vault_name),
-            Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
-
-            // --- DECOUPLED P2P ROUTING ---
-            Commands::Daemon => commands::daemon::handle_daemon(),
-            Commands::Id => commands::id::handle_id(),
-            Commands::Friend { command } => commands::friend::handle_friend(command),
-            Commands::Sync {
-                vault_path,
-                friend_nickname,
-            } => commands::sync::handle_sync(&vault_path, &friend_nickname),
-        }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match args.command {
+        Commands::Create {
+            vault_path,
+            vault_name,
+            kdf,
+            memory,
+            transform_rounds,
+            parallelism,
+            generate_passphrase,
+            decryption_time,
+        } => commands::create::handle_create(
+            &vault_path,
+            &vault_name,
+            &kdf,
+            memory,
+            transform_rounds,
+            parallelism,
+            decryption_time,
+            generate_passphrase,
+        ),
+        Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
+        Commands::Daemon => commands::daemon::handle_daemon(),
+        Commands::Id => commands::id::handle_id(),
+        Commands::Friend { command } => commands::friend::handle_friend(command),
+        Commands::Sync {
+            vault_path,
+            friend_nickname,
+        } => commands::sync::handle_sync(&vault_path, &friend_nickname),
     }));
 
     match result {
