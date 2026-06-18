@@ -4,9 +4,11 @@ mod chunker;
 mod cli;
 mod commands;
 mod crypto;
-pub mod sandbox;
 mod storage;
 mod vfs;
+pub mod sandbox; 
+pub mod gui;    
+pub mod secure_input;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -73,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             parallelism,
             decryption_time,
             generate_passphrase,
+            None,
         ),
         Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
         Commands::Daemon => commands::daemon::handle_daemon(),

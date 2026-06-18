@@ -1,3 +1,4 @@
+use crate::crypto::UnlockedVault;
 use crate::vfs::VaultMetadata;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -6,7 +7,8 @@ pub fn handle_vacuum(
     vault_path: &str,
     metadata: &mut VaultMetadata,
     physical_vault: &mut File,
-) -> Result<(), Box<dyn std::error::Error>> {
+    unlocked_vault: &UnlockedVault, // KRİTİK: Metadata'yı yeniden şifrelemek için eklendi
+) -> Result<u64, Box<dyn std::error::Error>> { // Güncel offset'i döndürür
     let tmp_path = format!("{}.tmp", vault_path);
     let mut tmp_file = std::fs::OpenOptions::new()
         .read(true)
@@ -16,8 +18,11 @@ pub fn handle_vacuum(
         .map_err(|e| format!("Failed to create vacuum temp file: {:?}", e))?;
 
     let header_size: u64 = 112;
-    tmp_file.write_all(&header_size.to_le_bytes())?;
+    
+    // Geçici olarak Master Pointer alanını (8 bayt) 0 ile doldur, sonra güncelleyeceğiz
+    tmp_file.write_all(&[0u8; 8])?;
 
+    // Header'ın geri kalanını kopyala (Master Salt, KDF parametreleri vs.)
     physical_vault.seek(SeekFrom::Start(8))?;
     let mut header_rest = [0u8; 104];
     physical_vault.read_exact(&mut header_rest)?;
@@ -25,6 +30,7 @@ pub fn handle_vacuum(
 
     let mut new_payload_offset = header_size;
 
+    // Sadece silinmemiş, aktif chunk'ları yeni dosyaya sıkıştırarak yaz
     for file_index in &mut metadata.file_table {
         for chunk in &mut file_index.chunks {
             physical_vault.seek(SeekFrom::Start(chunk.offset))?;
@@ -35,35 +41,28 @@ pub fn handle_vacuum(
             tmp_file.seek(SeekFrom::Start(new_payload_offset))?;
             tmp_file.write_all(&cipher_buffer)?;
 
+            // Bellekteki metadata'nın offset'ini YENİ konuma göre güncelle
             chunk.offset = new_payload_offset;
             new_payload_offset += chunk.cipher_len as u64;
         }
     }
 
-    physical_vault.seek(SeekFrom::Start(0))?;
-    let mut master_ptr_bytes = [0u8; 8];
-    physical_vault.read_exact(&mut master_ptr_bytes)?;
-    let old_master_ptr = u64::from_le_bytes(master_ptr_bytes);
+    // KRİTİK YAMA: Eski metadata'yı kopyalamak yerine, offset'leri güncellenmiş
+    // yeni metadata'yı şifreleyerek dosyanın sonuna yaz.
+    crate::storage::save_vault_metadata(
+        &mut tmp_file,
+        metadata,
+        unlocked_vault,
+        new_payload_offset,
+    )?;
 
-    physical_vault.seek(SeekFrom::Start(old_master_ptr))?;
-    let mut metadata_nonce = [0u8; crate::crypto::XNONCE_LEN];
-    physical_vault.read_exact(&mut metadata_nonce)?;
-
-    let mut encrypted_metadata = Vec::new();
-    physical_vault.take(10 * 1024 * 1024).read_to_end(&mut encrypted_metadata)?;
-
-    tmp_file.seek(SeekFrom::Start(new_payload_offset))?;
-    tmp_file.write_all(&metadata_nonce)?;
-    tmp_file.write_all(&encrypted_metadata)?;
-
-    tmp_file.seek(SeekFrom::Start(0))?;
-    tmp_file.write_all(&new_payload_offset.to_le_bytes())?;
-    
     tmp_file.sync_all()?;
-    drop(tmp_file);
+    drop(tmp_file); // Yeniden adlandırma (rename) yapabilmek için dosya kilidini (FD) serbest bırak
     
     std::fs::rename(&tmp_path, vault_path)?;
 
     println!("[Vacuum] Optimization complete. Discarded dead zones and atomically defragmented storage container.");
-    Ok(())
+    
+    // Yeni payload offset'ini döndür ki shell.rs bunu güncelleyebilsin
+    Ok(new_payload_offset) 
 }

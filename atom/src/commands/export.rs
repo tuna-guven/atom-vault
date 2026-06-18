@@ -37,8 +37,8 @@ pub fn handle_export(
     metadata: &VaultMetadata,
     physical_vault: &mut File,
     unlocked_vault: &UnlockedVault,
+    force_overwrite: bool, // YENİ PARAMETRE: Shell'den veya GUI'den gelen onay
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // FIX 1: Sync staging path determination logic to prioritize volatile tmpfs
     let staging_dir_str = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
         format!("{}/atom_staging", xdg_runtime)
     } else if let Ok(home) = std::env::var("HOME") {
@@ -56,6 +56,11 @@ pub fn handle_export(
 
     let target_path = Path::new(&staging_dir_str).join(safe_filename);
 
+    // YENİ KONTROL: Eğer dosya varsa ve overwrite false ise özel hata dön
+    if target_path.exists() && !force_overwrite {
+        return Err("ALREADY_EXISTS".into());
+    }
+
     let file_entry = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name);
 
     let target_file = match file_entry {
@@ -65,9 +70,15 @@ pub fn handle_export(
         }
     };
 
-    // FIX 2: Enforce strict 0600 file permissions for the exported plaintext
     let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.write(true).create_new(true);
+    open_opts.write(true);
+    
+    // GÜVENLİ YAZMA MODU
+    if force_overwrite {
+        open_opts.create(true).truncate(true); // Dosya varsa içini tamamen ez ve sıfırdan yaz
+    } else {
+        open_opts.create_new(true); // Sadece yeni oluştur (Zaten üstte yakaladık ama kernel savunması)
+    }
 
     #[cfg(unix)]
     {
@@ -76,11 +87,7 @@ pub fn handle_export(
     }
 
     let mut output_file = open_opts.open(&target_path).map_err(|e| {
-        format!(
-            "Failed to create secure output file at '{}' (it might already exist): {:?}",
-            target_path.display(),
-            e
-        )
+        format!("Failed to create secure output file at '{}': {:?}", target_path.display(), e)
     })?;
 
     for chunk in &target_file.chunks {
@@ -99,9 +106,7 @@ pub fn handle_export(
             .map_err(|e| format!("Decryption error: {:?}", e))?,
         );
 
-        // FIX 3: Lock the plaintext buffer in RAM so it cannot be paged to the swap file
         let _mlock_guard = MlockGuard::new(&decrypted_bytes)?;
-
         output_file.write_all(&decrypted_bytes)?;
     }
 

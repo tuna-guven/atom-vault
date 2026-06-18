@@ -19,7 +19,10 @@ pub fn handle_create(
     parallelism_arg: Option<u32>,
     decryption_time: u32,
     generate_passphrase: bool,
+    gui_password: Option<Zeroizing<String>>
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+    // 1. Build the path and ensure the parent directories exist
     let mut actual_file_path = PathBuf::from(vault_path);
     fs::create_dir_all(&actual_file_path)?;
     actual_file_path.push(format!("{}.aegis", vault_name));
@@ -45,6 +48,16 @@ pub fn handle_create(
         settings.choice = KdfChoice::Argon2id;
         settings.memory_kib = memory_arg.unwrap_or(65536);
         settings.parallelism = parallelism_arg.unwrap_or(total_threads.max(1));
+    std::io::stdout().flush()?;
+
+    // YENİ: Şifre GUI'den verilmişse onu kullan, verilmemişse CLI TTY'den (pinentry) iste
+    let password = match gui_password {
+        Some(pw) => pw,
+        None => crate::secure_input::read_password_pinentry()?,
+    };
+
+    if password.trim().is_empty() {
+        return Err("Password cannot be empty or contain only spaces.".into());
     }
 
     settings.iterations = if let Some(explicit_rounds) = rounds_arg {
@@ -129,6 +142,7 @@ pub fn handle_create(
     file.write_all(&dek_nonce)?;
     file.write_all(&wrapped_dek)?;
 
+    use rand::RngCore;
     let mut cdc_salt = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut cdc_salt);
 

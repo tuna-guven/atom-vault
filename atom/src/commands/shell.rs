@@ -2,6 +2,7 @@ use crate::crypto::UnlockedVault;
 use crate::vfs::VaultMetadata;
 use std::fs::File;
 use std::io::{self, Write};
+use std::sync::mpsc; // CLI'yi bloke etmek ve thread senkronizasyonu için gerekli
 
 pub fn start_interactive_shell(
     metadata: &mut VaultMetadata,
@@ -62,13 +63,15 @@ pub fn start_interactive_shell(
                 } else {
                     let vfs_name = parts[1].to_string();
 
-                    crate::commands::rm::handle_rm(
+                    if let Err(e) = crate::commands::rm::handle_rm(
                         vfs_name,
                         metadata,
                         physical_vault,
                         unlocked_vault,
                         &mut current_payload_offset,
-                    )?;
+                    ) {
+                        eprintln!("{}", e);
+                    }
                 }
             }
 
@@ -81,7 +84,6 @@ pub fn start_interactive_shell(
                     let to_disk = parts[2].to_string();
                     
                     print!("\n[WARNING] You are about to extract decrypted data to the physical disk (Staging Area).\nAre you sure you want to proceed? [y/N]: ");
-                    
                     std::io::stdout().flush().unwrap_or_default();
                     
                     let mut input = String::new();
@@ -89,14 +91,44 @@ pub fn start_interactive_shell(
                     
                     if input.trim().eq_ignore_ascii_case("y") {
                         
-                        if let Err(e) = crate::commands::export::handle_export(
-                            vfs_name,
-                            to_disk,
+                        // 1. ADIM: Normal deneme (force_overwrite: false)
+                        match crate::commands::export::handle_export(
+                            vfs_name.clone(),
+                            to_disk.clone(),
                             metadata,
                             physical_vault,
                             unlocked_vault,
+                            false 
                         ) {
-                            eprintln!("{}", e);
+                            Ok(_) => {}
+                            Err(e) => {
+                                // 2. ADIM: Dosya zaten varsa uyarı ver ve sor
+                                if e.to_string() == "ALREADY_EXISTS" {
+                                    print!("Warning: The file already exists in the staging area. Do you want to overwrite it? [y/N]: ");
+                                    std::io::stdout().flush().unwrap_or_default();
+                                    
+                                    let mut ow_input = String::new();
+                                    std::io::stdin().read_line(&mut ow_input).unwrap_or_default();
+                                    
+                                    if ow_input.trim().eq_ignore_ascii_case("y") {
+                                        // Kullanıcı zorla yaz dedi, parametreyi true gönder
+                                        if let Err(err2) = crate::commands::export::handle_export(
+                                            vfs_name,
+                                            to_disk,
+                                            metadata,
+                                            physical_vault,
+                                            unlocked_vault,
+                                            true // GÜÇLÜ YAZMA
+                                        ) {
+                                            eprintln!("Export failed: {}", err2);
+                                        }
+                                    } else {
+                                        println!("Export cancelled by user. Existing file was preserved.");
+                                    }
+                                } else {
+                                    eprintln!("Export failed: {}", e);
+                                }
+                            }
                         }
                         
                     } else {
@@ -112,14 +144,17 @@ pub fn start_interactive_shell(
                 } else {
                     let vfs_name = parts[1].to_string();
 
-                    crate::commands::cat::handle_cat(
+                    if let Err(e) = crate::commands::cat::handle_cat(
                         vfs_name,
                         metadata,
                         physical_vault,
                         unlocked_vault,
-                    )?;
+                    ) {
+                        eprintln!("{}", e);
+                    }
                 }
             }
+            
             "view" => {
                 if parts.len() < 2 {
                     println!("Error: Missing argument.");
@@ -129,16 +164,29 @@ pub fn start_interactive_shell(
 
                     if let Some(file_index) = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name) {
                         
-                        // KORUMA 1: Okumadan önce bekleyen tüm 'import' yazma işlemlerini diske zorla (Flush)
+                        // KORUMA 1: Okumadan önce bekleyen tüm yazma işlemlerini diske zorla
                         let _ = physical_vault.sync_all();
 
-                        // KORUMA 2: '?' kullanmıyoruz! Hata gelirse ekrana basıp loop'a (shell'e) devam ediyoruz.
-                        if let Err(e) = crate::commands::view::execute(
+                        // CLI'ı dondurmak için senkronizasyon kanalı
+                        let (tx, rx) = mpsc::channel();
+
+                        // KORUMA 2: '?' kullanmıyoruz! Hata gelirse ekrana basıp shell'e devam ediyoruz.
+                        match crate::commands::view::execute(
                             physical_vault,
                             file_index,
                             unlocked_vault,
+                            move || {
+                                // Zathura kapanıp RAM silindikten sonra sinyal gönder
+                                let _ = tx.send(()); 
+                            }
                         ) {
-                            eprintln!("❌ View Error: {}", e);
+                            Ok(_) => {
+                                // Zathura açık olduğu sürece CLI burada sessizce bekler (blocking)
+                                let _ = rx.recv();
+                            }
+                            Err(e) => {
+                                eprintln!("❌ View Error: {}", e);
+                            }
                         }
                         
                     } else {
@@ -146,10 +194,22 @@ pub fn start_interactive_shell(
                     }
                 }
             }
+            
             "vacuum" => {
-                crate::commands::vacuum::handle_vacuum(&vault_path, metadata, physical_vault)?;
-                *physical_vault = File::options().read(true).write(true).open(&vault_path)?;
-                current_payload_offset = physical_vault.metadata()?.len();
+                match crate::commands::vacuum::handle_vacuum(&vault_path, metadata, physical_vault, unlocked_vault) {
+                    Ok(new_offset) => {
+                        // Kasa yeniden oluşturulduğu için dosya tanımlayıcısını tazele ve offset'i güncelle
+                        match File::options().read(true).write(true).open(&vault_path) {
+                            Ok(file) => {
+                                *physical_vault = file;
+                                current_payload_offset = new_offset;
+                            }
+                            Err(e) => eprintln!("Error reopening vault after vacuum: {}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("Vacuum error: {}", e),
+                }
+            
             }
 
             "help" => {
@@ -166,6 +226,9 @@ pub fn start_interactive_shell(
                 );
                 println!(
                     "  rm <vfs_name>                       - Cryptographically shred a file reference from metadata"
+                );
+                println!(
+                    "  view <vfs_name>                     - Securely isolate and view a file inside the Zathura sandbox"
                 );
                 println!(
                     "  vacuum                              - Defragment and shrink the physical .aegis container"
