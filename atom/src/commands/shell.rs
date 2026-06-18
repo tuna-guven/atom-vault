@@ -3,6 +3,7 @@ use crate::vfs::VaultMetadata;
 use std::fs::File;
 use std::io::{self, Write};
 use std::sync::mpsc; // CLI'yi bloke etmek ve thread senkronizasyonu için gerekli
+use zeroize::Zeroizing;
 
 pub fn start_interactive_shell(
     metadata: &mut VaultMetadata,
@@ -20,7 +21,7 @@ pub fn start_interactive_shell(
         print!("atom-vault> ");
         io::stdout().flush()?;
 
-        let mut input = zeroize::Zeroizing::new(String::new());
+        let mut input = Zeroizing::new(String::new());
         io::stdin().read_line(&mut input)?;
 
         let trimmed_input = input.trim();
@@ -86,7 +87,8 @@ pub fn start_interactive_shell(
                     print!("\n[WARNING] You are about to extract decrypted data to the physical disk (Staging Area).\nAre you sure you want to proceed? [y/N]: ");
                     std::io::stdout().flush().unwrap_or_default();
                     
-                    let mut input = String::new();
+                    // Girdi tamponunu temiz tutmak için Zeroizing
+                    let mut input = Zeroizing::new(String::new());
                     std::io::stdin().read_line(&mut input).unwrap_or_default();
                     
                     if input.trim().eq_ignore_ascii_case("y") {
@@ -107,7 +109,7 @@ pub fn start_interactive_shell(
                                     print!("Warning: The file already exists in the staging area. Do you want to overwrite it? [y/N]: ");
                                     std::io::stdout().flush().unwrap_or_default();
                                     
-                                    let mut ow_input = String::new();
+                                    let mut ow_input = Zeroizing::new(String::new());
                                     std::io::stdin().read_line(&mut ow_input).unwrap_or_default();
                                     
                                     if ow_input.trim().eq_ignore_ascii_case("y") {
@@ -176,12 +178,12 @@ pub fn start_interactive_shell(
                             file_index,
                             unlocked_vault,
                             move || {
-                                // Zathura kapanıp RAM silindikten sonra sinyal gönder
+                                // Harici okuyucu kapanıp RAM silindikten sonra sinyal gönder
                                 let _ = tx.send(()); 
                             }
                         ) {
                             Ok(_) => {
-                                // Zathura açık olduğu sürece CLI burada sessizce bekler (blocking)
+                                // Harici okuyucu açık olduğu sürece CLI burada sessizce bekler (blocking)
                                 let _ = rx.recv();
                             }
                             Err(e) => {
@@ -228,7 +230,7 @@ pub fn start_interactive_shell(
                     "  rm <vfs_name>                       - Cryptographically shred a file reference from metadata"
                 );
                 println!(
-                    "  view <vfs_name>                     - Securely isolate and view a file inside the Zathura sandbox"
+                    "  view <vfs_name>                     - Securely isolate and view a file inside the sandbox"
                 );
                 println!(
                     "  vacuum                              - Defragment and shrink the physical .aegis container"

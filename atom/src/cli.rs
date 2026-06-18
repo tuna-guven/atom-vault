@@ -1,3 +1,5 @@
+// atom/src/cli.rs
+
 use clap::{
     Parser, Subcommand,
     builder::styling::{AnsiColor, Effects, Styles},
@@ -28,13 +30,46 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Create a new, empty secure vault container file
+    /// Initialize a new, cryptographically secure Atom Vault
+    #[command(
+        long_about = "Initialize a new, cryptographically secure Atom Vault.\n\n\
+        This command creates a new .aegis container file to safely store your encrypted data. \
+        You can customize the underlying Key Derivation Function (KDF) using the available flags, \
+        or stick to the highly secure defaults (Argon2id). For maximum security, use the \
+        --generate-passphrase flag to create a 10-word diceware master password."
+    )]
     Create {
-        #[arg(long, default_value = ".")]
+        /// Directory where the .aegis file will be saved
+        #[arg(long, value_parser = parse_vault_path, default_value = ".")]
         vault_path: String,
 
+        /// Name of the vault. The .aegis extension is added automatically
         #[arg(long, value_parser = parse_vault_name)]
         vault_name: String,
+
+        /// The Key Derivation Function to use ("argon2id" or "scrypt")
+        #[arg(long, default_value = "argon2id")]
+        kdf: String,
+
+        /// Memory limit for the KDF in KiB (Default: 64MiB for Argon2id, 256MiB for Scrypt)
+        #[arg(long)]
+        memory: Option<u32>,
+
+        /// Overrides auto-calibration and manually sets the number of transform rounds
+        #[arg(long)]
+        transform_rounds: Option<u32>,
+
+        /// Target decryption delay in milliseconds for auto-tuning rounds (Default: 1000)
+        #[arg(long, default_value_t = 1000)]
+        decryption_time: u32,
+
+        /// Number of CPU threads to use for hashing (Defaults to all available logical cores)
+        #[arg(long)]
+        parallelism: Option<u32>,
+
+        /// Automatically generate a highly secure, 10-word EFF diceware master passphrase
+        #[arg(long, default_value_t = false)]
+        generate_passphrase: bool,
     },
 
     /// Unlock a vault and enter its cryptographically isolated interactive shell
@@ -102,9 +137,7 @@ fn parse_vault_name(s: &str) -> Result<String, String> {
     if !s.is_ascii() {
         return Err("Vault name must contain only ASCII".to_string());
     }
-    if s.chars()
-        .any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
-    {
+    if s.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '-') {
         return Err("Vault name can only contain alphanumeric characters, _, or -".to_string());
     }
     Ok(s.to_string())
@@ -117,7 +150,6 @@ fn parse_vault_path(s: &str) -> Result<String, String> {
     if s.len() > 4096 {
         return Err("Vault path is too long".to_string());
     }
-    
     Ok(s.to_string())
 }
 

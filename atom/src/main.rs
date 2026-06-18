@@ -2,21 +2,19 @@ mod chunker;
 mod cli;
 mod commands;
 mod crypto;
+pub mod gui;
+pub mod sandbox;
+pub mod secure_input;
 mod storage;
 mod vfs;
-pub mod sandbox; 
-pub mod gui;    
-pub mod secure_input;
 
 use clap::Parser;
 use cli::{Cli, Commands};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Enable raw standard panic hooks to prevent sensitive data leaks during crashes
+    // Zero-Trust Panic Hook: Herhangi bir çökme anında bellek sızıntısını önler
     std::panic::set_hook(Box::new(|panic_info| {
         eprintln!("\n[FATAL] Atom Vault encountered a critical runtime failure.");
-
-        // FIX 1: Catch both static string slices (&str) and dynamically allocated Strings
         let payload = panic_info.payload();
         if let Some(s) = payload.downcast_ref::<&str>() {
             eprintln!("Reason: {}", s);
@@ -25,18 +23,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             eprintln!("Reason: Unknown error payload.");
         }
-
         eprintln!("Purging volatile process memory and enforcing immediate emergency exit.");
     }));
 
-    // Parse command line arguments
     let args = Cli::parse();
 
-    // FIX 2: Prioritize XDG_RUNTIME_DIR (RAM/tmpfs) over HOME (Disk) for staging
+    // Güvenli Staging Dizini (Geçici Dosya Çıkarma Alanı) Belirleme
     let staging_dir_str = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
         format!("{}/atom_staging", xdg_runtime)
     } else if let Ok(home) = std::env::var("HOME") {
-        format!("{}/.atom_vault/staging", home) // Hidden fallback directory
+        format!("{}/.atom_vault/staging", home)
     } else {
         return Err(
             "Security Error: Neither XDG_RUNTIME_DIR nor HOME environment variables are set."
@@ -44,13 +40,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     };
 
-    // FIX 3: Enforce strict 0700 permissions on the staging directory
     let mut dir_builder = std::fs::DirBuilder::new();
     dir_builder.recursive(true);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
+        // Sadece sahibinin okuyup/yazabileceği katı izinler (0700)
         dir_builder.mode(0o700);
     }
 
@@ -61,25 +57,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        
-        match args.command {
-            Some(command) => {
-                match command {
-                    Commands::Create { vault_path, vault_name } => commands::create::handle_create(&vault_path, &vault_name, None),
-                    Commands::Enter { vault_path } => commands::enter::handle_enter(vault_path),
-                    // P2P Commands
-                    Commands::Daemon => commands::daemon::handle_daemon(),
-                    Commands::Id => commands::id::handle_id(),
-                    Commands::Friend { command } => commands::friend::handle_friend(command),
-                    Commands::Sync { vault_path, friend_nickname } => commands::sync::handle_sync(&vault_path, &friend_nickname),
-                }
-            },
-            
-            None => {
-                println!("[INFO] No CLI arguments provided. Launching Graphical Interface...");
-                gui::run_gui()
-            }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match args.command {
+        Some(Commands::Create {
+            vault_path,
+            vault_name,
+            kdf,
+            memory,
+            transform_rounds,
+            parallelism,
+            generate_passphrase,
+            decryption_time,
+        }) => commands::create::handle_create(
+            &vault_path,
+            &vault_name,
+            &kdf,
+            memory,
+            transform_rounds,
+            parallelism,
+            decryption_time,
+            generate_passphrase,
+            None, // TTY tabanlı CLI için GUI şifresi 'None' geçilir
+        ),
+        Some(Commands::Enter { vault_path }) => commands::enter::handle_enter(vault_path),
+        Some(Commands::Daemon) => commands::daemon::handle_daemon(),
+        Some(Commands::Id) => commands::id::handle_id(),
+        Some(Commands::Friend { command }) => commands::friend::handle_friend(command),
+        Some(Commands::Sync {
+            vault_path,
+            friend_nickname,
+        }) => commands::sync::handle_sync(&vault_path, &friend_nickname),
+        None => {
+            // Argüman yoksa varsayılan olarak GUI'yi ve arka plan P2P dinleyicisini başlat
+            println!("[INFO] No CLI arguments provided. Launching Graphical Interface...");
+            crate::gui::run_gui()
         }
     }));
 
