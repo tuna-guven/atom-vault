@@ -4,25 +4,109 @@ use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
+use std::sync::Mutex;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::commands::p2p_utils::{load_friends, parse_atom_uri, save_friends, SharedVault, SyncMessage};
 
-/// Asynchronously prompts the user in the terminal using a blocking thread
-/// so the main Tokio Tor event loop is never paused.
-async fn ask_user(prompt: String) -> String {
-    tokio::task::spawn_blocking(move || {
-        use std::io::{self, Write};
-        print!("{}", prompt);
-        io::stdout().flush().unwrap();
-        let mut buf = String::new();
-        io::stdin().read_line(&mut buf).unwrap();
-        buf.trim().to_string()
-    })
-    .await
-    .unwrap()
+// CROSS-THREAD COMMUNICATION FOR GUI & CLI
+pub enum DaemonEvent {
+    SyncRequest {
+        sender_nick: String,
+        filename: String,
+        response_channel: tokio::sync::oneshot::Sender<SyncResponse>,
+    },
+    Log(String),
+}
+
+pub struct SyncResponse {
+    pub accepted: bool,
+    pub label: Option<String>,
+    pub save_path: Option<String>,
+}
+
+static EVENT_TX: Mutex<Option<tokio::sync::mpsc::Sender<DaemonEvent>>> = Mutex::new(None);
+
+pub fn set_event_sender(tx: tokio::sync::mpsc::Sender<DaemonEvent>) {
+    let mut global_tx = EVENT_TX.lock().unwrap();
+    *global_tx = Some(tx);
+}
+
+// HELPER: Routes daemon logs to the GUI channel if attached, otherwise uses terminal stdout.
+pub fn send_daemon_log(msg: &str) {
+    let tx_opt = EVENT_TX.lock().unwrap().clone();
+    if let Some(tx) = tx_opt {
+        let _ = tx.try_send(DaemonEvent::Log(msg.to_string()));
+    } else {
+        println!("{}", msg);
+    }
+}
+
+async fn ask_user_interactive(
+    sender_nick: String,
+    filename: String,
+) -> SyncResponse {
+    let tx_opt = {
+        let lock = EVENT_TX.lock().unwrap();
+        lock.clone()
+    };
+
+    if let Some(tx) = tx_opt {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(DaemonEvent::SyncRequest {
+            sender_nick,
+            filename,
+            response_channel: resp_tx,
+        }).await;
+
+        match resp_rx.await {
+            Ok(response) => response,
+            Err(_) => SyncResponse { accepted: false, label: None, save_path: None },
+        }
+    } else {
+        // FALLBACK: Blocking CLI Mode
+        tokio::task::spawn_blocking(move || {
+            use std::io::{self, Write};
+            
+            print!("{} wants to sync {} with you. Accept? [Y/n]: ", sender_nick, filename);
+            io::stdout().flush().unwrap();
+            let mut ans = String::new();
+            io::stdin().read_line(&mut ans).unwrap();
+            
+            if ans.trim().to_lowercase() == "y" || ans.trim().is_empty() {
+                print!("Label for this vault?: ");
+                io::stdout().flush().unwrap();
+                let mut label = String::new();
+                io::stdin().read_line(&mut label).unwrap();
+                
+                let mut default_path = dirs::home_dir().unwrap();
+                default_path.push(format!("Downloads/{}/{}", sender_nick, filename));
+                
+                print!("Folder path? [{}]: ", default_path.display());
+                io::stdout().flush().unwrap();
+                let mut path_ans = String::new();
+                io::stdin().read_line(&mut path_ans).unwrap();
+                
+                let final_path = if path_ans.trim().is_empty() {
+                    default_path.to_string_lossy().to_string()
+                } else {
+                    path_ans.trim().to_string()
+                };
+
+                SyncResponse {
+                    accepted: true,
+                    label: Some(label.trim().to_string()),
+                    save_path: Some(final_path),
+                }
+            } else {
+                SyncResponse { accepted: false, label: None, save_path: None }
+            }
+        })
+        .await
+        .unwrap()
+    }
 }
 
 pub fn get_or_create_identity() -> Result<SigningKey, Box<dyn std::error::Error>> {
@@ -56,7 +140,7 @@ pub fn get_or_create_identity() -> Result<SigningKey, Box<dyn std::error::Error>
 }
 
 pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🛡️ Starting Secure Standalone P2P Daemon...");
+    send_daemon_log("Starting Secure Standalone P2P Daemon...");
 
     let local_identity = get_or_create_identity()?;
 
@@ -76,7 +160,7 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async {
-        println!("🧅 Bootstrapping embedded Arti client...");
+        send_daemon_log("Bootstrapping embedded Arti client...");
         let client = arti_client::TorClient::create_bootstrapped(config)
             .await
             .expect("Tor bootstrap failed");
@@ -114,9 +198,9 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
             let _ = f.write_all(final_link.as_bytes());
         }
 
-        println!("\n✅ Daemon is online!");
-        println!("🔗 Your Identity: {}\n", final_link);
-        println!("🎧 Listening for incoming mutual friends...");
+        send_daemon_log("Daemon is online!");
+        send_daemon_log(&format!("Your Identity: {}", final_link));
+        send_daemon_log("Listening for incoming mutual friends...");
 
         while let Some(rend_request) = futures::StreamExt::next(&mut stream_requests).await {
             let friends = load_friends();
@@ -143,7 +227,7 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                                 });
 
                                 let nick = connected_friend.map(|f| f.nickname.clone()).unwrap_or_else(|| "Unknown".to_string());
-                                println!("🎉 {} is online! Secure messaging channel established.", nick);
+                                send_daemon_log(&format!("{} is online! Secure messaging channel established.", nick));
 
                                 let (control, inbound_rx) = p2p_sync::transport::start_multiplexer(stream, session.transport, false);
                                 let mut inbound_stream = ReceiverStream::new(inbound_rx);
@@ -155,20 +239,18 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                                         use tokio_util::compat::FuturesAsyncReadCompatExt;
                                         let data_stream = data_stream.compat();
                                         
-                                        // Wrap the stream in a buffered reader to intercept the JSON line
                                         let mut stream_io = tokio::io::BufReader::new(data_stream);
                                         let mut line = String::new();
 
                                         if let Ok(_) = stream_io.read_line(&mut line).await {
                                             if let Ok(msg) = serde_json::from_str::<SyncMessage>(&line) {
                                                 if let SyncMessage::Proposal { filename, last_modified } = msg {
-                                                    println!("📥 Received sync proposal for '{}' from {}", filename, nick);
+                                                    send_daemon_log(&format!("Received sync proposal for '{}' from {}", filename, nick));
 
                                                     let mut friends_db = load_friends();
                                                     let mut is_new = true;
                                                     let mut local_save_path = String::new();
 
-                                                    // Check if we already know this vault
                                                     if let Some(friend) = friends_db.iter_mut().find(|f| f.nickname == nick) {
                                                         if let Some(vault) = friend.shared_vaults.iter_mut().find(|v| v.original_name == filename) {
                                                             is_new = false;
@@ -179,32 +261,17 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
 
                                                     let mut accepted = false;
 
-                                                    // Request Consent and Metadata Configuration
                                                     if is_new {
-                                                        let prompt = format!("{} wants to sync {} with you. Do you accept? [Y/n]: ", nick, filename);
-                                                        let ans = ask_user(prompt).await;
+                                                        let user_response = ask_user_interactive(nick.clone(), filename.clone()).await;
                                                         
-                                                        if ans.to_lowercase() == "y" || ans.is_empty() {
-                                                            let label = ask_user("What is the label for this vault?: ".to_string()).await;
-
-                                                            let mut default_path = dirs::home_dir().unwrap();
-                                                            default_path.push(format!("Downloads/{}/{}", nick, filename));
-                                                            
-                                                            let path_prompt = format!("What is the folder path for the vault? [{}]: ", default_path.display());
-                                                            let mut path_ans = ask_user(path_prompt).await;
-
-                                                            if path_ans.is_empty() {
-                                                                path_ans = default_path.to_string_lossy().to_string();
-                                                            }
-
-                                                            local_save_path = path_ans.clone();
+                                                        if user_response.accepted {
+                                                            local_save_path = user_response.save_path.unwrap();
                                                             accepted = true;
 
-                                                            // Save new vault into the address book
                                                             if let Some(friend) = friends_db.iter_mut().find(|f| f.nickname == nick) {
                                                                 friend.shared_vaults.push(SharedVault {
                                                                     original_name: filename.clone(),
-                                                                    label,
+                                                                    label: user_response.label.unwrap_or_else(|| "Synced Vault".to_string()),
                                                                     local_path: local_save_path.clone(),
                                                                     last_modified,
                                                                 });
@@ -212,11 +279,9 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                                                             save_friends(&friends_db);
                                                         }
                                                     } else {
-                                                        // Automatically accept known synchronized folders
                                                         accepted = true;
                                                     }
 
-                                                    // Execute Data Pipeline
                                                     if accepted {
                                                         let reply = SyncMessage::Accept { action: "pull_from_you".to_string() };
                                                         let reply_json = format!("{}\n", serde_json::to_string(&reply).unwrap());
@@ -229,18 +294,18 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                                                         }
 
                                                         let mut file = tokio::fs::File::create(&local_save_path).await.unwrap();
-                                                        println!("⏳ Receiving encrypted payload into {}...", local_save_path);
+                                                        send_daemon_log(&format!("Receiving encrypted payload into {}...", local_save_path));
                                                         
                                                         match tokio::io::copy(&mut stream_io, &mut file).await {
-                                                            Ok(bytes) => println!("📥 Success! {} bytes written to disk.", bytes),
-                                                            Err(e) => println!("❌ Transfer failed: {}", e),
+                                                            Ok(bytes) => send_daemon_log(&format!("Success! {} bytes written to disk.", bytes)),
+                                                            Err(e) => send_daemon_log(&format!("Transfer failed: {}", e)),
                                                         }
                                                     } else {
                                                         let reply = SyncMessage::Reject;
                                                         let reply_json = format!("{}\n", serde_json::to_string(&reply).unwrap());
                                                         stream_io.write_all(reply_json.as_bytes()).await.unwrap();
                                                         stream_io.flush().await.unwrap();
-                                                        println!("❌ Rejected sync proposal.");
+                                                        send_daemon_log("Rejected sync proposal.");
                                                     }
                                                 }
                                             }
@@ -248,7 +313,7 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 });
                             }
-                            Err(e) => println!("❌ Handshake rejected: {}", e),
+                            Err(e) => send_daemon_log(&format!("Handshake rejected: {}", e)),
                         }
                     }
                 }

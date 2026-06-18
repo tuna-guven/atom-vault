@@ -3,15 +3,17 @@ use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, FileChooserAction,
     FileChooserNative, Label, ListBox, Orientation, PasswordEntry,
-    ResponseType, ScrolledWindow, Entry, GestureClick, Window,
+    ResponseType, ScrolledWindow, Entry, GestureClick, Window, DropDown,
 };
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
+
+use crate::commands::daemon::{DaemonEvent, SyncResponse};
 
 // Shared vault session state
 pub struct VaultSession {
@@ -21,7 +23,38 @@ pub struct VaultSession {
     pub current_offset: u64,
 }
 
+// Global queue for handling cross-thread Daemon events safely in GTK
+static INCOMING_EVENTS: Mutex<Vec<DaemonEvent>> = Mutex::new(Vec::new());
+
+// Initialize background daemon listener without blocking the main GTK thread
+fn start_daemon_and_listener() {
+    let (tokio_tx, mut tokio_rx) = tokio::sync::mpsc::channel(10);
+    crate::commands::daemon::set_event_sender(tokio_tx);
+
+    // Spawn the core Daemon in a dedicated standard thread
+    std::thread::spawn(|| {
+        if let Err(e) = crate::commands::daemon::handle_daemon() {
+            eprintln!("[Daemon Error] {}", e);
+        }
+    });
+
+    // Bridge Tokio events into the Mutex Queue
+    std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Runtime::new() {
+            rt.block_on(async {
+                while let Some(event) = tokio_rx.recv().await {
+                    if let Ok(mut queue) = INCOMING_EVENTS.lock() {
+                        queue.push(event);
+                    }
+                }
+            });
+        }
+    });
+}
+
 pub fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
+    start_daemon_and_listener();
+
     let app = Application::builder()
         .application_id("org.atom.Vault")
         .build();
@@ -33,6 +66,26 @@ pub fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn build_login_ui(app: &Application) {
+    // Start polling the global Daemon Queue every 500ms safely
+    gtk::glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+        let mut events_to_process = Vec::new();
+        if let Ok(mut queue) = INCOMING_EVENTS.lock() {
+            std::mem::swap(&mut events_to_process, &mut *queue);
+        }
+
+        for event in events_to_process {
+            match event {
+                DaemonEvent::SyncRequest { sender_nick, filename, response_channel } => {
+                    show_incoming_sync_dialog(sender_nick, filename, response_channel);
+                }
+                DaemonEvent::Log(msg) => {
+                    println!("[Daemon Log] {}", msg);
+                }
+            }
+        }
+        gtk::glib::ControlFlow::Continue
+    });
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Atom Vault - Login")
@@ -62,7 +115,6 @@ fn build_login_ui(app: &Application) {
     let create_btn = Button::builder().label("Create New Vault").css_classes(["flat"]).build();
     let status_label = Label::builder().label("Please select or create a vault to begin.").build();
 
-    // File selection
     let path_clone = Rc::clone(&selected_path);
     let btn_clone = select_btn.clone();
     let status_clone = status_label.clone();
@@ -97,7 +149,6 @@ fn build_login_ui(app: &Application) {
         chooser.show();
     });
 
-    // Vault unlock
     let path_clone2 = Rc::clone(&selected_path);
     let status_clone2 = status_label.clone();
     let pass_entry_clone = pass_entry.clone();
@@ -107,7 +158,7 @@ fn build_login_ui(app: &Application) {
         let path_opt = path_clone2.borrow();
         let secure_password = Zeroizing::new(pass_entry_clone.text().to_string());
         
-        pass_entry_clone.set_text(""); // Clear password field
+        pass_entry_clone.set_text(""); 
 
         if let Some(path) = &*path_opt {
             if secure_password.is_empty() {
@@ -128,7 +179,8 @@ fn build_login_ui(app: &Application) {
                                 current_offset,
                             }));
 
-                            build_vault_explorer(&window_clone, session);
+                            let current_vault_path = path.to_string_lossy().to_string();
+                            build_vault_explorer(&window_clone, session, current_vault_path);
                         }
                         Err(_) => {
                             status_clone2.set_label("Error: Invalid password or corrupted vault.");
@@ -144,7 +196,6 @@ fn build_login_ui(app: &Application) {
         }
     });
 
-    // Create New Vault
     let create_window_weak = window.downgrade();
     create_btn.connect_clicked(move |_| {
         let chooser = FileChooserNative::new(
@@ -181,7 +232,85 @@ fn build_login_ui(app: &Application) {
     window.present();
 }
 
-// UI HELPER: Secure Vault Creation Dialog
+// UI HELPER: Modal for handling incoming P2P sync requests
+fn show_incoming_sync_dialog(
+    sender_nick: String,
+    filename: String,
+    response_channel: tokio::sync::oneshot::Sender<SyncResponse>
+) {
+    let dialog = Window::builder()
+        .title("Incoming P2P Sync Request")
+        .default_width(380)
+        .modal(true)
+        .build();
+
+    let vbox = GtkBox::builder().orientation(Orientation::Vertical).spacing(12).margin_top(16).margin_bottom(16).margin_start(16).margin_end(16).build();
+
+    let label = Label::builder()
+        .label(&format!("<b>{}</b> wants to sync <b>{}</b> with you over the P2P network.", sender_nick, filename))
+        .use_markup(true)
+        .wrap(true)
+        .build();
+
+    let vault_label_entry = Entry::builder().placeholder_text("Vault Label (e.g. Work)").build();
+    
+    let mut default_path = dirs::home_dir().unwrap_or_default();
+    default_path.push(format!("Downloads/{}/{}", sender_nick, filename));
+    
+    // Type conversion fix: Cow to String for the text builder
+    let path_entry = Entry::builder().text(default_path.to_string_lossy().to_string()).build();
+
+    let btn_box = GtkBox::builder().orientation(Orientation::Horizontal).spacing(8).build();
+    let accept_btn = Button::builder().label("Accept").css_classes(["suggested-action"]).build();
+    let reject_btn = Button::builder().label("Reject").css_classes(["destructive-action"]).build();
+
+    btn_box.append(&accept_btn);
+    btn_box.append(&reject_btn);
+
+    vbox.append(&label);
+    vbox.append(&gtk::Separator::builder().build());
+    vbox.append(&Label::builder().label("Assign local label:").xalign(0.0).build());
+    vbox.append(&vault_label_entry);
+    vbox.append(&Label::builder().label("Destination path:").xalign(0.0).build());
+    vbox.append(&path_entry);
+    vbox.append(&btn_box);
+
+    dialog.set_child(Some(&vbox));
+
+    let dialog_clone_1 = dialog.clone();
+    let dialog_clone_2 = dialog.clone();
+    
+    let resp_chan = Rc::new(RefCell::new(Some(response_channel)));
+    let resp_chan_rej = Rc::clone(&resp_chan);
+
+    accept_btn.connect_clicked(move |_| {
+        if let Some(chan) = resp_chan.borrow_mut().take() {
+            let v_label = vault_label_entry.text().to_string();
+            let v_path = path_entry.text().to_string();
+            
+            let _ = chan.send(SyncResponse {
+                accepted: true,
+                label: Some(if v_label.is_empty() { "Synced Vault".to_string() } else { v_label }),
+                save_path: Some(if v_path.is_empty() { default_path.to_string_lossy().to_string() } else { v_path }),
+            });
+        }
+        dialog_clone_1.close();
+    });
+
+    reject_btn.connect_clicked(move |_| {
+        if let Some(chan) = resp_chan_rej.borrow_mut().take() {
+            let _ = chan.send(SyncResponse {
+                accepted: false,
+                label: None,
+                save_path: None,
+            });
+        }
+        dialog_clone_2.close();
+    });
+
+    dialog.present();
+}
+
 fn show_create_vault_dialog(parent: &ApplicationWindow, folder_path: PathBuf) {
     let dialog = Window::builder()
         .transient_for(parent)
@@ -236,9 +365,7 @@ fn show_create_vault_dialog(parent: &ApplicationWindow, folder_path: PathBuf) {
             return;
         }
 
-        // Wrap securely
         let secure_pass = zeroize::Zeroizing::new(pass1);
-
         status_label.set_label("Deriving keys, please wait...");
 
         match crate::commands::create::handle_create(
@@ -247,7 +374,6 @@ fn show_create_vault_dialog(parent: &ApplicationWindow, folder_path: PathBuf) {
             Some(secure_pass) 
         ) {
             Ok(_) => {
-                println!("[GUI] Vault successfully created via UI.");
                 dialog_clone.close();
             }
             Err(e) => {
@@ -259,11 +385,10 @@ fn show_create_vault_dialog(parent: &ApplicationWindow, folder_path: PathBuf) {
     dialog.present();
 }
 
-// SECURE VAULT EXPLORER VIEW
-fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSession>>) {
+fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSession>>, current_vault_path: String) {
     window.set_title(Some("Atom Vault - Secure Explorer"));
-    window.set_default_width(650);
-    window.set_default_height(500);
+    window.set_default_width(750);
+    window.set_default_height(550);
 
     let vbox = GtkBox::builder().orientation(Orientation::Vertical).spacing(8).build();
 
@@ -279,11 +404,13 @@ fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSes
 
     let import_btn = Button::builder().label("Import File").css_classes(["suggested-action"]).build();
     let export_btn = Button::builder().label("Export File").build();
+    let p2p_btn = Button::builder().label("P2P Network").build();
     let lock_btn = Button::builder().label("Lock & Exit").css_classes(["destructive-action"]).build();
 
     toolbar.append(&title);
     toolbar.append(&import_btn);
     toolbar.append(&export_btn);
+    toolbar.append(&p2p_btn);
     toolbar.append(&lock_btn);
 
     let action_status_label = Label::builder().use_markup(true).margin_start(12).margin_end(12).xalign(0.0).build();
@@ -297,7 +424,6 @@ fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSes
 
     refresh_file_list(&list_box, Rc::clone(&session), window.clone(), action_status_label.clone());
 
-    // Import Action
     let import_session = Rc::clone(&session);
     let import_window_weak = window.downgrade();
     let import_list_box = list_box.clone();
@@ -330,7 +456,6 @@ fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSes
                         if let Err(e) = crate::commands::import::handle_import(
                             from_disk, vfs_name.clone(), file, metadata, unlocked_vault, current_offset
                         ) {
-                            eprintln!("[GUI Error] {}", e);
                             status_alloc.set_label(&format!("<span foreground='red'>Import Error: {}</span>", e));
                         } else {
                             let _ = file.sync_all();
@@ -347,7 +472,6 @@ fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSes
         chooser.show();
     });
 
-    // Direct Export Action
     let export_session = Rc::clone(&session);
     let export_list_box = list_box.clone();
     let export_status = action_status_label.clone();
@@ -359,7 +483,6 @@ fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSes
             let index = row.index() as usize;
             let raw_vfs_name = { session_alloc.borrow().metadata.file_table[index].vfs_name.clone() };
 
-            // Anti-Traversal Shield
             let safe_vfs_name = Path::new(&raw_vfs_name).file_name().unwrap_or_default().to_string_lossy().to_string();
             if safe_vfs_name.is_empty() { return; }
 
@@ -385,14 +508,159 @@ fn build_vault_explorer(window: &ApplicationWindow, session: Rc<RefCell<VaultSes
         }
     });
 
-    // Lock and Exit
+    let window_p2p = window.clone();
+    let current_vault_path_p2p = current_vault_path.clone();
+    p2p_btn.connect_clicked(move |_| {
+        show_p2p_dialog(&window_p2p, current_vault_path_p2p.clone());
+    });
+
     let lock_window = window.clone();
     lock_btn.connect_clicked(move |_| { lock_window.close(); });
 
     window.set_child(Some(&vbox));
 }
 
-// UI HELPER: Dynamic List Renderer
+fn show_p2p_dialog(parent: &ApplicationWindow, current_vault_path: String) {
+    let dialog = Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("P2P Network & Friends")
+        .default_width(450)
+        .destroy_with_parent(true)
+        .build();
+
+    let vbox = GtkBox::builder().orientation(Orientation::Vertical).spacing(16).margin_top(16).margin_bottom(16).margin_start(16).margin_end(16).build();
+
+    let my_id_label = Label::builder().use_markup(true).xalign(0.0).build();
+    match crate::commands::id::get_id_string() {
+        Ok(onion) => my_id_label.set_label(&format!("<b>Your Identity:</b> {}", onion)),
+        Err(_) => my_id_label.set_label("<b>Your Identity:</b> Not generated yet. Run daemon."),
+    }
+
+    let add_friend_box = GtkBox::builder().orientation(Orientation::Vertical).spacing(8).build();
+    add_friend_box.append(&Label::builder().label("Add New Friend:").xalign(0.0).build());
+    
+    let friend_nick_entry = Entry::builder().placeholder_text("Friend Nickname").build();
+    let friend_url_entry = Entry::builder().placeholder_text("atom://...").build();
+    let add_friend_btn = Button::builder().label("Add to Address Book").build();
+    let add_status = Label::builder().use_markup(true).build();
+
+    add_friend_box.append(&friend_nick_entry);
+    add_friend_box.append(&friend_url_entry);
+    add_friend_box.append(&add_friend_btn);
+    add_friend_box.append(&add_status);
+
+    let add_status_clone = add_status.clone();
+    add_friend_btn.connect_clicked(move |_| {
+        let nick = friend_nick_entry.text().to_string();
+        let url = friend_url_entry.text().to_string();
+        
+        if nick.is_empty() || url.is_empty() {
+            add_status_clone.set_label("<span foreground='red'>Nickname and URL are required.</span>");
+            return;
+        }
+
+        match crate::commands::friend::add_friend_core(&url, &nick) {
+            Ok(msg) => {
+                add_status_clone.set_label(&format!("<span foreground='green'>{}</span>", msg));
+                friend_nick_entry.set_text("");
+                friend_url_entry.set_text("");
+            }
+            Err(e) => add_status_clone.set_label(&format!("<span foreground='red'>Error: {}</span>", e)),
+        }
+    });
+
+    let sync_box = GtkBox::builder().orientation(Orientation::Vertical).spacing(8).build();
+    sync_box.append(&Label::builder().label("Push Current Vault to Friend:").xalign(0.0).build());
+    
+    let friends = crate::commands::p2p_utils::load_friends();
+    let friend_names: Vec<String> = friends.iter().map(|f| f.nickname.clone()).collect();
+    
+    let friend_dropdown = DropDown::from_strings(
+        &friend_names.iter().map(|s| s.as_str()).collect::<Vec<&str>>()
+    );
+
+    let sync_btn = Button::builder().label("Start Sync").css_classes(["suggested-action"]).build();
+    let sync_status = Label::builder().use_markup(true).wrap(true).build();
+
+    sync_box.append(&friend_dropdown);
+    sync_box.append(&sync_btn);
+    sync_box.append(&sync_status);
+
+    let sync_status_clone = sync_status.clone();
+    let vault_path_clone = current_vault_path.clone();
+    
+    sync_btn.connect_clicked(move |_| {
+        if friend_names.is_empty() {
+            sync_status_clone.set_label("<span foreground='red'>No friends available.</span>");
+            return;
+        }
+
+        let selected_index = friend_dropdown.selected();
+        if selected_index as usize >= friend_names.len() { return; }
+        
+        let selected_friend = friend_names[selected_index as usize].clone();
+        
+        let status_msg = Arc::new(Mutex::new(String::from("Initiating background sync...")));
+        let status_msg_thread = Arc::clone(&status_msg);
+        let done_flag = Arc::new(AtomicBool::new(false));
+        let done_flag_thread = Arc::clone(&done_flag);
+        let sync_status_async = sync_status_clone.clone();
+
+        gtk::glib::timeout_add_local(
+            std::time::Duration::from_millis(100),
+            move || {
+                if let Ok(msg) = status_msg.lock() {
+                    sync_status_async.set_label(&msg);
+                }
+                
+                if done_flag.load(Ordering::SeqCst) {
+                    gtk::glib::ControlFlow::Break
+                } else {
+                    gtk::glib::ControlFlow::Continue
+                }
+            }
+        );
+
+        let vault_path_thread = vault_path_clone.clone();
+        let friend_thread = selected_friend.clone();
+
+        std::thread::spawn(move || {
+            let (std_tx, std_rx) = std::sync::mpsc::channel();
+            
+            let status_msg_inner = Arc::clone(&status_msg_thread);
+            std::thread::spawn(move || {
+                while let Ok(msg) = std_rx.recv() {
+                    if let Ok(mut lock) = status_msg_inner.lock() {
+                        *lock = msg;
+                    }
+                }
+            });
+
+            if let Err(e) = crate::commands::sync::sync_core(&vault_path_thread, &friend_thread, Some(std_tx)) {
+                if let Ok(mut lock) = status_msg_thread.lock() {
+                    *lock = format!("<span foreground='red'>Sync Failed: {}</span>", e);
+                }
+            } else {
+                if let Ok(mut lock) = status_msg_thread.lock() {
+                    *lock = format!("<span foreground='green'>Sync Complete with {}</span>", friend_thread);
+                }
+            }
+            
+            done_flag_thread.store(true, Ordering::SeqCst);
+        });
+    });
+
+    vbox.append(&my_id_label);
+    vbox.append(&gtk::Separator::builder().build());
+    vbox.append(&add_friend_box);
+    vbox.append(&gtk::Separator::builder().build());
+    vbox.append(&sync_box);
+
+    dialog.set_child(Some(&vbox));
+    dialog.present();
+}
+
 fn refresh_file_list(
     list_box: &ListBox, 
     session: Rc<RefCell<VaultSession>>, 
@@ -419,7 +687,7 @@ fn refresh_file_list(
             .build();
 
         let row_label = Label::builder()
-            .label(&format!("📄 {}", file_index.vfs_name))
+            .label(&file_index.vfs_name)
             .xalign(0.0)
             .hexpand(true) 
             .build();
@@ -427,7 +695,6 @@ fn refresh_file_list(
         let open_btn = Button::builder().label("Open").css_classes(["flat"]).build();
         let delete_btn = Button::builder().label("Delete").css_classes(["destructive-action"]).build();
 
-        // 1. OPEN ACTION
         let session_open = Rc::clone(&session);
         let status_open = status_label.clone();
         let vfs_name_open = file_index.vfs_name.clone();
@@ -440,7 +707,6 @@ fn refresh_file_list(
 
             if let Some(target_file_index) = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name_open) {
                 
-                // Lock-free flag
                 let done_flag = Arc::new(AtomicBool::new(false));
                 let done_flag_thread = Arc::clone(&done_flag);
                 
@@ -449,14 +715,11 @@ fn refresh_file_list(
                     target_file_index,
                     unlocked_vault,
                     move || {
-                        // Signal when done
                         done_flag_thread.store(true, Ordering::SeqCst);
                     }
                 ) {
-                    eprintln!("[GUI Error] View failed: {}", e);
                     status_open.set_label(&format!("<span foreground='red'>Open failed: {}</span>", e));
                 } else {
-                    // Poll flag every 100ms
                     let status_open_async = status_open.clone();
                     let vfs_name_open_clone = vfs_name_open.clone();
                     
@@ -477,7 +740,6 @@ fn refresh_file_list(
             }
         });
 
-        // 2. RENAME ACTION
         let gesture = GestureClick::new();
         gesture.set_button(1); 
         
@@ -547,7 +809,6 @@ fn refresh_file_list(
             }
         });
 
-        // 3. SECURE DELETE ACTION
         let session_delete = Rc::clone(&session);
         let status_delete = status_label.clone();
         let list_box_delete = list_box.clone();
@@ -571,7 +832,6 @@ fn refresh_file_list(
                     refresh_file_list(&list_box_delete, Rc::clone(&session_delete), window_delete.clone(), status_delete.clone());
                 }
                 Err(e) => {
-                    eprintln!("[GUI Error] Delete failed: {}", e);
                     status_delete.set_label(&format!("<span foreground='red'>Delete failed: {}</span>", e));
                 }
             }
