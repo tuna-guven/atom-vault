@@ -531,11 +531,36 @@ fn show_p2p_dialog(parent: &ApplicationWindow, current_vault_path: String) {
 
     let vbox = GtkBox::builder().orientation(Orientation::Vertical).spacing(16).margin_top(16).margin_bottom(16).margin_start(16).margin_end(16).build();
 
-    let my_id_label = Label::builder().use_markup(true).xalign(0.0).build();
+    // My Identity Section
+    let my_id_box = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(4)
+        .build();
+    
+    my_id_box.append(&Label::builder()
+        .label("<b>Your Identity:</b>")
+        .use_markup(true)
+        .xalign(0.0)
+        .build());
+
+    let id_entry = Entry::builder()
+        .editable(false) 
+        .can_focus(true)
+        .build();
+
     match crate::commands::id::get_id_string() {
-        Ok(onion) => my_id_label.set_label(&format!("<b>Your Identity:</b> {}", onion)),
-        Err(_) => my_id_label.set_label("<b>Your Identity:</b> Not generated yet. Run daemon."),
+        Ok(onion) => {
+            if onion.starts_with("atom://") {
+                id_entry.set_text(&onion);
+            } else {
+                id_entry.set_text(&format!("atom://{}", onion));
+            }
+        },
+        Err(_) => id_entry.set_text("Identity not generated yet. Run daemon."),
     }
+
+    my_id_box.append(&id_entry);
+    vbox.append(&my_id_box);
 
     let add_friend_box = GtkBox::builder().orientation(Orientation::Vertical).spacing(8).build();
     add_friend_box.append(&Label::builder().label("Add New Friend:").xalign(0.0).build());
@@ -651,7 +676,6 @@ fn show_p2p_dialog(parent: &ApplicationWindow, current_vault_path: String) {
         });
     });
 
-    vbox.append(&my_id_label);
     vbox.append(&gtk::Separator::builder().build());
     vbox.append(&add_friend_box);
     vbox.append(&gtk::Separator::builder().build());
