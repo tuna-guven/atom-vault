@@ -1,11 +1,10 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use crate::commands::daemon::get_or_create_identity;
 use crate::commands::p2p_utils::{SyncMessage, load_friends, parse_atom_uri};
 
-// CORE: Shared logic for both CLI and GUI.
 // GUI can pass an mpsc::Sender to receive non-blocking status updates.
 pub fn sync_core(
     vault_path: &str,
@@ -32,7 +31,7 @@ pub fn sync_core(
 
     let (onion_address, friend_pubkey) = parse_atom_uri(&friend.url)?;
 
-    let _physical_vault = OpenOptions::new().read(true).write(true).open(vault_path)?;
+    
     let local_identity = get_or_create_identity()?;
 
     let mut client_state_dir = dirs::home_dir().ok_or("Could not find home directory")?;
@@ -106,6 +105,10 @@ pub fn sync_core(
                     let mut file = tokio::fs::File::open(&physical_vault_path).await?;
                     let bytes_sent = tokio::io::copy(&mut file, &mut stream_io).await?;
 
+                    stream_io.flush().await?;
+                    let mut inner_stream = stream_io.into_inner();
+                    inner_stream.shutdown().await?;
+
                     log(&format!("Blind file transfer complete. Pushed {} bytes.", bytes_sent));
                 }
                 SyncMessage::Reject => {
@@ -121,6 +124,7 @@ pub fn sync_core(
 
         log("Finalizing block commitment and gracefully closing circuit...");
         drop(control);
+        // Clean exit sleep allows network buffers to drain
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         Ok::<_, Box<dyn std::error::Error>>(())
@@ -129,7 +133,7 @@ pub fn sync_core(
     Ok(())
 }
 
-// CLI INTERFACE
+
 pub fn handle_sync(
     vault_path: &str,
     friend_nickname: &str,
