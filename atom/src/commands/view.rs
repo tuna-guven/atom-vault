@@ -57,8 +57,7 @@ where
     }
 
     println!("Starting secure sandbox mode...");
-    // Sandbox'ı ayağa kaldırıp PID'yi hemen döndürüyoruz (senkron bloklamayı önlüyoruz)
-    let pid = sandbox::spawn_in_sandbox(target_raw_fd)?;
+    let pid = sandbox::spawn_in_bwrap_sandbox(target_raw_fd)?;
 
     // 5. Zero-allocation RAM shredding'i arka plan OS Thread'ine taşıyoruz
     std::thread::spawn(move || {
