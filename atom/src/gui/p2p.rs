@@ -1,10 +1,10 @@
 use eframe::egui;
 use egui::Context;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::commands::daemon::SyncResponse;
-use super::{AtomVaultApp, IncomingSyncState, Screen};
+use super::{AtomVaultApp, Screen};
 
 // ── Pure helpers (tested below) ───────────────────────────────────────────────
 

@@ -1,0 +1,51 @@
+{
+    "id": "io.atom_vault.AtomVault",
+    "runtime": "org.freedesktop.Platform",
+    "runtime-version": "24.08",
+    "sdk": "org.freedesktop.Sdk",
+    "sdk-extensions": [
+        "org.freedesktop.Sdk.Extension.rust-stable"
+    ],
+    "command": "atom",
+
+    "finish-args": [
+        "--share=ipc",
+
+        "--socket=wayland",
+        "--socket=fallback-x11",
+
+        "--device=dri",
+
+        "--share=network",
+
+        "--talk-name=org.freedesktop.portal.FileChooser",
+        "--talk-name=org.freedesktop.portal.Documents",
+        "--talk-name=org.freedesktop.portal.OpenURI"
+    ],
+
+    "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "env": {
+            "CARGO_HOME": "/run/build/atom-vault/cargo",
+            "RUSTFLAGS": "-C link-arg=-Wl,-z,relro,-z,now"
+        },
+        "no-debuginfo": false
+    },
+
+    "modules": [
+        {
+            "name": "atom-vault",
+            "buildsystem": "simple",
+            "build-commands": [
+                "cargo build --release --manifest-path atom/Cargo.toml",
+                "install -Dm755 atom/target/release/atom /app/bin/atom"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "."
+                }
+            ]
+        }
+    ]
+}

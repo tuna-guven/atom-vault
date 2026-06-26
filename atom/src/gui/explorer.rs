@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::{AtomVaultApp, ExportOverwriteState, FileAction, RenameState, Screen, VaultSession};
+use super::{AtomVaultApp, ExportOverwriteState, FileAction, RenameState, Screen};
 
 // ── Pure helpers (tested below) ───────────────────────────────────────────────
 

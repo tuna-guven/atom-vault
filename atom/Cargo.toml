@@ -38,6 +38,7 @@ eff-wordlist = "1.0.3"
 sysinfo = "0.39.3"
 eframe = "0.30"
 rfd = "0.15"
+landlock = "0.4"
 
 [dev-dependencies]
 libc = "0.2"

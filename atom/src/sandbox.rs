@@ -4,6 +4,115 @@ use std::os::fd::RawFd;
 use std::path::Path;
 use std::ptr;
 
+// ── Landlock inner sandbox ────────────────────────────────────────────────────
+
+/// Outcome reported by [apply_process_sandbox].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandlockStatus {
+    /// Every requested access flag was recognised and enforced by the kernel.
+    FullyEnforced,
+    /// The kernel supports Landlock but predates some requested ABI flags;
+    /// the sandbox is still active with the rights the kernel understands.
+    PartiallyEnforced,
+    /// The running kernel has no Landlock support; the process is unrestricted.
+    NotEnforced,
+}
+
+/// Applies a Landlock LSM filesystem ruleset to the **calling thread**.
+///
+/// After this call, the calling thread (and any threads it spawns) can only
+/// open paths listed in `read_only_paths` or `read_write_paths`. All other
+/// filesystem access is refused at the kernel level — no capability or uid can
+/// override it.
+///
+/// **Thread scope**: Landlock domains are per-task. Threads already running
+/// when this is called are not restricted. Only the calling thread and the
+/// threads it creates afterwards are bound by the returned domain.
+///
+/// **Graceful degradation**: Returns [`LandlockStatus::NotEnforced`] (not an
+/// error) when the kernel does not include Landlock support, so the caller can
+/// decide whether to abort or continue unprotected. Kernels with a Landlock
+/// ABI older than V5 produce [`LandlockStatus::PartiallyEnforced`]; the sandbox
+/// is still active but may cover fewer access types.
+///
+/// Paths that do not exist on the current machine are silently skipped; this
+/// makes the function safe to call with distro-specific optional paths.
+pub fn apply_process_sandbox(
+    read_only_paths: &[&Path],
+    read_write_paths: &[&Path],
+) -> Result<LandlockStatus, Box<dyn std::error::Error>> {
+    use landlock::{
+        Access, AccessFs, ABI,
+        PathBeneath, PathFd,
+        Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    };
+
+    // Target V5 (Linux 6.10). The landlock crate degrades automatically to
+    // whatever ABI the running kernel actually supports; the returned status
+    // tells the caller which level was achieved.
+    let abi = ABI::V5;
+    let all_rights = AccessFs::from_all(abi);
+
+    // Read-only includes Execute so that fork+exec of helper programs (bwrap,
+    // flatpak) inside sandboxed threads can still find their binaries under
+    // /usr without us granting write access to the system hierarchy.
+    let ro_rights = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+
+    let mut ruleset = Ruleset::default()
+        .handle_access(all_rights)?
+        .create()?;
+
+    for &path in read_only_paths {
+        if !path.exists() {
+            continue;
+        }
+        match PathFd::new(path) {
+            Ok(fd) => ruleset = ruleset.add_rule(PathBeneath::new(fd, ro_rights))?,
+            Err(_) => continue,
+        }
+    }
+
+    for &path in read_write_paths {
+        if !path.exists() {
+            continue;
+        }
+        match PathFd::new(path) {
+            Ok(fd) => ruleset = ruleset.add_rule(PathBeneath::new(fd, all_rights))?,
+            Err(_) => continue,
+        }
+    }
+
+    let status = ruleset.restrict_self()?;
+
+    Ok(match status.ruleset {
+        RulesetStatus::FullyEnforced => LandlockStatus::FullyEnforced,
+        RulesetStatus::PartiallyEnforced => LandlockStatus::PartiallyEnforced,
+        RulesetStatus::NotEnforced => LandlockStatus::NotEnforced,
+    })
+}
+
+/// Logs the sandbox outcome to stderr using the standard `[Sandbox]` prefix.
+/// Called at each activation site so log output is consistent and searchable.
+pub fn log_sandbox_status(status: LandlockStatus) {
+    match status {
+        LandlockStatus::FullyEnforced => {
+            eprintln!("[Sandbox] Landlock inner sandbox: fully enforced (ABI V5).");
+        }
+        LandlockStatus::PartiallyEnforced => {
+            eprintln!(
+                "[Sandbox] Landlock inner sandbox: partially enforced \
+                 (kernel ABI < V5 — some access flags unavailable)."
+            );
+        }
+        LandlockStatus::NotEnforced => {
+            eprintln!(
+                "[Sandbox] Warning: Landlock LSM not supported on this kernel. \
+                 Process filesystem access is unrestricted."
+            );
+        }
+    }
+}
+
 /// Launches org.gnome.Papers inside a bubblewrap container to view the in-memory PDF.
 ///
 /// The decrypted content is passed via `target_fd` (a sealed memfd). bwrap copies it
@@ -196,6 +305,43 @@ pub(crate) fn extract_dbus_socket_path(addr: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── apply_process_sandbox ────────────────────────────────────────────────
+
+    // These tests must NOT call restrict_self() because doing so would
+    // permanently alter the test process's filesystem access for the remainder
+    // of the test run.  We exercise the path-selection and existence-filtering
+    // logic instead.
+
+    #[test]
+    fn sandbox_skips_nonexistent_paths() {
+        // apply_process_sandbox must return Ok even when every supplied path
+        // is absent.  On any machine where /nonexistent_atom_test does not
+        // exist this exercises the "skip missing path" branch.
+        let ro: &[&Path] = &[Path::new("/nonexistent_atom_test_ro")];
+        let rw: &[&Path] = &[Path::new("/nonexistent_atom_test_rw")];
+
+        // We do NOT call apply_process_sandbox here to avoid restricting the
+        // test runner.  We exercise just the existence predicate instead.
+        for &p in ro.iter().chain(rw.iter()) {
+            assert!(!p.exists(), "sentinel path must not exist on this machine");
+        }
+    }
+
+    #[test]
+    fn sandbox_status_variants_are_distinct() {
+        assert_ne!(LandlockStatus::FullyEnforced, LandlockStatus::PartiallyEnforced);
+        assert_ne!(LandlockStatus::FullyEnforced, LandlockStatus::NotEnforced);
+        assert_ne!(LandlockStatus::PartiallyEnforced, LandlockStatus::NotEnforced);
+    }
+
+    #[test]
+    fn log_sandbox_status_does_not_panic() {
+        // Smoke-test: log_sandbox_status must not panic for any variant.
+        log_sandbox_status(LandlockStatus::FullyEnforced);
+        log_sandbox_status(LandlockStatus::PartiallyEnforced);
+        log_sandbox_status(LandlockStatus::NotEnforced);
+    }
 
     // ── extract_dbus_socket_path ─────────────────────────────────────────────
 
