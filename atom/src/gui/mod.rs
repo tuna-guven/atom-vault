@@ -1,6 +1,6 @@
 use eframe::egui;
 use egui::Context;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -64,7 +64,9 @@ struct AtomVaultApp {
     // File dialog results — written by bg threads, polled every frame
     pending_vault_path: Arc<Mutex<Option<PathBuf>>>,
     pending_import_path: Arc<Mutex<Option<PathBuf>>>,
-    pending_folder_path: Arc<Mutex<Option<PathBuf>>>,
+    // Receives the full save-file path chosen via the XDG portal at the end
+    // of the create-vault form.  Polled each frame to trigger vault creation.
+    pending_create_path: Arc<Mutex<Option<PathBuf>>>,
 
     // Open vault
     vault_session: Option<VaultSession>,
@@ -73,7 +75,6 @@ struct AtomVaultApp {
     viewer_done: Option<(Arc<AtomicBool>, String)>,
 
     // Create vault screen
-    create_folder_path: Option<PathBuf>,
     create_name: String,
     create_password: String,
     create_confirm: String,
@@ -109,12 +110,11 @@ impl AtomVaultApp {
             login_status: "Please select or create a vault to begin.".to_string(),
             pending_vault_path: Arc::new(Mutex::new(None)),
             pending_import_path: Arc::new(Mutex::new(None)),
-            pending_folder_path: Arc::new(Mutex::new(None)),
+            pending_create_path: Arc::new(Mutex::new(None)),
             vault_session: None,
             current_vault_path: String::new(),
             explorer_status: String::new(),
             viewer_done: None,
-            create_folder_path: None,
             create_name: String::new(),
             create_password: String::new(),
             create_confirm: String::new(),
@@ -175,12 +175,15 @@ impl AtomVaultApp {
     fn poll_file_dialog_results(&mut self) {
         // Use and_then so the MutexGuard is dropped before we borrow self mutably.
         if let Some(path) = self.pending_vault_path.lock().ok().and_then(|mut g| g.take()) {
+            // The vault path is now known.  Apply the Landlock sandbox with
+            // exactly this file before any unlock attempt so the kernel denies
+            // access to every other host path for the rest of the process.
+            crate::sandbox::apply_gui_vault_sandbox(&path);
             self.selected_vault_path = Some(path);
             self.login_status = "Vault selected. Enter master password.".to_string();
         }
-        if let Some(path) = self.pending_folder_path.lock().ok().and_then(|mut g| g.take()) {
-            self.create_folder_path = Some(path);
-            self.screen = Screen::CreateVault;
+        if let Some(full_path) = self.pending_create_path.lock().ok().and_then(|mut g| g.take()) {
+            self.do_create_vault_at_path(full_path);
         }
         if let Some(path) = self.pending_import_path.lock().ok().and_then(|mut g| g.take()) {
             self.do_import(path);
@@ -253,46 +256,7 @@ impl eframe::App for AtomVaultApp {
 }
 
 pub fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
-    // The daemon thread is spawned first so it can finish any crypto
-    // initialisation (identity key derivation, Arti bootstrap) before the
-    // Landlock domain is established.  Landlock domains are per-task: the
-    // daemon thread, already running, is unaffected by restrict_self() below.
-    // Only the calling (main) thread and all threads it creates after this
-    // point will be bound by the filesystem restrictions.
     start_daemon_and_listener();
-
-    // ── Inner Landlock sandbox ───────────────────────────────────────────────
-    //
-    // Allowed read-only paths:
-    //   /usr  — egui/eframe runtime libraries, system fonts, bwrap binary
-    //   /etc  — locale, fontconfig rules, TLS certificate store
-    //
-    // Allowed read-write paths:
-    //   $XDG_RUNTIME_DIR — Wayland socket, D-Bus socket, portal IPC, and the
-    //                       document-portal directory ($XDG_RUNTIME_DIR/doc/)
-    //                       where the XDG File Chooser Portal deposits the
-    //                       user's chosen vault file when running under Flatpak.
-    //
-    // Home directory is intentionally absent: when deployed as a Flatpak the
-    // outer cage already hides /home, and vault files arrive through the portal
-    // path inside $XDG_RUNTIME_DIR.  If Landlock is not supported by the
-    // kernel, log_sandbox_status() reports it and the app continues normally.
-    {
-        let xdg_runtime = std::env::var("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
-
-        // /sys is needed by Mesa's drmGetDevices() which reads
-        // /sys/dev/char/<major>:<minor>/device/driver to identify the GPU
-        // before opening any /dev/dri node.  Without it Mesa cannot retrieve
-        // device information and the entire EGL probe chain fails (fd -1).
-        // /dev/dri is the DRM render-node directory eframe opens for rendering.
-        let ro: &[&Path] = &[Path::new("/usr"), Path::new("/etc"), Path::new("/sys")];
-        let rw_runtime = Path::new(xdg_runtime.as_str());
-        let rw: &[&Path] = &[rw_runtime, Path::new("/dev/dri")];
-
-        let status = crate::sandbox::apply_process_sandbox(ro, rw)?;
-        crate::sandbox::log_sandbox_status(status);
-    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -69,14 +69,7 @@ impl AtomVaultApp {
 
                 ui.add_space(8.0);
                 if ui.button("Create New Vault").clicked() {
-                    let tx = Arc::clone(&self.pending_folder_path);
-                    std::thread::spawn(move || {
-                        if let Some(path) = FileDialog::new().pick_folder() {
-                            if let Ok(mut g) = tx.lock() {
-                                *g = Some(path);
-                            }
-                        }
-                    });
+                    self.screen = Screen::CreateVault;
                 }
 
                 ui.add_space(16.0);
@@ -110,6 +103,10 @@ impl AtomVaultApp {
             Ok(mut file) => {
                 match crate::storage::load_vault_metadata(&mut file, &secure_password) {
                     Ok((metadata, unlocked_vault, current_offset)) => {
+                        // Landlock is already active: apply_gui_vault_sandbox()
+                        // was called in poll_file_dialog_results() the moment
+                        // the user picked this vault file, before any password
+                        // entry.  No further restriction needed here.
                         self.current_vault_path = path.to_string_lossy().to_string();
                         self.vault_session = Some(VaultSession {
                             file,
@@ -137,17 +134,9 @@ impl AtomVaultApp {
 
 impl AtomVaultApp {
     pub(super) fn show_create_vault(&mut self, ctx: &Context) {
-        let folder_display = self
-            .create_folder_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Initialize Secure Vault");
-                ui.add_space(8.0);
-                ui.label(format!("Path: {}", folder_display));
                 ui.add_space(8.0);
 
                 ui.label("Vault Name:");
@@ -210,8 +199,29 @@ impl AtomVaultApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Create Vault").clicked() {
-                        if let Some(folder) = self.create_folder_path.clone() {
-                            self.do_create_vault(folder);
+                        // Validate first so feedback is immediate; only then
+                        // open the XDG save-file portal to choose the location.
+                        let name = self.create_name.clone();
+                        if !is_valid_vault_name(&name) {
+                            self.create_status = "Invalid or empty vault name.".to_string();
+                        } else if self.create_password.is_empty() {
+                            self.create_status = "Password cannot be empty.".to_string();
+                        } else if self.create_password != self.create_confirm {
+                            self.create_status = "Passwords do not match.".to_string();
+                        } else {
+                            self.create_status = "Choose where to save your vault...".to_string();
+                            let tx = Arc::clone(&self.pending_create_path);
+                            std::thread::spawn(move || {
+                                if let Some(path) = FileDialog::new()
+                                    .set_file_name(&format!("{}.aegis", name))
+                                    .add_filter("Atom Vault", &["aegis"])
+                                    .save_file()
+                                {
+                                    if let Ok(mut g) = tx.lock() {
+                                        *g = Some(path);
+                                    }
+                                }
+                            });
                         }
                     }
                     if ui.button("Cancel").clicked() {
@@ -236,20 +246,28 @@ impl AtomVaultApp {
         });
     }
 
-    fn do_create_vault(&mut self, folder_path: PathBuf) {
-        let name = self.create_name.clone();
-        if !is_valid_vault_name(&name) {
-            self.create_status = "Invalid or empty vault name.".to_string();
-            return;
-        }
-        if self.create_password.is_empty() {
-            self.create_status = "Password cannot be empty.".to_string();
-            return;
-        }
-        if self.create_password != self.create_confirm {
-            self.create_status = "Passwords do not match.".to_string();
-            return;
-        }
+    // Called by poll_file_dialog_results() once the XDG save-file portal returns.
+    // Validation already passed at button-click time; here we just run the KDF
+    // and write the vault header to the chosen path.
+    pub(super) fn do_create_vault_at_path(&mut self, full_path: PathBuf) {
+        // Derive the vault name from the file stem chosen in the save dialog
+        // (the user may have edited it there).
+        let name = full_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.create_name.clone());
+
+        let folder = match full_path.parent() {
+            Some(p) => p.to_string_lossy().to_string(),
+            None => {
+                self.create_status = "Error: Invalid save path.".to_string();
+                return;
+            }
+        };
+
+        // The save path is now known.  Lock the process to this single file
+        // before any key derivation or disk write happens.
+        crate::sandbox::apply_gui_vault_sandbox(&full_path);
 
         let kdf = if self.create_kdf_argon { "argon2id" } else { "scrypt" };
         let dec_time: u32 = self.create_dec_time.parse().unwrap_or(1000);
@@ -263,7 +281,7 @@ impl AtomVaultApp {
         self.create_status = "Deriving keys, please wait...".to_string();
 
         match crate::commands::create::handle_create(
-            &folder_path.to_string_lossy(),
+            &folder,
             &name,
             kdf,
             mem_arg,

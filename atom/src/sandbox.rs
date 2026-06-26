@@ -91,6 +91,68 @@ pub fn apply_process_sandbox(
     })
 }
 
+/// Activates the GUI Landlock sandbox for a single, specific vault file.
+///
+/// Called exactly once per process, immediately after the user has chosen a
+/// vault path (via the XDG file-chooser portal) and before any cryptographic
+/// or file-system operation on that path.  This ensures the kernel allows
+/// access to precisely one vault file and nothing else on the host.
+///
+/// **Creation vs. open**: Landlock rules require an open FD for the target
+/// path, so a non-existent file cannot have a rule.  When `vault_path` does
+/// not exist yet (vault creation flow), the rule is added for its parent
+/// directory instead — the minimum grant needed to create the file there.
+/// When the file already exists (vault open flow) the rule is pinned to the
+/// exact file, so sibling files in the same directory are still denied.
+///
+/// Allowed paths:
+/// - `/usr`, `/etc`, `/sys`, `/proc` (RO+exec) — egui libs, fonts, Mesa GPU
+///   probe, `sysinfo` reads `/proc/meminfo` for KDF calibration
+/// - `/dev/dri`              (RW)      — GPU render node
+/// - `$XDG_RUNTIME_DIR`     (RW)      — Wayland socket, D-Bus, portal IPC
+/// - `staging_dir`           (RW)      — in-runtime staging area
+/// - `vault_path` or parent  (RW)      — the one vault file (or its directory
+///   when it does not yet exist)
+///
+/// Every other filesystem path — including the rest of `/home` — is denied
+/// at the kernel level for the lifetime of the process.
+pub fn apply_gui_vault_sandbox(vault_path: &Path) {
+    let xdg_runtime: String = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| "/run/user/1000".into());
+    let staging: String = format!("{}/atom_staging", xdg_runtime);
+
+    // Landlock cannot open an FD for a path that does not exist.  For vault
+    // creation the file is absent at this point, so we grant write access to
+    // its parent directory (enough to create the file).  For vault opening the
+    // file already exists and we restrict to exactly that path.
+    let effective_vault_path: std::path::PathBuf = if vault_path.exists() {
+        vault_path.to_path_buf()
+    } else {
+        vault_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| vault_path.to_path_buf())
+    };
+
+    let ro = [
+        Path::new("/usr"),
+        Path::new("/etc"),
+        Path::new("/sys"),
+        Path::new("/proc"),
+    ];
+    let rw = [
+        Path::new("/dev/dri"),
+        Path::new(xdg_runtime.as_str()),
+        effective_vault_path.as_path(),
+        Path::new(staging.as_str()),
+    ];
+
+    match apply_process_sandbox(&ro, &rw) {
+        Ok(s) => log_sandbox_status(s),
+        Err(e) => eprintln!("[Sandbox] Warning: could not apply Landlock: {}", e),
+    }
+}
+
 /// Logs the sandbox outcome to stderr using the standard `[Sandbox]` prefix.
 /// Called at each activation site so log output is consistent and searchable.
 pub fn log_sandbox_status(status: LandlockStatus) {
