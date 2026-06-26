@@ -61,6 +61,14 @@ pub fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     app.connect_activate(build_login_ui);
+
+    app.connect_window_removed(|app, _| {
+        if app.windows().is_empty() {
+            println!("[System] All windows closed. Terminating Tor daemon and exiting gracefully...");
+            std::process::exit(0);
+        }
+    });
+
     app.run();
 
     Ok(())
