@@ -48,7 +48,7 @@ where
     let handshake_hash = noise.get_handshake_hash();
     let signature = local_identity_key.sign(handshake_hash);
 
-    let mut master_secret = [0u8; 32];
+    let mut master_secret = Zeroizing::new([0u8; 32]);
     master_secret.copy_from_slice(handshake_hash);
 
     let mut my_auth_payload = Zeroizing::new([0u8; 96]);
@@ -72,14 +72,14 @@ where
         return Err("Invalid authentication payload length".into());
     }
 
-    let mut remote_pubkey_bytes = [0u8; 32];
+    let mut remote_pubkey_bytes = Zeroizing::new([0u8; 32]);
     remote_pubkey_bytes.copy_from_slice(&plain_payload[..32]);
 
-    let mut remote_sig_bytes = [0u8; 64];
+    let mut remote_sig_bytes = Zeroizing::new([0u8; 64]);
     remote_sig_bytes.copy_from_slice(&plain_payload[32..96]);
 
-    let remote_pubkey = VerifyingKey::from_bytes(&remote_pubkey_bytes)?;
-    let remote_sig = Signature::from_bytes(&remote_sig_bytes);
+    let remote_pubkey = VerifyingKey::from_bytes(&*remote_pubkey_bytes)?;
+    let remote_sig = Signature::from_bytes(&*remote_sig_bytes);
 
     // MUTUAL AUTHENTICATION ENFORCEMENT
     if !authorized_peers.contains(&remote_pubkey) {
@@ -87,7 +87,7 @@ where
     }
 
     if remote_pubkey
-        .verify_strict(&master_secret, &remote_sig)
+        .verify_strict(&*master_secret, &remote_sig)
         .is_err()
     {
         return Err("Invalid signature! The peer could not prove their identity.".into());
@@ -95,7 +95,7 @@ where
 
     Ok(VaultSession {
         transport,
-        master_secret: Zeroizing::new(master_secret),
+        master_secret,
         remote_static_key: remote_pubkey,
     })
 }
