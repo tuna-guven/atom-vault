@@ -1,6 +1,7 @@
 mod chunker;
 mod cli;
 mod commands;
+pub mod config_crypto;
 mod crypto;
 pub mod gui;
 pub mod sandbox;
@@ -25,6 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         eprintln!("Purging volatile process memory and enforcing immediate emergency exit.");
     }));
+
+    // Load (or generate) the config-file encryption key from GNOME Keyring.
+    // Must run before any config I/O and before the bwrap exec so the key is
+    // available in both the original and re-exec'd process.
+    if let Err(e) = crate::config_crypto::init_config_key() {
+        eprintln!("[FATAL] Cannot access GNOME Keyring: {e}");
+        eprintln!("Atom Vault requires the Secret Service (GNOME Keyring or compatible) to protect config files.");
+        eprintln!("Ensure the Secret Service daemon is running and your session keyring is unlocked.");
+        std::process::exit(1);
+    }
 
     // Attempt to re-exec inside a bwrap outer cage before any threads spawn.
     // Skipped automatically when: already sandboxed, running inside a Flatpak

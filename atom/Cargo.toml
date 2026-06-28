@@ -39,6 +39,7 @@ sysinfo = "0.39.3"
 eframe = "0.30"
 rfd = "0.15"
 landlock = "0.4"
+secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }
 
 [dev-dependencies]
 libc = "0.2"

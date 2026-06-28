@@ -2,7 +2,7 @@ use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{SignatureError, VerifyingKey};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -117,9 +117,13 @@ fn get_friends_path() -> PathBuf {
 
 pub fn load_friends() -> Vec<FriendRecord> {
     let path = get_friends_path();
-    if let Ok(mut file) = std::fs::File::open(path) {
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_ok() {
+    if let Ok(raw) = fs::read(&path) {
+        let decrypted = crate::config_crypto::decrypt_config(&raw)
+            .unwrap_or_else(|e| {
+                eprintln!("[FATAL] Cannot decrypt friends.json: {e}");
+                std::process::exit(1);
+            });
+        if let Ok(contents) = String::from_utf8(decrypted) {
             if let Ok(friends) = serde_json::from_str(&contents) {
                 return friends;
             }
@@ -146,6 +150,7 @@ pub fn update_friend_last_seen(nickname: &str) {
 pub fn save_friends(friends: &[FriendRecord]) {
     let path = get_friends_path();
     let json = serde_json::to_string_pretty(friends).expect("Failed to serialize friends list");
+    let data = crate::config_crypto::encrypt_config(json.as_bytes());
 
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -154,6 +159,6 @@ pub fn save_friends(friends: &[FriendRecord]) {
     opts.mode(0o600);
 
     if let Ok(mut file) = opts.open(path) {
-        let _ = file.write_all(json.as_bytes());
+        let _ = file.write_all(&data);
     }
 }

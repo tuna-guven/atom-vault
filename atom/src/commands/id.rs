@@ -4,10 +4,12 @@ pub fn get_id_string() -> Result<String, Box<dyn std::error::Error>> {
     let mut path = dirs::home_dir().ok_or("Could not find home directory")?;
     path.push(".atom_vault/onion.txt");
 
-    match fs::read_to_string(&path) {
-        Ok(onion) => Ok(onion.trim().to_string()),
-        Err(_) => Err("Identity not generated yet. Run 'atom daemon' first.".into()),
-    }
+    let raw = fs::read(&path).map_err(|_| -> Box<dyn std::error::Error> {
+        "Identity not generated yet. Run 'atom daemon' first.".into()
+    })?;
+    let decrypted = crate::config_crypto::decrypt_config(&raw)?;
+    let text = String::from_utf8(decrypted)?;
+    Ok(text.trim().to_string())
 }
 
 pub fn handle_id() -> Result<(), Box<dyn std::error::Error>> {

@@ -116,7 +116,8 @@ pub fn get_or_create_identity() -> Result<SigningKey, Box<dyn std::error::Error>
     path.push("identity.key");
 
     if path.exists() {
-        let bytes = fs::read(&path)?;
+        let raw = fs::read(&path)?;
+        let bytes = crate::config_crypto::decrypt_config(&raw)?;
         if bytes.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
@@ -126,6 +127,7 @@ pub fn get_or_create_identity() -> Result<SigningKey, Box<dyn std::error::Error>
 
     let mut new_key = [0u8; 32];
     OsRng.fill_bytes(&mut new_key);
+    let encrypted = crate::config_crypto::encrypt_config(&new_key);
 
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -134,7 +136,7 @@ pub fn get_or_create_identity() -> Result<SigningKey, Box<dyn std::error::Error>
 
     let mut f = opts.open(&path)?;
     use std::io::Write;
-    f.write_all(&new_key)?;
+    f.write_all(&encrypted)?;
 
     Ok(SigningKey::from_bytes(&new_key))
 }
@@ -151,19 +153,26 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))?;
 
-    let config_json =
-        serde_json::json!({ "storage": { "state_dir": state_dir.to_str().unwrap() } });
-    let config = serde_json::from_value(config_json)
-        .unwrap_or(arti_client::TorClientConfig::builder())
-        .build()?;
+    let mut cache_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+    cache_dir.push(".atom_vault/arti_cache");
+    fs::create_dir_all(&cache_dir)?;
+
+    let mut builder = arti_client::TorClientConfig::builder();
+    builder.storage().state_dir(arti_client::config::CfgPath::new_literal(state_dir));
+    builder.storage().cache_dir(arti_client::config::CfgPath::new_literal(cache_dir));
+    let config = builder.build()?;
 
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async {
         send_daemon_log("Bootstrapping embedded Arti client...");
-        let client = arti_client::TorClient::create_bootstrapped(config)
-            .await
-            .expect("Tor bootstrap failed");
+        let client = match arti_client::TorClient::create_bootstrapped(config).await {
+            Ok(c) => c,
+            Err(e) => {
+                send_daemon_log(&format!("[Daemon] Tor bootstrap failed: {}", e));
+                return Ok(());
+            }
+        };
 
         let svc_config = tor_hsservice::config::OnionServiceConfigBuilder::default()
             .nickname("atom_vault".parse()?)
@@ -195,7 +204,8 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
         opts.mode(0o600);
         if let Ok(mut f) = opts.open(&onion_file_path) {
             use std::io::Write;
-            let _ = f.write_all(final_link.as_bytes());
+            let encrypted_link = crate::config_crypto::encrypt_config(final_link.as_bytes());
+            let _ = f.write_all(&encrypted_link);
         }
 
         send_daemon_log("Daemon is online!");

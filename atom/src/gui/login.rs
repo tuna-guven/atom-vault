@@ -489,10 +489,6 @@ impl AtomVaultApp {
             }
         };
 
-        // Register before locking down: writes to ~/.atom_vault/vaults.json.
-        crate::commands::vault_registry::register_vault(&full_path.to_string_lossy());
-        self.vault_registry = crate::commands::vault_registry::load_vault_registry();
-
         // Lock the process to this file before any key derivation or disk write.
         if !self.sandbox_applied {
             crate::sandbox::apply_gui_vault_sandbox(&full_path);
@@ -522,6 +518,11 @@ impl AtomVaultApp {
             Some(secure_pass),
         ) {
             Ok(_) => {
+                // Register after the file exists so load_vault_registry() does not
+                // filter it out. ~/.atom_vault/ is in the Landlock RW set so this
+                // write succeeds even after the sandbox has been applied.
+                crate::commands::vault_registry::register_vault(&full_path.to_string_lossy());
+                self.vault_registry = crate::commands::vault_registry::load_vault_registry();
                 self.home_status = format!("Vault '{}' created. Select it to unlock.", name);
                 self.create_name = String::new();
                 self.create_status = String::new();

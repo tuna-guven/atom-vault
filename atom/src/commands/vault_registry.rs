@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -23,9 +23,13 @@ fn get_registry_path() -> PathBuf {
 
 pub fn load_vault_registry() -> Vec<VaultEntry> {
     let path = get_registry_path();
-    if let Ok(mut file) = fs::File::open(path) {
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_ok() {
+    if let Ok(raw) = fs::read(&path) {
+        let decrypted = crate::config_crypto::decrypt_config(&raw)
+            .unwrap_or_else(|e| {
+                eprintln!("[FATAL] Cannot decrypt vaults.json: {e}");
+                std::process::exit(1);
+            });
+        if let Ok(contents) = String::from_utf8(decrypted) {
             if let Ok(entries) = serde_json::from_str::<Vec<VaultEntry>>(&contents) {
                 return entries
                     .into_iter()
@@ -42,6 +46,7 @@ fn save_vault_registry(entries: &[VaultEntry]) {
     let Ok(json) = serde_json::to_string_pretty(entries) else {
         return;
     };
+    let data = crate::config_crypto::encrypt_config(json.as_bytes());
 
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -50,7 +55,7 @@ fn save_vault_registry(entries: &[VaultEntry]) {
     opts.mode(0o600);
 
     if let Ok(mut file) = opts.open(path) {
-        let _ = file.write_all(json.as_bytes());
+        let _ = file.write_all(&data);
     }
 }
 
