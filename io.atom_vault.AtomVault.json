@@ -1,7 +1,7 @@
 {
     "id": "io.atom_vault.AtomVault",
     "runtime": "org.freedesktop.Platform",
-    "runtime-version": "24.08",
+    "runtime-version": "25.08",
     "sdk": "org.freedesktop.Sdk",
     "sdk-extensions": [
         "org.freedesktop.Sdk.Extension.rust-stable"
@@ -18,6 +18,8 @@
 
         "--share=network",
 
+        "--persist=.atom_vault",
+
         "--talk-name=org.freedesktop.portal.FileChooser",
         "--talk-name=org.freedesktop.portal.Documents",
         "--talk-name=org.freedesktop.portal.OpenURI"
@@ -25,8 +27,12 @@
 
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "build-args": [
+            "--share=network"
+        ],
         "env": {
             "CARGO_HOME": "/run/build/atom-vault/cargo",
+            "CARGO_NET_OFFLINE": "false",
             "RUSTFLAGS": "-C link-arg=-Wl,-z,relro,-z,now"
         },
         "no-debuginfo": false
@@ -38,7 +44,10 @@
             "buildsystem": "simple",
             "build-commands": [
                 "cargo build --release --manifest-path atom/Cargo.toml",
-                "install -Dm755 atom/target/release/atom /app/bin/atom"
+                "install -Dm755 target/release/atom /app/bin/atom",
+                "install -Dm644 io.atom_vault.AtomVault.desktop /app/share/applications/io.atom_vault.AtomVault.desktop",
+                "install -Dm644 io.atom_vault.AtomVault.metainfo.xml /app/share/metainfo/io.atom_vault.AtomVault.metainfo.xml",
+                "install -Dm644 io.atom_vault.AtomVault.svg /app/share/icons/hicolor/scalable/apps/io.atom_vault.AtomVault.svg"
             ],
             "sources": [
                 {

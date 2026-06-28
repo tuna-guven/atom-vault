@@ -8,6 +8,7 @@ use crate::commands::daemon::{DaemonEvent, SyncResponse};
 
 mod broker;
 mod explorer;
+mod home;
 mod login;
 mod p2p;
 
@@ -21,6 +22,7 @@ struct VaultSession {
 }
 
 enum Screen {
+    Home,
     Login,
     VaultExplorer,
     CreateVault,
@@ -52,10 +54,18 @@ enum FileAction {
 struct AtomVaultApp {
     screen: Screen,
 
+    // Home screen
+    vault_registry: Vec<crate::commands::vault_registry::VaultEntry>,
+    friends_full: Vec<crate::commands::p2p_utils::FriendRecord>,
+    home_status: String,
+    // Detects sync completion to refresh friends_full
+    prev_sync_done: bool,
+
     // Login screen
     selected_vault_path: Option<PathBuf>,
     password: String,
     login_status: String,
+    sandbox_applied: bool,
 
     // File broker — pre-spawned before any Landlock domain fires so its
     // threads are never restricted by the vault sandbox.
@@ -110,10 +120,15 @@ struct AtomVaultApp {
 impl AtomVaultApp {
     fn new() -> Self {
         Self {
-            screen: Screen::Login,
+            screen: Screen::Home,
+            vault_registry: crate::commands::vault_registry::load_vault_registry(),
+            friends_full: crate::commands::p2p_utils::load_friends(),
+            home_status: String::new(),
+            prev_sync_done: true,
             selected_vault_path: None,
             password: String::new(),
-            login_status: "Please select or create a vault to begin.".to_string(),
+            login_status: String::new(),
+            sandbox_applied: false,
             file_broker: broker::FileBroker::spawn(),
             pending_vault_path: Arc::new(Mutex::new(None)),
             pending_import_path: Arc::new(Mutex::new(None)),
@@ -166,7 +181,7 @@ impl AtomVaultApp {
                 } => {
                     let default_path = dirs::home_dir()
                         .unwrap_or_default()
-                        .join(format!("Downloads/{}/{}", sender_nick, filename))
+                        .join(format!(".atom_vault/received/{}/{}", sender_nick, filename))
                         .to_string_lossy()
                         .to_string();
                     self.incoming_sync = Some(IncomingSyncState {
@@ -187,12 +202,15 @@ impl AtomVaultApp {
     fn poll_file_dialog_results(&mut self) {
         // Use and_then so the MutexGuard is dropped before we borrow self mutably.
         if let Some(path) = self.pending_vault_path.lock().ok().and_then(|mut g| g.take()) {
-            // The vault path is now known.  Apply the Landlock sandbox with
-            // exactly this file before any unlock attempt so the kernel denies
-            // access to every other host path for the rest of the process.
-            crate::sandbox::apply_gui_vault_sandbox(&path);
+            // Sandbox is applied later in try_unlock(), immediately before the
+            // first cryptographic operation, so the user can still navigate
+            // Back → Home and pick a different vault before committing.
             self.selected_vault_path = Some(path);
             self.login_status = "Vault selected. Enter master password.".to_string();
+            // If the file dialog was opened from the Home screen, navigate to Login.
+            if matches!(self.screen, Screen::Home) {
+                self.screen = Screen::Login;
+            }
         }
         if let Some(full_path) = self.pending_create_path.lock().ok().and_then(|mut g| g.take()) {
             self.do_create_vault_at_path(full_path);
@@ -314,12 +332,21 @@ impl eframe::App for AtomVaultApp {
         self.poll_viewer_done(ctx);
         self.poll_broker_results(ctx);
 
+        // Refresh friends list once after each completed sync so the home
+        // screen online/offline indicator reflects the latest last_seen value.
+        let sync_now_done = self.sync_done.load(std::sync::atomic::Ordering::SeqCst);
+        if !self.prev_sync_done && sync_now_done {
+            self.friends_full = crate::commands::p2p_utils::load_friends();
+        }
+        self.prev_sync_done = sync_now_done;
+
         // Overlay dialogs render on top of any screen
         if self.incoming_sync.is_some() {
             self.show_incoming_sync_dialog(ctx);
         }
 
         match self.screen {
+            Screen::Home => self.show_home(ctx),
             Screen::Login => self.show_login(ctx),
             Screen::VaultExplorer => self.show_vault_explorer(ctx),
             Screen::CreateVault => self.show_create_vault(ctx),
@@ -334,14 +361,34 @@ pub fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Atom Vault")
-            .with_inner_size([480.0, 420.0]),
+            .with_inner_size([800.0, 560.0]),
         ..Default::default()
     };
 
     eframe::run_native(
         "Atom Vault",
         options,
-        Box::new(|_cc| Ok(Box::new(AtomVaultApp::new()))),
+        Box::new(|cc| {
+            // Force consistent dark theme regardless of system setting.
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+
+            // Larger, more readable typography.
+            let mut style = (*cc.egui_ctx.style()).clone();
+            use egui::{FontFamily::Proportional, FontId, TextStyle::*};
+            style.text_styles = [
+                (Heading,   FontId::new(22.0, Proportional)),
+                (Body,      FontId::new(14.5, Proportional)),
+                (Monospace, FontId::new(13.0, egui::FontFamily::Monospace)),
+                (Button,    FontId::new(14.0, Proportional)),
+                (Small,     FontId::new(11.5, Proportional)),
+            ]
+            .into();
+            style.spacing.button_padding = egui::vec2(12.0, 7.0);
+            style.spacing.item_spacing  = egui::vec2(8.0, 6.0);
+            cc.egui_ctx.set_style(style);
+
+            Ok(Box::new(AtomVaultApp::new()))
+        }),
     )?;
 
     Ok(())

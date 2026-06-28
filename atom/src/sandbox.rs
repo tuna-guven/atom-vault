@@ -121,6 +121,15 @@ pub fn apply_gui_vault_sandbox(vault_path: &Path) {
         .unwrap_or_else(|_| "/run/user/1000".into());
     let staging: String = format!("{}/atom_staging", xdg_runtime);
 
+    // ~/.atom_vault/ holds friends.json, onion.txt, vault registry, and
+    // identity keys — the P2P screen needs read-write access to all of them
+    // after the sandbox is applied.
+    let atom_data_dir: std::path::PathBuf = dirs::home_dir()
+        .map(|h| h.join(".atom_vault"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.atom_vault_fallback"));
+    // Ensure the directory exists so Landlock can open an FD for it.
+    std::fs::create_dir_all(&atom_data_dir).ok();
+
     // Landlock cannot open an FD for a path that does not exist.  For vault
     // creation the file is absent at this point, so we grant write access to
     // its parent directory (enough to create the file).  For vault opening the
@@ -145,6 +154,7 @@ pub fn apply_gui_vault_sandbox(vault_path: &Path) {
         Path::new(xdg_runtime.as_str()),
         effective_vault_path.as_path(),
         Path::new(staging.as_str()),
+        atom_data_dir.as_path(),
     ];
 
     match apply_process_sandbox(&ro, &rw) {
@@ -173,6 +183,229 @@ pub fn log_sandbox_status(status: LandlockStatus) {
             );
         }
     }
+}
+
+// ── bwrap self-sandbox ────────────────────────────────────────────────────────
+
+/// Re-exec the atom process inside a bubblewrap container for additional
+/// isolation on top of Landlock.
+///
+/// What bwrap adds that Landlock does not cover:
+/// - `/usr`, `/etc`, `/sys` mounted **read-only at the kernel mount level**
+///   (defence-in-depth; Landlock already restricts writes but bwrap enforces
+///   it at a separate kernel layer — the mount namespace)
+/// - **Private `/tmp`** — tmpfs visible only to this process tree; staging
+///   temp files from other apps are invisible
+/// - **IPC namespace** — no shared-memory segments or System-V IPC with
+///   unrelated processes
+/// - **UTS namespace** — isolated hostname; avoids hostname-based information
+///   leaks and fingerprinting
+/// - **`--die-with-parent`** — the bwrap container exits if the launcher dies,
+///   preventing orphan vault-holding processes
+///
+/// Intentional omissions (documented):
+/// - `--unshare-net` is NOT applied: the embedded Arti/Tor P2P daemon needs
+///   outbound network access; network isolation requires moving the daemon to a
+///   separate process (see the Flatpak packaging roadmap)
+/// - `--unshare-user` is NOT attempted: on SELinux-enforcing kernels (Fedora,
+///   RHEL) unprivileged user-namespace creation is blocked by policy; adding
+///   that flag would cause EPERM even on native terminals
+///
+/// Failure modes:
+/// - Inside a Flatpak terminal (Ptyxis, …): nested mount namespace creation is
+///   blocked → EPERM → prints `[Sandbox] bwrap outer cage: …` notice and
+///   returns; the process continues with Landlock-only isolation
+/// - bwrap not installed: same fallback
+/// - Already sandboxed (`ATOM_BWRAP_SANDBOX=1`): returns immediately (no loop)
+pub fn try_bwrap_self_sandbox() {
+    // Already inside our bwrap cage — do not re-enter.
+    if std::env::var("ATOM_BWRAP_SANDBOX").is_ok() {
+        return;
+    }
+
+    // Inside a Flatpak app sandbox: the platform already confines the process
+    // with its own bwrap invocation (via flatpak-session-helper).  Nesting a
+    // second bwrap would require --allow=devel in the manifest and adds no
+    // security value.  Let Flatpak's confinement handle isolation.
+    if Path::new("/.flatpak-info").exists() || env::var("FLATPAK_ID").is_ok() {
+        eprintln!("[Sandbox] bwrap outer cage: Flatpak platform sandbox active — skipping");
+        return;
+    }
+
+    // Probe whether bwrap can create namespaces on this kernel/policy before
+    // replacing the process image.  Suppressing bwrap's stderr prevents the
+    // "Creating new namespace failed: Permission denied" message from reaching
+    // the user when running inside a Flatpak terminal (Ptyxis) or on an
+    // SELinux-enforcing system without the required policy exception.
+    if !bwrap_namespace_available() {
+        eprintln!("[Sandbox] bwrap outer cage: namespace creation unavailable — Landlock only");
+        return;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[Sandbox] bwrap outer cage: cannot resolve own path: {}", e);
+            return;
+        }
+    };
+
+    let xdg_runtime = match env::var("XDG_RUNTIME_DIR") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("[Sandbox] bwrap outer cage: XDG_RUNTIME_DIR unset, skipping");
+            return;
+        }
+    };
+
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            eprintln!("[Sandbox] bwrap outer cage: cannot determine HOME, skipping");
+            return;
+        }
+    };
+    let home_str = home.to_string_lossy().into_owned();
+
+    let wayland_display = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+    let dbus_addr = env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default();
+
+    let _ = std::fs::create_dir_all(format!("{}/atom_staging", xdg_runtime));
+
+    let args = build_self_bwrap_args(
+        exe.to_string_lossy().as_ref(),
+        &xdg_runtime,
+        &wayland_display,
+        &home_str,
+        &dbus_addr,
+        std::env::args_os().skip(1).collect(),
+    );
+
+    let mut cmd = std::process::Command::new("bwrap");
+    cmd.args(&args);
+
+    use std::os::unix::process::CommandExt;
+    let err = cmd.exec(); // replaces the process image; only returns on error
+
+    // exec() returned — bwrap binary found but execvp failed (should be rare
+    // since we already probed successfully, but guard anyway).
+    eprintln!("[Sandbox] bwrap outer cage: exec failed: {} — Landlock only", err);
+}
+
+/// Returns `true` if bwrap can create a mount+IPC namespace on this system.
+/// Runs a silent probe (`bwrap … true`) with stderr suppressed so that
+/// policy-denied namespace creation does not print noise to the terminal.
+fn bwrap_namespace_available() -> bool {
+    std::process::Command::new("bwrap")
+        .args([
+            "--ro-bind-try", "/usr", "/usr",
+            "--unshare-ipc",
+            "--", "true",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Builds the bwrap argument list for the process self-sandbox.
+/// Extracted as a pure function so it can be unit-tested.
+pub(crate) fn build_self_bwrap_args(
+    exe: &str,
+    xdg_runtime: &str,
+    wayland_display: &str,
+    home: &str,
+    dbus_addr: &str,
+    extra_args: Vec<std::ffi::OsString>,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+
+    // System paths — read-only.  --ro-bind-try silently skips absent paths
+    // (e.g. /lib64 is a symlink on Fedora, /opt may not exist).
+    for path in ["/usr", "/etc", "/sys", "/opt"] {
+        args.extend(["--ro-bind-try", path, path].map(String::from));
+    }
+    // /lib and /lib64 only when they are real directories (not symlinks into /usr).
+    for path in ["/lib", "/lib64"] {
+        let p = Path::new(path);
+        if p.exists() && p.symlink_metadata().map(|m| !m.file_type().is_symlink()).unwrap_or(false) {
+            args.extend(["--ro-bind", path, path].map(String::from));
+        }
+    }
+
+    // Pseudo-filesystems.
+    args.extend(["--proc", "/proc", "--dev", "/dev"].map(String::from));
+    // GPU render node for egui/Mesa.
+    if Path::new("/dev/dri").exists() {
+        args.extend(["--dev-bind", "/dev/dri", "/dev/dri"].map(String::from));
+    }
+    // Private /tmp — staging files from other processes are invisible.
+    args.extend(["--tmpfs", "/tmp"].map(String::from));
+
+    // /run: read-only base so Flatpak plumbing is visible, then RW override
+    // for XDG_RUNTIME_DIR (Wayland socket, D-Bus, portal FUSE).
+    args.extend(["--ro-bind-try", "/run", "/run"].map(String::from));
+    args.extend(["--bind", xdg_runtime, xdg_runtime].map(String::from));
+
+    // Flatpak store (read-only) so gio/xdg-open can launch Flatpak apps.
+    if Path::new("/var/lib/flatpak").exists() {
+        args.extend(["--ro-bind", "/var/lib/flatpak", "/var/lib/flatpak"].map(String::from));
+    }
+    let user_flatpak = format!("{}/.local/share/flatpak", home);
+    if Path::new(&user_flatpak).exists() {
+        args.extend(["--ro-bind-try", &user_flatpak, &user_flatpak].map(String::from));
+    }
+
+    // Home directory — writable so the vault file can be created/updated.
+    // Landlock (applied later, after the vault path is known) tightens this
+    // to the single vault file; bwrap does not restrict home writes here.
+    // On Fedora Silverblue, home lives under /var/home; bind both so that
+    // absolute paths under either root work inside the container.
+    args.extend(["--bind-try", home, home].map(String::from));
+    if Path::new("/var/home").exists() {
+        args.extend(["--bind-try", "/var/home", "/var/home"].map(String::from));
+    }
+    // /home is often a symlink to /var/home on Silverblue; bind the real dir
+    // at /home too so symlink-following tools see a consistent path.
+    if Path::new("/home").exists() {
+        args.extend(["--bind-try", "/home", "/home"].map(String::from));
+    }
+
+    // Namespace isolation (no --unshare-user: SELinux blocks it;
+    //                      no --unshare-net: P2P daemon needs network).
+    args.extend(
+        ["--unshare-ipc", "--unshare-uts", "--new-session", "--die-with-parent"]
+            .map(String::from),
+    );
+
+    // Pass through essential environment variables.
+    for (key, val) in [
+        ("ATOM_BWRAP_SANDBOX", "1"),
+        ("WAYLAND_DISPLAY", wayland_display),
+        ("XDG_RUNTIME_DIR", xdg_runtime),
+        ("HOME", home),
+    ] {
+        args.extend(["--setenv", key, val].map(String::from));
+    }
+    if let Some(dbus_socket) = extract_dbus_socket_path(dbus_addr) {
+        args.extend(
+            ["--setenv", "DBUS_SESSION_BUS_ADDRESS", dbus_addr].map(String::from),
+        );
+        // Bind the socket itself in case /run was mounted RO above and
+        // the socket path falls outside XDG_RUNTIME_DIR on some distros.
+        if Path::new(&dbus_socket).exists() {
+            args.extend(["--bind-try", &dbus_socket, &dbus_socket].map(String::from));
+        }
+    }
+
+    args.push("--".into());
+    args.push(exe.to_string());
+    for arg in extra_args {
+        args.push(arg.to_string_lossy().into_owned());
+    }
+
+    args
 }
 
 /// Launches org.gnome.Papers inside a bubblewrap container to view the in-memory PDF.
@@ -372,6 +605,103 @@ pub(crate) fn extract_dbus_socket_path(addr: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── build_self_bwrap_args ────────────────────────────────────────────────
+
+    fn self_bwrap_sample() -> Vec<String> {
+        build_self_bwrap_args(
+            "/usr/bin/atom",
+            "/run/user/1000",
+            "wayland-0",
+            "/home/user",
+            "unix:path=/run/user/1000/bus",
+            vec![],
+        )
+    }
+
+    #[test]
+    fn self_bwrap_usr_is_ro() {
+        let args = self_bwrap_sample();
+        // --ro-bind-try /usr /usr must appear
+        let pos = args.iter().position(|a| a == "--ro-bind-try").expect("--ro-bind-try missing");
+        // scan all --ro-bind-try triples for /usr
+        let triples: Vec<_> = args.windows(3)
+            .filter(|w| w[0] == "--ro-bind-try" || w[0] == "--ro-bind")
+            .collect();
+        assert!(triples.iter().any(|w| w[1] == "/usr"), "/usr must be bound RO");
+        let _ = pos;
+    }
+
+    #[test]
+    fn self_bwrap_no_unshare_net() {
+        // P2P daemon needs network — must NOT appear.
+        assert!(!self_bwrap_sample().contains(&"--unshare-net".to_string()));
+    }
+
+    #[test]
+    fn self_bwrap_no_unshare_user() {
+        // SELinux blocks unprivileged user-namespace creation.
+        assert!(!self_bwrap_sample().contains(&"--unshare-user".to_string()));
+    }
+
+    #[test]
+    fn self_bwrap_ipc_and_uts_isolated() {
+        let args = self_bwrap_sample();
+        assert!(args.contains(&"--unshare-ipc".to_string()));
+        assert!(args.contains(&"--unshare-uts".to_string()));
+    }
+
+    #[test]
+    fn self_bwrap_die_with_parent() {
+        assert!(self_bwrap_sample().contains(&"--die-with-parent".to_string()));
+    }
+
+    #[test]
+    fn self_bwrap_tmp_is_private() {
+        let args = self_bwrap_sample();
+        let pos = args.iter().position(|a| a == "--tmpfs").expect("--tmpfs missing");
+        assert_eq!(args[pos + 1], "/tmp");
+    }
+
+    #[test]
+    fn self_bwrap_marker_env_set() {
+        let args = self_bwrap_sample();
+        let pos = args.iter().position(|a| a == "ATOM_BWRAP_SANDBOX")
+            .expect("ATOM_BWRAP_SANDBOX missing");
+        assert_eq!(args[pos - 1], "--setenv");
+        assert_eq!(args[pos + 1], "1");
+    }
+
+    #[test]
+    fn self_bwrap_home_is_rw() {
+        let args = self_bwrap_sample();
+        // Home must appear as --bind-try (RW), not --ro-bind.
+        let home_in_rw = args.windows(3)
+            .any(|w| w[0] == "--bind-try" && w[1] == "/home/user");
+        assert!(home_in_rw, "home directory must be bound RW");
+    }
+
+    #[test]
+    fn self_bwrap_exe_is_last_positional() {
+        let args = self_bwrap_sample();
+        let sep = args.iter().rposition(|a| a == "--").expect("-- separator missing");
+        assert_eq!(args[sep + 1], "/usr/bin/atom");
+    }
+
+    #[test]
+    fn self_bwrap_extra_args_forwarded() {
+        let args = build_self_bwrap_args(
+            "/usr/bin/atom",
+            "/run/user/1000",
+            "wayland-0",
+            "/home/user",
+            "",
+            vec!["--vault-path".into(), "my.aegis".into()],
+        );
+        let sep = args.iter().rposition(|a| a == "--").unwrap();
+        let positional: Vec<&str> = args[sep + 1..].iter().map(|s| s.as_str()).collect();
+        assert_eq!(positional, vec!["/usr/bin/atom", "--vault-path", "my.aegis"]);
+    }
 
     // ── apply_process_sandbox ────────────────────────────────────────────────
 

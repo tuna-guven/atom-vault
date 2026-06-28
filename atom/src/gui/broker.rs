@@ -16,7 +16,7 @@ enum BrokerRequest {
     },
     /// Decrypted bytes are written to the user's XDG_RUNTIME_DIR tmpfs (RAM-only),
     /// opened with `gio open`/`xdg-open` (which routes via the XDG document portal
-    /// so Papers/Flatpak can access the file), then shredded when the viewer closes.
+    /// so Flatpak viewers can access the file), then shredded when the viewer closes.
     OpenViewer {
         data: Vec<u8>,
         filename: String,
@@ -127,14 +127,15 @@ impl FileBroker {
 
 // ── Viewer helpers ────────────────────────────────────────────────────────────
 
-/// Write decrypted bytes to `$XDG_RUNTIME_DIR/atom_staging/<filename>` (a
-/// RAM-backed tmpfs — never touches a persistent disk), open with `gio open`
-/// (which routes via the XDG document portal so Flatpak apps like Papers can
-/// access the file), then watch until the viewer closes and shred the file.
+/// Write decrypted bytes to `$XDG_RUNTIME_DIR/atom_staging/<stem>_view_tmp.<ext>`
+/// (a RAM-backed tmpfs — never touches a persistent disk), open with `gio open`
+/// which uses the user's default application for the file's MIME type (whatever
+/// PDF/image/text viewer they have set), then watch until the viewer closes and
+/// shred the file.
 ///
 /// bwrap is intentionally NOT used here: on SELinux-enforcing systems (Fedora,
 /// RHEL) unprivileged namespace creation is blocked by policy and bwrap fails
-/// with EPERM.  Papers is already Flatpak-sandboxed; `gio open` delegates
+/// with EPERM.  Flatpak viewers are already sandboxed; `gio open` delegates
 /// through `xdg-portal-desktop` which enforces Flatpak's own confinement.
 fn open_in_viewer(
     mut data: Vec<u8>,
@@ -153,7 +154,14 @@ fn open_in_viewer(
     std::fs::create_dir_all(&staging)
         .map_err(|e| format!("Cannot create staging dir: {}", e))?;
 
-    let tmp_path = staging.join(format!("{}_view_tmp", filename));
+    // Preserve the file extension so gio/xdg-open can detect the MIME type
+    // and route to the user's default viewer (not Papers specifically).
+    let file_path = Path::new(filename);
+    let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or(filename);
+    let ext = file_path.extension().and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e))
+        .unwrap_or_default();
+    let tmp_path = staging.join(format!("{}_view_tmp{}", stem, ext));
 
     {
         let mut opts = std::fs::OpenOptions::new();
@@ -177,8 +185,8 @@ fn open_in_viewer(
     data.zeroize();
     drop(data);
 
-    // `gio open` on GNOME handles the XDG portal so Flatpak viewers get access.
-    // Fall back to `xdg-open` on non-GNOME desktops.
+    // `gio open` opens with the user's default app for the file's MIME type.
+    // Fall back to `xdg-open` on non-GNOME desktops (same behaviour).
     let open_result = std::process::Command::new("gio")
         .args(["open", &tmp_path.to_string_lossy()])
         .spawn()
@@ -192,8 +200,8 @@ fn open_in_viewer(
     println!("Starting secure sandbox mode...");
 
     // Watch for the viewer to close, then shred.  The XDG document-portal
-    // FUSE daemon holds the original file open while Papers has it displayed;
-    // once Papers closes the document the portal releases the fd too, so
+    // FUSE daemon holds the original file open while the viewer displays it;
+    // once the viewer closes the document the portal releases the fd too, so
     // /proc/*/fd scanning reliably detects closure.
     let path_clone = tmp_path.clone();
     std::thread::spawn(move || {

@@ -52,6 +52,7 @@ pub fn add_friend_core(url: &str, nickname: &str) -> Result<String, Box<dyn std:
         nickname: nickname.to_string(),
         url: url.to_string(),
         shared_vaults: Vec::new(),
+        last_seen: None,
     });
     
     save_friends(&friends);

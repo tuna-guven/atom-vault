@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Atom Vault
+GenericName=Secure File Vault
+Comment=Encrypted virtual filesystem with P2P sync over Tor
+Exec=atom
+Icon=io.atom_vault.AtomVault
+Terminal=false
+Type=Application
+Categories=Security;Utility;FileTools;
+Keywords=vault;encrypt;secure;p2p;tor;
+StartupNotify=true
+StartupWMClass=atom

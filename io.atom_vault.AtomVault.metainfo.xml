@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.atom_vault.AtomVault</id>
+  <name>Atom Vault</name>
+  <summary>Encrypted virtual filesystem with P2P sync over Tor</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Atom Vault is a secure, application-level Virtual File System (VFS).
+      It provides a cryptographic container for sensitive data with hardware-level
+      memory isolation, ephemeral file viewing, and P2P vault synchronisation
+      over Tor — without requiring FUSE or kernel filesystem modifications.
+    </p>
+    <ul>
+      <li>Two-layer key scheme: Argon2id/Scrypt KEK wraps a per-vault DEK</li>
+      <li>XChaCha20-Poly1305 per-chunk encryption with content-defined chunking</li>
+      <li>Files decrypted into RAM-only memfd — never written to disk</li>
+      <li>Landlock LSM sandbox applied after vault selection</li>
+      <li>P2P sync via Arti (embedded Tor), Noise_XX handshake, and Yamux multiplexing</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.atom_vault.AtomVault.desktop</launchable>
+  <url type="homepage">https://github.com/tuna-guven/atom-vault</url>
+  <provides>
+    <binary>atom</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2025-01-01">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

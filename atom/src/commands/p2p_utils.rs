@@ -87,9 +87,12 @@ pub struct SharedVault {
 pub struct FriendRecord {
     pub nickname: String,
     pub url: String,
-    // The default macro ensures old address books won't crash when loading
     #[serde(default)]
     pub shared_vaults: Vec<SharedVault>,
+    /// Unix timestamp of the last successful outbound sync with this peer.
+    /// `None` means never synced. Used for online/offline heuristic in the GUI.
+    #[serde(default)]
+    pub last_seen: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -123,6 +126,21 @@ pub fn load_friends() -> Vec<FriendRecord> {
         }
     }
     vec![]
+}
+
+/// Sets `last_seen` for the given nickname to the current Unix timestamp.
+/// Called after a successful outbound sync so the home screen can show
+/// an online/offline indicator based on recency.
+pub fn update_friend_last_seen(nickname: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut friends = load_friends();
+    if let Some(f) = friends.iter_mut().find(|f| f.nickname == nickname) {
+        f.last_seen = Some(now);
+        save_friends(&friends);
+    }
 }
 
 pub fn save_friends(friends: &[FriendRecord]) {

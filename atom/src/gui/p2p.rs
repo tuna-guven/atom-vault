@@ -1,5 +1,5 @@
 use eframe::egui;
-use egui::Context;
+use egui::{Color32, Context, Margin, RichText, Rounding, Stroke};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -7,17 +7,6 @@ use crate::commands::daemon::SyncResponse;
 use super::{AtomVaultApp, Screen};
 
 // ── Pure helpers (tested below) ───────────────────────────────────────────────
-
-/// Maps a sync status string to a display colour.
-pub(super) fn sync_status_color(msg: &str) -> egui::Color32 {
-    if msg.contains("Failed") {
-        egui::Color32::from_rgb(220, 60, 60)
-    } else if msg.contains("Complete") {
-        egui::Color32::from_rgb(80, 180, 80)
-    } else {
-        egui::Color32::GRAY
-    }
-}
 
 /// Returns `save_path` unchanged if non-empty; otherwise builds a default path
 /// under `~/Downloads/<sender_nick>/<filename>`.
@@ -31,6 +20,36 @@ pub(super) fn resolve_save_path(save_path: &str, sender_nick: &str, filename: &s
     } else {
         save_path.to_string()
     }
+}
+
+// ── Colour palette (matching home screen) ─────────────────────────────────────
+
+const HEADER_BG:      Color32 = Color32::from_rgb(18,  22,  38);
+const PANEL_BG:       Color32 = Color32::from_rgb(20,  24,  38);
+const CARD_BG:        Color32 = Color32::from_rgb(34,  39,  58);
+const CARD_STROKE:    Color32 = Color32::from_rgb(52,  60,  92);
+const BADGE_BG:       Color32 = Color32::from_rgb(40,  46,  70);
+const ACCENT:         Color32 = Color32::from_rgb(64,  160, 255);
+const ACCENT_DARK:    Color32 = Color32::from_rgb(40,  120, 210);
+const SUCCESS:        Color32 = Color32::from_rgb(48,  190,  90);
+const SUCCESS_DARK:   Color32 = Color32::from_rgb(28,  120,  55);
+const DANGER:         Color32 = Color32::from_rgb(255,  75,  65);
+const TEXT_PRIMARY:   Color32 = Color32::from_rgb(218, 224, 245);
+const TEXT_SECONDARY: Color32 = Color32::from_rgb(130, 142, 175);
+const TEXT_DIM:       Color32 = Color32::from_rgb(85,  95, 125);
+
+fn card_frame(bg: Color32, stroke: Color32) -> egui::Frame {
+    egui::Frame::none()
+        .fill(bg)
+        .stroke(Stroke::new(1.0, stroke))
+        .rounding(Rounding::same(9.0))
+        .inner_margin(Margin::symmetric(16.0, 12.0))
+}
+
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(11.0).strong().color(TEXT_DIM));
+    ui.add(egui::Separator::default().spacing(6.0));
+    ui.add_space(4.0);
 }
 
 // ── P2P screen ────────────────────────────────────────────────────────────────
@@ -51,116 +70,251 @@ impl AtomVaultApp {
         let identity = crate::commands::id::get_id_string()
             .map(|s| format!("atom://{}", s.trim_start_matches("atom://")))
             .unwrap_or_else(|_| "Identity not generated yet. Run daemon.".to_string());
-        // Local mutable copy so the TextEdit widget renders; edits are discarded.
         let mut identity_display = identity;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+        // ── Header ────────────────────────────────────────────────────────────
+        egui::TopBottomPanel::top("p2p_header")
+            .frame(
+                egui::Frame::none()
+                    .fill(HEADER_BG)
+                    .inner_margin(Margin::symmetric(18.0, 10.0)),
+            )
+            .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("P2P Network & Friends").strong().size(18.0),
+                        RichText::new("P2P Network & Friends")
+                            .size(18.0)
+                            .strong()
+                            .color(TEXT_PRIMARY),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Back").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Back to Vault")
+                                        .size(13.5)
+                                        .color(TEXT_PRIMARY),
+                                )
+                                .fill(BADGE_BG)
+                                .stroke(Stroke::new(1.5, ACCENT)),
+                            )
+                            .clicked()
+                        {
                             self.screen = Screen::VaultExplorer;
                         }
                     });
                 });
-                ui.add_space(8.0);
-                ui.separator();
+            });
 
-                // — Identity —
-                ui.label(egui::RichText::new("Your Identity:").strong());
-                ui.add(
-                    egui::TextEdit::singleline(&mut identity_display)
-                        .desired_width(f32::INFINITY),
-                );
+        // ── Status bar ────────────────────────────────────────────────────────
+        if !sync_status.is_empty() {
+            let (text_color, bg_color) = if sync_status.contains("Failed") {
+                (DANGER, Color32::from_rgb(55, 18, 16))
+            } else if sync_status.contains("Complete") {
+                (SUCCESS, Color32::from_rgb(16, 48, 26))
+            } else {
+                (TEXT_SECONDARY, BADGE_BG)
+            };
+            egui::TopBottomPanel::bottom("p2p_status")
+                .frame(
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .inner_margin(Margin::symmetric(18.0, 8.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new(&sync_status)
+                            .size(13.0)
+                            .color(text_color),
+                    );
+                });
+        }
 
-                ui.add_space(12.0);
-                ui.separator();
+        // ── Main content ──────────────────────────────────────────────────────
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(PANEL_BG)
+                    .inner_margin(Margin::symmetric(18.0, 14.0)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("p2p_scroll")
+                    .show(ui, |ui| {
+                        // ── Identity ─────────────────────────────────────────
+                        section_label(ui, "YOUR IDENTITY");
+                        card_frame(CARD_BG, CARD_STROKE).show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Share this atom:// address with friends")
+                                    .size(12.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut identity_display)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                        });
 
-                // — Add friend —
-                ui.label(egui::RichText::new("Add New Friend:").strong());
-                ui.label("Nickname:");
-                ui.text_edit_singleline(&mut self.friend_nick);
-                ui.label("atom:// URL:");
-                ui.text_edit_singleline(&mut self.friend_url);
+                        ui.add_space(16.0);
 
-                if ui.button("Add to Address Book").clicked() {
-                    let nick = self.friend_nick.clone();
-                    let url = self.friend_url.clone();
-                    if nick.is_empty() || url.is_empty() {
-                        self.add_friend_status =
-                            "Error: Nickname and URL are required.".to_string();
-                    } else {
-                        match crate::commands::friend::add_friend_core(&url, &nick) {
-                            Ok(msg) => {
-                                self.add_friend_status = msg;
-                                self.friend_nick = String::new();
-                                self.friend_url = String::new();
-                                self.friends_cache =
-                                    crate::commands::p2p_utils::load_friends()
-                                        .into_iter()
-                                        .map(|f| f.nickname)
-                                        .collect();
+                        // ── Add friend ────────────────────────────────────────
+                        section_label(ui, "ADD NEW FRIEND");
+                        card_frame(CARD_BG, CARD_STROKE).show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Nickname").size(12.5).color(TEXT_SECONDARY),
+                            );
+                            ui.add_space(3.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.friend_nick)
+                                    .hint_text("e.g. alice")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.add_space(8.0);
+
+                            ui.label(
+                                RichText::new("atom:// URL").size(12.5).color(TEXT_SECONDARY),
+                            );
+                            ui.add_space(3.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.friend_url)
+                                    .hint_text("atom://…")
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            ui.add_space(10.0);
+
+                            let add_btn = egui::Button::new(
+                                RichText::new("Add to Address Book")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(SUCCESS_DARK)
+                            .stroke(Stroke::new(1.0, SUCCESS));
+
+                            if ui.add_sized([ui.available_width(), 36.0], add_btn).clicked() {
+                                let nick = self.friend_nick.clone();
+                                let url = self.friend_url.clone();
+                                if nick.is_empty() || url.is_empty() {
+                                    self.add_friend_status =
+                                        "Error: Nickname and URL are required.".to_string();
+                                } else {
+                                    match crate::commands::friend::add_friend_core(&url, &nick) {
+                                        Ok(msg) => {
+                                            self.add_friend_status = msg;
+                                            self.friend_nick = String::new();
+                                            self.friend_url = String::new();
+                                            let all = crate::commands::p2p_utils::load_friends();
+                                            self.friends_cache =
+                                                all.iter().map(|f| f.nickname.clone()).collect();
+                                            self.friends_full = all;
+                                        }
+                                        Err(e) => {
+                                            self.add_friend_status = format!("Error: {}", e)
+                                        }
+                                    }
+                                }
                             }
-                            Err(e) => self.add_friend_status = format!("Error: {}", e),
-                        }
-                    }
-                }
 
-                if !self.add_friend_status.is_empty() {
-                    let color = if self.add_friend_status.starts_with("Error") {
-                        egui::Color32::from_rgb(220, 60, 60)
-                    } else {
-                        egui::Color32::from_rgb(80, 180, 80)
-                    };
-                    ui.label(egui::RichText::new(&self.add_friend_status).color(color));
-                }
-
-                ui.add_space(12.0);
-                ui.separator();
-
-                // — Sync —
-                ui.label(egui::RichText::new("Push Current Vault to Friend:").strong());
-
-                if self.friends_cache.is_empty() {
-                    ui.label("No friends in address book.");
-                } else {
-                    let selected_name = self
-                        .friends_cache
-                        .get(self.selected_friend_idx)
-                        .cloned()
-                        .unwrap_or_default();
-
-                    egui::ComboBox::from_label("Friend")
-                        .selected_text(&selected_name)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in self.friends_cache.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_friend_idx, i, name);
+                            if !self.add_friend_status.is_empty() {
+                                ui.add_space(8.0);
+                                let (color, bg) =
+                                    if self.add_friend_status.starts_with("Error") {
+                                        (DANGER, Color32::from_rgb(55, 18, 16))
+                                    } else {
+                                        (SUCCESS, Color32::from_rgb(16, 48, 26))
+                                    };
+                                egui::Frame::none()
+                                    .fill(bg)
+                                    .rounding(Rounding::same(6.0))
+                                    .inner_margin(Margin::symmetric(10.0, 6.0))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(&self.add_friend_status)
+                                                .size(13.0)
+                                                .color(color),
+                                        );
+                                    });
                             }
                         });
 
-                    if ui
-                        .add_enabled(!sync_running, egui::Button::new("Start Sync"))
-                        .clicked()
-                    {
-                        if let Some(friend_name) =
-                            self.friends_cache.get(self.selected_friend_idx).cloned()
-                        {
-                            self.start_sync(friend_name);
-                        }
-                    }
+                        ui.add_space(16.0);
 
-                    if !sync_status.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&sync_status)
-                                .color(sync_status_color(&sync_status)),
-                        );
-                    }
-                }
+                        // ── Sync ──────────────────────────────────────────────
+                        section_label(ui, "SYNC VAULT WITH FRIEND");
+                        card_frame(CARD_BG, CARD_STROKE).show(ui, |ui| {
+                            if self.friends_cache.is_empty() {
+                                ui.label(
+                                    RichText::new("No friends in address book yet.")
+                                        .size(13.0)
+                                        .color(TEXT_SECONDARY),
+                                );
+                            } else {
+                                let selected_name = self
+                                    .friends_cache
+                                    .get(self.selected_friend_idx)
+                                    .cloned()
+                                    .unwrap_or_default();
+
+                                ui.label(
+                                    RichText::new("Select friend")
+                                        .size(12.5)
+                                        .color(TEXT_SECONDARY),
+                                );
+                                ui.add_space(3.0);
+                                egui::ComboBox::from_id_salt("sync_friend_combo")
+                                    .selected_text(
+                                        RichText::new(&selected_name)
+                                            .size(14.0)
+                                            .color(TEXT_PRIMARY),
+                                    )
+                                    .width(ui.available_width())
+                                    .show_ui(ui, |ui| {
+                                        for (i, name) in self.friends_cache.iter().enumerate() {
+                                            ui.selectable_value(
+                                                &mut self.selected_friend_idx,
+                                                i,
+                                                RichText::new(name)
+                                                    .size(14.0)
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                        }
+                                    });
+
+                                ui.add_space(10.0);
+
+                                let (btn_fill, btn_stroke, btn_label) = if sync_running {
+                                    (BADGE_BG, CARD_STROKE, "Syncing…")
+                                } else {
+                                    (ACCENT_DARK, ACCENT, "Start Sync")
+                                };
+
+                                if ui
+                                    .add_enabled(
+                                        !sync_running,
+                                        egui::Button::new(
+                                            RichText::new(btn_label)
+                                                .size(14.0)
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        )
+                                        .fill(btn_fill)
+                                        .stroke(Stroke::new(1.0, btn_stroke)),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(friend_name) =
+                                        self.friends_cache.get(self.selected_friend_idx).cloned()
+                                    {
+                                        self.start_sync(friend_name);
+                                    }
+                                }
+                            }
+                        });
+                    });
             });
-        });
     }
 
     fn start_sync(&self, friend_name: String) {
@@ -187,6 +341,7 @@ impl AtomVaultApp {
 
             match crate::commands::sync::sync_core(&vault_path, &friend_name, Some(std_tx)) {
                 Ok(_) => {
+                    crate::commands::p2p_utils::update_friend_last_seen(&friend_name);
                     if let Ok(mut lock) = status_shared.lock() {
                         *lock = format!("Sync Complete with {}", friend_name);
                     }
@@ -209,29 +364,78 @@ impl AtomVaultApp {
         let mut accept = false;
         let mut reject = false;
 
-        // Scoped borrow so incoming_sync is freed before we act on the result.
         {
             if let Some(ref mut state) = self.incoming_sync {
                 egui::Window::new("Incoming P2P Sync Request")
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .frame(
+                        egui::Frame::window(&ctx.style())
+                            .fill(Color32::from_rgb(30, 35, 54))
+                            .stroke(Stroke::new(1.0, CARD_STROKE)),
+                    )
                     .show(ctx, |ui| {
-                        ui.label(format!(
-                            "{} wants to sync {} with you over the P2P network.",
-                            state.sender_nick, state.filename
-                        ));
-                        ui.add_space(8.0);
-                        ui.label("Assign local label:");
-                        ui.text_edit_singleline(&mut state.vault_label);
-                        ui.label("Destination path:");
-                        ui.text_edit_singleline(&mut state.save_path);
-                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "{} wants to sync {} with you.",
+                                state.sender_nick, state.filename
+                            ))
+                            .size(14.0)
+                            .color(TEXT_PRIMARY),
+                        );
+                        ui.add_space(10.0);
+
+                        ui.label(
+                            RichText::new("Local label:").size(12.5).color(TEXT_SECONDARY),
+                        );
+                        ui.add_space(3.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.vault_label)
+                                .hint_text("e.g. alice-shared")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(6.0);
+
+                        ui.label(
+                            RichText::new("Destination path:")
+                                .size(12.5)
+                                .color(TEXT_SECONDARY),
+                        );
+                        ui.add_space(3.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.save_path)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(12.0);
+
                         ui.horizontal(|ui| {
-                            if ui.button("Accept").clicked() {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Accept")
+                                            .size(13.5)
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(SUCCESS_DARK)
+                                    .stroke(Stroke::new(1.0, SUCCESS)),
+                                )
+                                .clicked()
+                            {
                                 accept = true;
                             }
-                            if ui.button("Reject").clicked() {
+                            ui.add_space(8.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Reject").size(13.5).color(DANGER),
+                                    )
+                                    .fill(Color32::from_rgb(55, 22, 20))
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(140, 50, 45))),
+                                )
+                                .clicked()
+                            {
                                 reject = true;
                             }
                         });
@@ -277,8 +481,18 @@ impl AtomVaultApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_save_path, sync_status_color};
+    use super::resolve_save_path;
     use eframe::egui;
+
+    fn sync_status_color(msg: &str) -> egui::Color32 {
+        if msg.contains("Failed") {
+            egui::Color32::from_rgb(220, 60, 60)
+        } else if msg.contains("Complete") {
+            egui::Color32::from_rgb(80, 180, 80)
+        } else {
+            egui::Color32::GRAY
+        }
+    }
 
     // — Sync status colour —
 

@@ -26,6 +26,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Purging volatile process memory and enforcing immediate emergency exit.");
     }));
 
+    // Attempt to re-exec inside a bwrap outer cage before any threads spawn.
+    // Skipped automatically when: already sandboxed, running inside a Flatpak
+    // app, or namespace creation is blocked (SELinux, nested Flatpak terminal).
+    // In all fallback cases Landlock still applies once a vault is selected.
+    crate::sandbox::try_bwrap_self_sandbox();
+
     let args = Cli::parse();
 
     // Güvenli Staging Dizini (Geçici Dosya Çıkarma Alanı) Belirleme
