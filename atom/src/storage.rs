@@ -1,5 +1,3 @@
-// atom/src/storage.rs
-
 use crate::crypto::{UnlockedVault, XNONCE_LEN};
 use crate::vfs::VaultMetadata;
 use std::fs::File;
@@ -32,8 +30,6 @@ pub fn load_vault_metadata(
     let unlocked_vault = crate::crypto::unwrap_dek(&kek, &wrapped_dek, &dek_nonce)
         .map_err(|e| format!("DEK unwrap error: {:?}", e))?;
 
-    let current_payload_offset = file.stream_position()?;
-
     file.seek(SeekFrom::Start(master_pointer))?;
 
     let mut metadata_nonce = [0u8; XNONCE_LEN];
@@ -53,7 +49,11 @@ pub fn load_vault_metadata(
 
     let metadata: VaultMetadata = bincode::deserialize(&decrypted_metadata_bytes)?;
 
-    Ok((metadata, unlocked_vault, current_payload_offset))
+    // Return master_pointer (= start of current metadata = end of all chunk data) so
+    // callers know where to begin writing new chunks or an updated metadata block.
+    // Returning stream_position() here (= fixed header size = 125) was wrong: it caused
+    // every post-load write to start at offset 125, silently overwriting chunk data.
+    Ok((metadata, unlocked_vault, master_pointer))
 }
 
 pub fn save_vault_metadata(
@@ -72,6 +72,12 @@ pub fn save_vault_metadata(
 
     file.write_all(&metadata_nonce)?;
     file.write_all(&encrypted_metadata)?;
+
+    // Truncate to the exact end of the new metadata block.  Without this, residual
+    // bytes from a previously-longer metadata block would be included in the next
+    // read_to_end() during load, causing the AEAD tag check to fail.
+    let end_pos = file.stream_position()?;
+    file.set_len(end_pos)?;
 
     file.sync_data()?;
 

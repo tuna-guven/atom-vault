@@ -407,32 +407,17 @@ impl AtomVaultApp {
                         } else if self.create_password != self.create_confirm {
                             self.create_status = "Passwords do not match.".to_string();
                         } else {
-                            // Inside Flatpak without --filesystem=home the save dialog
-                            // returns a host path the app cannot write to.  Skip the
-                            // dialog and save directly into the persist-mapped data dir.
-                            let is_flatpak = std::path::Path::new("/.flatpak-info").exists();
-                            self.create_status = if is_flatpak {
-                                "Creating vault in secure data directory…".to_string()
+                            // Vaults always live in ~/.atom_vault/ (which maps to
+                            // the Flatpak data dir when sandboxed via --persist).
+                            // No file-chooser dialog is ever needed for creation.
+                            if let Some(home) = dirs::home_dir() {
+                                let vault_dir = home.join(".atom_vault");
+                                std::fs::create_dir_all(&vault_dir).ok();
+                                let full_path = vault_dir.join(format!("{}.aegis", name));
+                                self.do_create_vault_at_path(full_path);
                             } else {
-                                "Choose where to save your vault…".to_string()
-                            };
-                            let tx = Arc::clone(&self.pending_create_path);
-                            std::thread::spawn(move || {
-                                let path = if is_flatpak {
-                                    dirs::home_dir()
-                                        .map(|h| h.join(".atom_vault").join(format!("{}.aegis", name)))
-                                } else {
-                                    FileDialog::new()
-                                        .set_file_name(&format!("{}.aegis", name))
-                                        .add_filter("Atom Vault", &["aegis"])
-                                        .save_file()
-                                };
-                                if let Some(p) = path {
-                                    if let Ok(mut g) = tx.lock() {
-                                        *g = Some(p);
-                                    }
-                                }
-                            });
+                                self.create_status = "Error: Cannot determine home directory.".to_string();
+                            }
                         }
                     }
 
