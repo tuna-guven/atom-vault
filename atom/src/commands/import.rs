@@ -31,6 +31,70 @@ impl Drop for MlockGuard {
     }
 }
 
+/// Import pre-read bytes into the vault.  Used by the GUI broker flow where
+/// the file has already been read in a sandboxed sub-thread; the caller is
+/// responsible for zeroing `data` after this returns.
+pub fn handle_import_from_bytes(
+    data: Vec<u8>,
+    vfs_name: String,
+    physical_vault: &mut File,
+    metadata: &mut VaultMetadata,
+    unlocked_vault: &UnlockedVault,
+    current_payload_offset: &mut u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if metadata.file_table.iter().any(|f| f.vfs_name == vfs_name) {
+        return Err(format!(
+            "Error: A file named '{}' already exists in the vault.",
+            vfs_name
+        )
+        .into());
+    }
+
+    let chunk_boundaries: Vec<fastcdc::v2020::ChunkData> =
+        crate::chunker::chunk_data(std::io::Cursor::new(&data), &metadata.cdc_salt)
+            .collect::<Result<Vec<_>, _>>()?;
+
+    let mut new_chunks = Vec::new();
+    physical_vault.seek(SeekFrom::Start(*current_payload_offset))?;
+
+    for chunk_info in chunk_boundaries {
+        let start = chunk_info.offset as usize;
+        let end = start + chunk_info.length;
+        let secure_buffer = zeroize::Zeroizing::new(data[start..end].to_vec());
+
+        let _mlock_guard = MlockGuard::new(&secure_buffer)?;
+        let (ciphertext, chunk_nonce) =
+            crypto::encrypt_chunk(unlocked_vault, &secure_buffer, *current_payload_offset)
+                .map_err(|e| format!("Encryption error: {:?}", e))?;
+
+        physical_vault.write_all(&ciphertext)?;
+        new_chunks.push(ChunkEntry {
+            cipher_len: ciphertext.len(),
+            offset: *current_payload_offset,
+            nonce: chunk_nonce,
+        });
+        *current_payload_offset += ciphertext.len() as u64;
+    }
+
+    metadata.file_table.push(FileIndex {
+        vfs_name,
+        chunks: new_chunks,
+        last_modified_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    });
+
+    crate::storage::save_vault_metadata(
+        physical_vault,
+        metadata,
+        unlocked_vault,
+        *current_payload_offset,
+    )?;
+    physical_vault.sync_all()?;
+    Ok(())
+}
+
 pub fn handle_import(
     from_disk: String,
     vfs_name: String,

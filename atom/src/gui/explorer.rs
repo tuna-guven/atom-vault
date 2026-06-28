@@ -2,10 +2,10 @@ use eframe::egui;
 use egui::Context;
 use rfd::FileDialog;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use super::{AtomVaultApp, ExportOverwriteState, FileAction, RenameState, Screen};
+use super::{AtomVaultApp, FileAction, RenameState, Screen};
 
 // ── Pure helpers (tested below) ───────────────────────────────────────────────
 
@@ -142,26 +142,19 @@ impl AtomVaultApp {
         if self.rename_dialog.is_some() {
             self.show_rename_dialog(ctx);
         }
-        if self.export_overwrite.is_some() {
-            self.show_export_overwrite_dialog(ctx);
-        }
     }
 }
 
 // ── File operations ───────────────────────────────────────────────────────────
 
 impl AtomVaultApp {
-    pub(super) fn do_import(&mut self, path: PathBuf) {
-        let from_disk = path.to_string_lossy().to_string();
-        let vfs_name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
+    /// Called from `poll_broker_results` once the broker sub-thread has read
+    /// the user-chosen file.  Encrypts and stores the bytes in the vault.
+    pub(super) fn do_import_bytes(&mut self, data: Vec<u8>) {
+        let vfs_name = std::mem::take(&mut self.pending_import_vfs_name);
         if let Some(sess) = &mut self.vault_session {
-            match crate::commands::import::handle_import(
-                from_disk,
+            match crate::commands::import::handle_import_from_bytes(
+                data,
                 vfs_name.clone(),
                 &mut sess.file,
                 &mut sess.metadata,
@@ -183,69 +176,73 @@ impl AtomVaultApp {
             None => return,
         };
 
-        let file_index = match sess.metadata.file_table.iter().find(|f| f.vfs_name == vfs_name) {
-            Some(fi) => fi.clone(),
-            None => {
-                self.explorer_status = "Error: File index not found!".to_string();
+        self.explorer_status = format!("Opening {} securely...", vfs_name);
+
+        // Decrypt on the main thread (vault FD access), then hand raw bytes to
+        // the broker.  The broker writes them to XDG_RUNTIME_DIR (RAM-backed
+        // tmpfs, mode 0600) and opens with `gio open` via the XDG portal.
+        // We skip bwrap: SELinux-enforcing kernels block unprivileged namespace
+        // creation (EPERM), and Papers is already Flatpak-sandboxed.
+        let bytes = match crate::commands::export::decrypt_to_bytes(
+            vfs_name,
+            &sess.metadata,
+            &mut sess.file,
+            &sess.unlocked_vault,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                self.explorer_status = format!("Open failed: {}", e);
                 return;
             }
         };
 
-        self.explorer_status = format!("Opening {} securely in sandbox...", vfs_name);
-
         let done_flag = Arc::new(AtomicBool::new(false));
-        let done_flag_thread = Arc::clone(&done_flag);
-
-        match crate::commands::view::execute(
-            &mut sess.file,
-            &file_index,
-            &sess.unlocked_vault,
-            move || done_flag_thread.store(true, Ordering::SeqCst),
-        ) {
-            Ok(_) => self.viewer_done = Some((done_flag, vfs_name.to_string())),
-            Err(e) => self.explorer_status = format!("Open failed: {}", e),
-        }
+        let spawn_result = self.file_broker.open_viewer(
+            bytes,
+            vfs_name.to_string(),
+            Arc::clone(&done_flag),
+        );
+        self.pending_viewer_spawn = Some(spawn_result);
+        self.viewer_done = Some((done_flag, vfs_name.to_string()));
     }
 
     fn do_export_file(&mut self, vfs_name: &str) {
-        let safe_name = std::path::Path::new(vfs_name)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        if safe_name.is_empty() {
-            return;
-        }
+        // Store which vault file to export, then open a save dialog.
+        // The path comes back via pending_export_path; poll_file_dialog_results
+        // picks it up, decrypts the bytes, and sends them to the broker.
+        self.pending_export_vfs_name = Some(vfs_name.to_string());
+        let file_name = vfs_name.to_string();
+        let tx = Arc::clone(&self.pending_export_path);
+        std::thread::spawn(move || {
+            if let Some(path) = FileDialog::new().set_file_name(&file_name).save_file() {
+                if let Ok(mut g) = tx.lock() {
+                    *g = Some(path);
+                }
+            }
+        });
+        self.explorer_status = "Choose where to save the decrypted file...".to_string();
+    }
 
-        let staging_dir = std::path::PathBuf::from("atom_staging");
-        let _ = std::fs::create_dir_all(&staging_dir);
-        let target_path = staging_dir.join(&safe_name).to_string_lossy().to_string();
-
+    /// Called from `poll_file_dialog_results` once the user has chosen a save
+    /// path.  Decrypts the vault file in the main thread, then hands the bytes
+    /// to the broker for a sandboxed write.
+    pub(super) fn do_export_via_broker(&mut self, path: PathBuf, vfs_name: String) {
         let sess = match &mut self.vault_session {
             Some(s) => s,
             None => return,
         };
-
-        match crate::commands::export::handle_export(
-            vfs_name.to_string(),
-            target_path.clone(),
+        match crate::commands::export::decrypt_to_bytes(
+            &vfs_name,
             &sess.metadata,
             &mut sess.file,
             &sess.unlocked_vault,
-            false,
         ) {
-            Ok(_) => {
-                self.explorer_status =
-                    format!("Success: Extracted to atom_staging/{}", safe_name);
+            Ok(bytes) => {
+                self.explorer_status = "Writing file...".to_string();
+                self.pending_export_write_result =
+                    Some(self.file_broker.write_file(path, bytes));
             }
-            Err(e) if e.to_string() == "ALREADY_EXISTS" => {
-                self.export_overwrite = Some(ExportOverwriteState {
-                    vfs_name: vfs_name.to_string(),
-                    target_path,
-                });
-                self.explorer_status = "File exists in staging — confirm overwrite below.".to_string();
-            }
-            Err(e) => self.explorer_status = format!("Export failed: {}", e),
+            Err(e) => self.explorer_status = format!("Export Error: {}", e),
         }
     }
 
@@ -322,52 +319,6 @@ impl AtomVaultApp {
         }
     }
 
-    fn show_export_overwrite_dialog(&mut self, ctx: &Context) {
-        let mut do_overwrite = false;
-        let mut cancel = false;
-
-        egui::Window::new("File Already Exists")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(
-                    "This file already exists in the staging area.\nDo you want to overwrite it?",
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Yes, Overwrite").clicked() {
-                        do_overwrite = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-
-        if do_overwrite {
-            if let Some(state) = self.export_overwrite.take() {
-                if let Some(sess) = &mut self.vault_session {
-                    match crate::commands::export::handle_export(
-                        state.vfs_name,
-                        state.target_path,
-                        &sess.metadata,
-                        &mut sess.file,
-                        &sess.unlocked_vault,
-                        true,
-                    ) {
-                        Ok(_) => {
-                            self.explorer_status =
-                                "Success: File securely overwritten in staging.".to_string();
-                        }
-                        Err(e) => self.explorer_status = format!("Overwrite failed: {}", e),
-                    }
-                }
-            }
-        } else if cancel {
-            self.export_overwrite = None;
-        }
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -424,8 +375,7 @@ mod tests {
         assert_eq!(status_color("Permanently Shredded: secret.pdf"), green);
         assert_eq!(status_color("Closed securely: notes.txt"), green);
         assert_eq!(status_color("Renamed to: new_name.txt"), green);
-        assert_eq!(status_color("Success: Extracted to atom_staging/f"), green);
-        assert_eq!(status_color("Success: File securely overwritten in staging."), green);
+        assert_eq!(status_color("Success: File exported."), green);
     }
 
     #[test]

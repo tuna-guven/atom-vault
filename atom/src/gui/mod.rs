@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::commands::daemon::{DaemonEvent, SyncResponse};
 
+mod broker;
 mod explorer;
 mod login;
 mod p2p;
@@ -39,11 +40,6 @@ struct RenameState {
     new_name: String,
 }
 
-struct ExportOverwriteState {
-    vfs_name: String,
-    target_path: String,
-}
-
 enum FileAction {
     Open(String),
     Export(String),
@@ -61,18 +57,29 @@ struct AtomVaultApp {
     password: String,
     login_status: String,
 
+    // File broker — pre-spawned before any Landlock domain fires so its
+    // threads are never restricted by the vault sandbox.
+    file_broker: broker::FileBroker,
+
     // File dialog results — written by bg threads, polled every frame
     pending_vault_path: Arc<Mutex<Option<PathBuf>>>,
     pending_import_path: Arc<Mutex<Option<PathBuf>>>,
-    // Receives the full save-file path chosen via the XDG portal at the end
-    // of the create-vault form.  Polled each frame to trigger vault creation.
     pending_create_path: Arc<Mutex<Option<PathBuf>>>,
+    pending_export_path: Arc<Mutex<Option<PathBuf>>>,
+
+    // Broker operation results (None = in-flight, Some = ready to process)
+    pending_import_bytes: Option<Arc<Mutex<Option<Result<Vec<u8>, String>>>>>,
+    pending_import_vfs_name: String,
+    pending_export_vfs_name: Option<String>,
+    pending_export_write_result: Option<Arc<Mutex<Option<Result<(), String>>>>>,
 
     // Open vault
     vault_session: Option<VaultSession>,
     current_vault_path: String,
     explorer_status: String,
     viewer_done: Option<(Arc<AtomicBool>, String)>,
+    // Polled for bwrap spawn success/failure (set by broker thread, fast)
+    pending_viewer_spawn: Option<Arc<Mutex<Option<Result<(), String>>>>>,
 
     // Create vault screen
     create_name: String,
@@ -98,7 +105,6 @@ struct AtomVaultApp {
     // Overlay dialogs
     incoming_sync: Option<IncomingSyncState>,
     rename_dialog: Option<RenameState>,
-    export_overwrite: Option<ExportOverwriteState>,
 }
 
 impl AtomVaultApp {
@@ -108,13 +114,20 @@ impl AtomVaultApp {
             selected_vault_path: None,
             password: String::new(),
             login_status: "Please select or create a vault to begin.".to_string(),
+            file_broker: broker::FileBroker::spawn(),
             pending_vault_path: Arc::new(Mutex::new(None)),
             pending_import_path: Arc::new(Mutex::new(None)),
             pending_create_path: Arc::new(Mutex::new(None)),
+            pending_export_path: Arc::new(Mutex::new(None)),
+            pending_import_bytes: None,
+            pending_import_vfs_name: String::new(),
+            pending_export_vfs_name: None,
+            pending_export_write_result: None,
             vault_session: None,
             current_vault_path: String::new(),
             explorer_status: String::new(),
             viewer_done: None,
+            pending_viewer_spawn: None,
             create_name: String::new(),
             create_password: String::new(),
             create_confirm: String::new(),
@@ -134,7 +147,6 @@ impl AtomVaultApp {
             sync_done: Arc::new(AtomicBool::new(true)),
             incoming_sync: None,
             rename_dialog: None,
-            export_overwrite: None,
         }
     }
 
@@ -186,7 +198,67 @@ impl AtomVaultApp {
             self.do_create_vault_at_path(full_path);
         }
         if let Some(path) = self.pending_import_path.lock().ok().and_then(|mut g| g.take()) {
-            self.do_import(path);
+            // Send to the pre-sandbox broker for a sandboxed read; the result
+            // is polled in poll_broker_results() once the sub-thread finishes.
+            let vfs_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.pending_import_vfs_name = vfs_name;
+            self.pending_import_bytes = Some(self.file_broker.read_file(path));
+            self.explorer_status = "Reading file...".to_string();
+        }
+        if let Some(path) = self.pending_export_path.lock().ok().and_then(|mut g| g.take()) {
+            if let Some(vfs_name) = self.pending_export_vfs_name.take() {
+                self.do_export_via_broker(path, vfs_name);
+            }
+        }
+    }
+
+    fn poll_broker_results(&mut self, ctx: &Context) {
+        // Clone the Arc so we release the borrow on `self` before calling
+        // do_import_bytes / assigning back to the field.
+        if let Some(arc) = self.pending_import_bytes.clone() {
+            if let Ok(mut g) = arc.lock() {
+                if g.is_some() {
+                    let result = g.take().unwrap();
+                    drop(g);
+                    self.pending_import_bytes = None;
+                    match result {
+                        Ok(data) => self.do_import_bytes(data),
+                        Err(e) => self.explorer_status = format!("Import Error: {}", e),
+                    }
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if let Some(arc) = self.pending_export_write_result.clone() {
+            if let Ok(mut g) = arc.lock() {
+                if g.is_some() {
+                    let result = g.take().unwrap();
+                    drop(g);
+                    self.pending_export_write_result = None;
+                    match result {
+                        Ok(()) => self.explorer_status = "Success: File exported.".to_string(),
+                        Err(e) => self.explorer_status = format!("Export Error: {}", e),
+                    }
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if let Some(arc) = self.pending_viewer_spawn.clone() {
+            if let Ok(mut g) = arc.lock() {
+                if g.is_some() {
+                    let result = g.take().unwrap();
+                    drop(g);
+                    self.pending_viewer_spawn = None;
+                    if let Err(e) = result {
+                        self.explorer_status = format!("Open failed: {}", e);
+                        self.viewer_done = None;
+                    }
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 
@@ -240,6 +312,7 @@ impl eframe::App for AtomVaultApp {
         self.poll_daemon_events();
         self.poll_file_dialog_results();
         self.poll_viewer_done(ctx);
+        self.poll_broker_results(ctx);
 
         // Overlay dialogs render on top of any screen
         if self.incoming_sync.is_some() {

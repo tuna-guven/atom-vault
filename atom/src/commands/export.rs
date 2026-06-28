@@ -31,6 +31,43 @@ impl Drop for MlockGuard {
     }
 }
 
+/// Decrypt all chunks of `vfs_name` into a single buffer.  Used by the GUI
+/// broker flow: the caller sends the returned bytes to the broker for writing.
+pub fn decrypt_to_bytes(
+    vfs_name: &str,
+    metadata: &VaultMetadata,
+    physical_vault: &mut File,
+    unlocked_vault: &UnlockedVault,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let file_entry = metadata
+        .file_table
+        .iter()
+        .find(|f| f.vfs_name == vfs_name)
+        .ok_or_else(|| format!("Error: File '{}' not found in vault.", vfs_name))?;
+
+    let mut output: Vec<u8> = Vec::new();
+
+    for chunk in &file_entry.chunks {
+        physical_vault.seek(SeekFrom::Start(chunk.offset))?;
+        let mut cipher_buffer = vec![0u8; chunk.cipher_len];
+        physical_vault.read_exact(&mut cipher_buffer)?;
+
+        let decrypted = zeroize::Zeroizing::new(
+            crate::crypto::decrypt_chunk(
+                unlocked_vault,
+                &cipher_buffer,
+                &chunk.nonce,
+                chunk.offset,
+            )
+            .map_err(|e| format!("Decryption error: {:?}", e))?,
+        );
+        let _mlock_guard = MlockGuard::new(&decrypted)?;
+        output.extend_from_slice(&decrypted);
+    }
+
+    Ok(output)
+}
+
 pub fn handle_export(
     vfs_name: String,
     to_disk: String,

@@ -248,8 +248,13 @@ pub(crate) fn build_bwrap_args(
     let mut args: Vec<String> = vec!["bwrap".into()];
 
     // --- Namespace isolation ---
-    // User namespace is kept shared: flatpak creates its own inner user namespace.
-    args.extend(["--unshare-ipc", "--unshare-net", "--unshare-uts"].map(String::from));
+    // --unshare-user creates a new user namespace first, which maps our UID to
+    // root inside the container.  This is required for unprivileged creation of
+    // the IPC, net, and UTS namespaces that follow — without it, clone() returns
+    // EPERM because non-root cannot create those namespaces in the current
+    // user namespace.  Flatpak can still nest its own inner user namespace
+    // inside ours (user.max_user_namespaces allows multiple levels).
+    args.extend(["--unshare-user", "--unshare-ipc", "--unshare-net", "--unshare-uts"].map(String::from));
     // Kill bwrap if the atom parent dies; no controlling terminal.
     args.extend(["--die-with-parent", "--new-session"].map(String::from));
 
@@ -496,9 +501,10 @@ mod tests {
     }
 
     #[test]
-    fn test_args_user_namespace_not_unshared() {
-        // Must stay shared so flatpak can create its own inner user namespace.
-        assert!(!sample_args().contains(&"--unshare-user".to_string()));
+    fn test_args_user_namespace_is_unshared() {
+        // Required: without a new user namespace, unprivileged clone() of
+        // IPC/net/UTS namespaces returns EPERM.
+        assert!(sample_args().contains(&"--unshare-user".to_string()));
     }
 
     #[test]
