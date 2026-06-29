@@ -1,11 +1,131 @@
 use memfd::MemfdOptions;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
-use zeroize::Zeroize;
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::crypto::UnlockedVault;
 use crate::sandbox;
 use crate::vfs::{FileIndex, process_secure_chunk};
+
+/// A read-only mmap of the memfd that is pinned into physical RAM with
+/// `mlock()`.  This prevents the kernel from swapping the decrypted plaintext
+/// to disk (or to the hibernation image) while the viewer is open.  Dropping
+/// the guard unlocks and unmaps the region.
+struct MlockedMap {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+// The raw pointer is owned exclusively by this struct and only touched in
+// `new`/`drop`; it is safe to move the guard across threads (worker thread,
+// signal handler).
+unsafe impl Send for MlockedMap {}
+
+impl MlockedMap {
+    /// Map `len` bytes of `fd` read-only and pin them in RAM.  A zero length
+    /// yields an inert guard (mmap rejects zero-length requests).
+    fn new(fd: RawFd, len: usize) -> std::io::Result<Self> {
+        if len == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            });
+        }
+
+        // PROT_READ is sufficient: we only need the pages resident so mlock can
+        // pin them.  A PROT_WRITE shared mapping would be rejected by
+        // F_SEAL_FUTURE_WRITE anyway.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        if unsafe { libc::mlock(ptr, len) } != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::munmap(ptr, len) };
+            return Err(err);
+        }
+
+        Ok(Self { ptr, len })
+    }
+}
+
+impl Drop for MlockedMap {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            unsafe {
+                libc::munlock(self.ptr, self.len);
+                libc::munmap(self.ptr, self.len);
+            }
+            self.ptr = std::ptr::null_mut();
+            self.len = 0;
+        }
+    }
+}
+
+/// All the resources that must be torn down securely once a viewer closes
+/// (or the process is interrupted).  Held in a shared slot so that whichever
+/// of the worker thread / signal handler reaches it first performs the shred.
+struct ShredJob {
+    pid: libc::pid_t,
+    /// Strict read-only handle handed to the sandbox; closed before shredding.
+    ro_memfd: std::fs::File,
+    /// Original writable handle (created before F_SEAL_FUTURE_WRITE) used to
+    /// zero and then shrink the backing pages.
+    memfd_file: std::fs::File,
+    /// RAM pin; released only after the plaintext has been overwritten.
+    locked_map: MlockedMap,
+    /// Caller notification fired after the shred completes (normal path only).
+    on_close: Box<dyn FnOnce() + Send>,
+}
+
+type ShredSlot = Arc<Mutex<Option<ShredJob>>>;
+
+/// Registry of in-flight viewer shred jobs.  The SIGINT handler drains this on
+/// termination so no decrypted page survives an interrupted session.
+fn registry() -> &'static Mutex<Vec<ShredSlot>> {
+    static REGISTRY: OnceLock<Mutex<Vec<ShredSlot>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Install (once) a SIGINT/SIGTERM handler that shreds every open viewer's
+/// decrypted RAM before letting the process die.  Without this, a Ctrl+C while
+/// a viewer is open would kill the detached shred thread and leave plaintext
+/// resident in memory.
+fn install_signal_handler() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = ctrlc::set_handler(|| {
+            eprintln!(
+                "\n[SIGINT] Termination requested. Shredding open viewer memory before exit..."
+            );
+            let jobs: Vec<ShredSlot> = {
+                let mut reg = registry().lock().unwrap();
+                std::mem::take(&mut *reg)
+            };
+            for slot in jobs {
+                if let Some(mut job) = slot.lock().unwrap().take() {
+                    // Force-close the still-running viewer child first.
+                    unsafe { libc::kill(job.pid, libc::SIGKILL) };
+                    // Drop the on_close notifier without firing it; the process
+                    // is exiting so no one is waiting on it.
+                    job.on_close = Box::new(|| {});
+                    complete_shred(job);
+                }
+            }
+            std::process::exit(130);
+        });
+    });
+}
 
 /// Decrypt `file_index` chunks into a sealed, anonymous memfd.
 ///
@@ -32,6 +152,7 @@ pub fn prepare_decrypted_memfd(
             &chunk.nonce,
             unlocked_vault,
             chunk.offset,
+            chunk.plain_len,
             |secure_plaintext| {
                 memfd_file
                     .write_all(secure_plaintext)
@@ -43,44 +164,79 @@ pub fn prepare_decrypted_memfd(
     memfd_file.flush()?;
     memfd_file.seek(SeekFrom::Start(0))?;
 
-    // Seal against external writes/grows so the viewer app cannot modify the
-    // in-RAM copy.  F_SEAL_SEAL prevents further seal changes.
+    // F_SEAL_FUTURE_WRITE prevents any new writable fd or mmap from being
+    // created on this memfd (including inside the sandboxed viewer), while
+    // leaving the existing writable fd (`memfd_file`) fully functional so that
+    // shredding can zero the pages after the viewer exits.
+    // F_SEAL_WRITE would block ALL writes — including our own shredder.
+    //
+    // F_SEAL_SHRINK is intentionally omitted: the sandbox only ever receives a
+    // read-only fd and cannot ftruncate, so F_SEAL_GROW + F_SEAL_FUTURE_WRITE
+    // already block tampering, while the parent retains the ability to shrink
+    // the file to 0 during cleanup to release the RAM promptly.
     unsafe {
         libc::fcntl(
             memfd_file.as_raw_fd(),
             libc::F_ADD_SEALS,
-            libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL,
+            libc::F_SEAL_GROW | libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SEAL,
         );
     }
 
     Ok(memfd_file)
 }
 
-/// Attempt to zero the memfd content and then drop the file (closing the fd).
-///
-/// The seals applied by `prepare_decrypted_memfd` prevent writes, so the
-/// zero-write will fail silently.  The real erasure happens when the last fd
-/// referencing the anonymous memfd is closed: the kernel releases the backing
-/// pages.  This function makes the intent explicit and drops the file handle.
-pub fn shred_memfd(mut memfd_file: std::fs::File) {
-    let size = memfd_file.seek(SeekFrom::End(0)).unwrap_or(0);
-    if size > 0 {
-        let _ = memfd_file.seek(SeekFrom::Start(0));
-        let mut zero_page = [0u8; 4096];
-        let mut written = 0u64;
-        while written < size {
-            let to_write = std::cmp::min(4096, size - written) as usize;
-            if memfd_file.write_all(&zero_page[..to_write]).is_err() {
-                break;
-            }
-            written += to_write as u64;
-        }
-        let _ = memfd_file.flush();
-        zero_page.zeroize();
+/// Overwrite the entire backing store of `memfd_file` with zeros via its
+/// (pre-seal) writable fd.
+fn zero_fill(memfd_file: &mut std::fs::File) {
+    let size = memfd_file.metadata().map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        return;
     }
+    if memfd_file.seek(SeekFrom::Start(0)).is_err() {
+        return;
+    }
+    let zero_page = [0u8; 4096];
+    let mut written = 0u64;
+    while written < size {
+        let to_write = std::cmp::min(4096, size - written) as usize;
+        if memfd_file.write_all(&zero_page[..to_write]).is_err() {
+            break;
+        }
+        written += to_write as u64;
+    }
+    let _ = memfd_file.flush();
+}
+
+/// Securely tear down a viewer's resources: close the sandbox handle, zero the
+/// RAM while it is still locked, release the lock, shrink the file to free the
+/// pages, then fire the completion callback.
+fn complete_shred(job: ShredJob) {
+    let ShredJob {
+        ro_memfd,
+        mut memfd_file,
+        locked_map,
+        on_close,
+        ..
+    } = job;
+
+    // Close the sandbox's read-only handle so no fd alias remains.
+    drop(ro_memfd);
+
+    // Overwrite plaintext while the pages are still mlock'd (cannot be swapped
+    // out mid-wipe).
+    zero_fill(&mut memfd_file);
+
+    // Unlock/unmap only after the plaintext is gone, and before shrinking so we
+    // never ftruncate a still-mapped region.
+    drop(locked_map);
+
+    // With F_SEAL_SHRINK removed this now succeeds, releasing the backing pages
+    // immediately rather than waiting for the fd to be dropped.
     let _ = memfd_file.set_len(0);
-    // memfd_file is dropped here, closing the last fd and freeing the pages.
+    drop(memfd_file);
+
     println!("Traces successfully removed.");
+    on_close();
 }
 
 /// CLI entry point: decrypt, spawn bwrap directly, wait and shred.
@@ -98,18 +254,61 @@ pub fn execute<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    install_signal_handler();
+
     let memfd_file = prepare_decrypted_memfd(physical_vault, file_index, unlocked_vault)?;
-    let raw_fd = memfd_file.as_raw_fd();
+
+    // Pin the decrypted memfd in physical RAM so the kernel cannot swap the
+    // plaintext to disk (or hibernation) while the viewer is open.
+    let size = memfd_file.metadata()?.len() as usize;
+    let locked_map = MlockedMap::new(memfd_file.as_raw_fd(), size)
+        .map_err(|e| format!("Failed to lock decrypted memfd into RAM: {}", e))?;
+
+    // Open a strictly read-only handle via procfs.  F_SEAL_FUTURE_WRITE blocks
+    // new writable fds, so this open with O_RDONLY always succeeds.  We pass
+    // this to bwrap instead of the original fd so the sandbox cannot write
+    // through it, while `memfd_file` (created before the seal) retains write
+    // access for the shredder.
+    let ro_path = format!("/proc/self/fd/{}", memfd_file.as_raw_fd());
+    let ro_memfd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(&ro_path)
+        .map_err(|e| format!("Failed to open read-only memfd handle: {}", e))?;
 
     println!("Starting secure sandbox mode...");
-    let pid = sandbox::spawn_in_bwrap_sandbox(raw_fd)?;
+    let pid = sandbox::spawn_in_bwrap_sandbox(ro_memfd.as_raw_fd())?;
+
+    // Register the teardown resources in a shared slot so either the worker
+    // thread (normal close) or the SIGINT handler (interrupt) can shred them.
+    let slot: ShredSlot = Arc::new(Mutex::new(Some(ShredJob {
+        pid,
+        ro_memfd,
+        memfd_file,
+        locked_map,
+        on_close: Box::new(on_close),
+    })));
+
+    {
+        let mut reg = registry().lock().unwrap();
+        // Prune slots whose job already completed to keep the registry small.
+        reg.retain(|s| s.lock().unwrap().is_some());
+        reg.push(Arc::clone(&slot));
+    }
 
     std::thread::spawn(move || {
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        // Wrap waitpid so a panic here still proceeds to shredding.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut status = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+        }));
+
         println!("Sandbox closed. Initiating memory shredding...");
-        shred_memfd(memfd_file);
-        on_close();
+        // Take ownership of the job; if the signal handler already claimed it,
+        // this is None and we do nothing.
+        if let Some(job) = slot.lock().unwrap().take() {
+            complete_shred(job);
+        }
     });
 
     Ok(())

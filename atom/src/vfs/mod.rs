@@ -12,6 +12,10 @@ pub struct ChunkEntry {
     pub offset: u64,
     // TODO: Replace random bytes with deterministic nonce generation using a Merkle tree approach
     pub nonce: [u8; crate::crypto::XNONCE_LEN],
+    /// Actual plaintext length before uniform padding.  Zero means "no padding"
+    /// (legacy vaults written before uniform-padding was introduced).
+    #[serde(default)]
+    pub plain_len: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -28,15 +32,19 @@ pub struct VaultMetadata {
     pub cdc_salt: [u8; 32],
 }
 
-/// Decrypts a chunk directly into memory, locks it to prevent swapping, 
+/// Decrypts a chunk directly into memory, locks it to prevent swapping,
 /// executes the provided closure, and guarantees memory zeroing even on panic.
+///
+/// `plain_len` is the byte count of actual content before uniform padding.
+/// Pass `0` for legacy chunks that were written without padding.
 pub fn process_secure_chunk<F>(
-    physical_vault: &mut std::fs::File, // Bypass RAM disk and read straight from SSD
+    physical_vault: &mut std::fs::File,
     cipher_len: usize,
     nonce: &[u8; crate::crypto::XNONCE_LEN],
     unlocked_vault: &crate::crypto::UnlockedVault,
     chunk_offset: u64,
-    action: F,   
+    plain_len: usize,
+    action: F,
 ) -> std::io::Result<()> where F: FnOnce(&[u8]), {
 
     physical_vault.seek(SeekFrom::Start(chunk_offset))?;
@@ -46,7 +54,7 @@ pub fn process_secure_chunk<F>(
 
     let mut secure_plaintext = crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce, chunk_offset)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Decryption error: {:?}", e)))?;
-    
+
     // Lock memory page to prevent OS from swapping plaintext to disk
     let mlock_result = unsafe {
         libc::mlock(
@@ -58,9 +66,16 @@ pub fn process_secure_chunk<F>(
         return Err(std::io::Error::last_os_error());
     }
 
+    // Strip uniform padding: use plain_len when set, otherwise pass the full slice (legacy).
+    let content = if plain_len > 0 {
+        &secure_plaintext[..plain_len]
+    } else {
+        &secure_plaintext[..]
+    };
+
     // Isolate execution to ensure sensitive data is wiped even if the action panics
     let action_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        action(&secure_plaintext);
+        action(content);
     }));
 
     // Securely overwrite the plaintext in RAM
@@ -77,7 +92,6 @@ pub fn process_secure_chunk<F>(
     if let Err(err) = action_result {
         std::panic::resume_unwind(err);
     }
-
 
     Ok(())
 }

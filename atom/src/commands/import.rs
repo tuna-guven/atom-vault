@@ -1,5 +1,7 @@
+use crate::chunker::MAX_CHUNK_SIZE;
 use crate::crypto::{self, UnlockedVault};
 use crate::vfs::{ChunkEntry, FileIndex, VaultMetadata};
+use rand::RngCore;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -51,7 +53,7 @@ pub fn handle_import_from_bytes(
     }
 
     let chunk_boundaries: Vec<fastcdc::v2020::ChunkData> =
-        crate::chunker::chunk_data(std::io::Cursor::new(&data), &metadata.cdc_salt)
+        crate::chunker::chunk_data(std::io::Cursor::new(&data))
             .collect::<Result<Vec<_>, _>>()?;
 
     let mut new_chunks = Vec::new();
@@ -59,12 +61,16 @@ pub fn handle_import_from_bytes(
 
     for chunk_info in chunk_boundaries {
         let start = chunk_info.offset as usize;
-        let end = start + chunk_info.length;
-        let secure_buffer = zeroize::Zeroizing::new(data[start..end].to_vec());
+        let plain_len = chunk_info.length;
 
-        let _mlock_guard = MlockGuard::new(&secure_buffer)?;
+        // Pad plaintext to MAX_CHUNK_SIZE with random bytes to hide chunk size.
+        let mut padded = zeroize::Zeroizing::new(vec![0u8; MAX_CHUNK_SIZE]);
+        padded[..plain_len].copy_from_slice(&data[start..start + plain_len]);
+        rand::rngs::OsRng.fill_bytes(&mut padded[plain_len..]);
+
+        let _mlock_guard = MlockGuard::new(&padded)?;
         let (ciphertext, chunk_nonce) =
-            crypto::encrypt_chunk(unlocked_vault, &secure_buffer, *current_payload_offset)
+            crypto::encrypt_chunk(unlocked_vault, &padded, *current_payload_offset)
                 .map_err(|e| format!("Encryption error: {:?}", e))?;
 
         physical_vault.write_all(&ciphertext)?;
@@ -72,6 +78,7 @@ pub fn handle_import_from_bytes(
             cipher_len: ciphertext.len(),
             offset: *current_payload_offset,
             nonce: chunk_nonce,
+            plain_len,
         });
         *current_payload_offset += ciphertext.len() as u64;
     }
@@ -154,24 +161,27 @@ pub fn handle_import(
         .open(&target_path)?;
 
     let chunk_boundaries: Vec<fastcdc::v2020::ChunkData> =
-        crate::chunker::chunk_data(&mut file, &metadata.cdc_salt).collect::<Result<Vec<_>, _>>()?;
+        crate::chunker::chunk_data(&mut file).collect::<Result<Vec<_>, _>>()?;
 
     let mut new_chunks = Vec::new();
 
     physical_vault.seek(SeekFrom::Start(*current_payload_offset))?;
 
     for chunk_info in chunk_boundaries {
-        let mut secure_buffer = zeroize::Zeroizing::new(vec![0u8; chunk_info.length]);
+        let plain_len = chunk_info.length;
 
+        // Pad plaintext to MAX_CHUNK_SIZE with random bytes to hide chunk size.
+        let mut padded = zeroize::Zeroizing::new(vec![0u8; MAX_CHUNK_SIZE]);
         file.seek(SeekFrom::Start(chunk_info.offset as u64))?;
-        file.read_exact(&mut secure_buffer)?;
+        file.read_exact(&mut padded[..plain_len])?;
+        rand::rngs::OsRng.fill_bytes(&mut padded[plain_len..]);
 
         // 3. Bind the buffer to the raw pointer-based MlockGuard
-        let _mlock_guard = MlockGuard::new(&secure_buffer)?;
+        let _mlock_guard = MlockGuard::new(&padded)?;
 
         // Pass immutable reference safely without triggering an exclusive borrow checker conflict
         let (ciphertext, chunk_nonce) =
-            crypto::encrypt_chunk(&unlocked_vault, &secure_buffer, *current_payload_offset)
+            crypto::encrypt_chunk(&unlocked_vault, &padded, *current_payload_offset)
                 .map_err(|e| format!("Encryption error: {:?}", e))?;
 
         if let Err(e) = physical_vault.write_all(&ciphertext) {
@@ -182,6 +192,7 @@ pub fn handle_import(
             cipher_len: ciphertext.len(),
             offset: *current_payload_offset,
             nonce: chunk_nonce,
+            plain_len,
         });
 
         *current_payload_offset += ciphertext.len() as u64;

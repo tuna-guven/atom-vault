@@ -19,7 +19,10 @@ pub fn handle_cat(
         }
     };
 
-    let total_capacity: usize = target_file.chunks.iter().map(|c| c.cipher_len).sum();
+    const AEAD_TAG_LEN: usize = 16;
+    let total_capacity: usize = target_file.chunks.iter().map(|c| {
+        if c.plain_len > 0 { c.plain_len } else { c.cipher_len.saturating_sub(AEAD_TAG_LEN) }
+    }).sum();
     let mut memfile = MemFile::new(&vfs_name, total_capacity)?;
 
     for chunk in &target_file.chunks {
@@ -31,6 +34,7 @@ pub fn handle_cat(
             &chunk.nonce,
             unlocked_vault,
             chunk.offset,
+            chunk.plain_len,
             |plaintext| {
                 if let Err(e) = memfile.write_all(plaintext) {
                     eprintln!("[ERROR] Memory write failed during decryption: {:?}", e);

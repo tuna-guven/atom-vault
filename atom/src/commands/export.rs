@@ -62,7 +62,8 @@ pub fn decrypt_to_bytes(
             .map_err(|e| format!("Decryption error: {:?}", e))?,
         );
         let _mlock_guard = MlockGuard::new(&decrypted)?;
-        output.extend_from_slice(&decrypted);
+        let content = if chunk.plain_len > 0 { &decrypted[..chunk.plain_len] } else { &decrypted[..] };
+        output.extend_from_slice(content);
     }
 
     Ok(output)
@@ -144,7 +145,8 @@ pub fn handle_export(
         );
 
         let _mlock_guard = MlockGuard::new(&decrypted_bytes)?;
-        output_file.write_all(&decrypted_bytes)?;
+        let content = if chunk.plain_len > 0 { &decrypted_bytes[..chunk.plain_len] } else { &decrypted_bytes[..] };
+        output_file.write_all(content)?;
     }
 
     output_file.sync_all()?;
