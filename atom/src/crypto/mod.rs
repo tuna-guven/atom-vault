@@ -2,7 +2,7 @@
 
 use argon2::{Algorithm, Argon2, Params as Argon2Params, Version};
 use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
+    Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
 use rand::{RngCore, rngs::OsRng};
@@ -182,10 +182,10 @@ pub fn wrap_dek(
     kek: &VaultKey,
     dek: &VaultKey,
 ) -> Result<(WrappedKey, [u8; XNONCE_LEN]), chacha20poly1305::Error> {
-    let cipher = XChaCha20Poly1305::new(kek.into());
+    let cipher = XChaCha20Poly1305::new(&Key::from(*kek));
     let nonce_bytes = generate_xnonce();
-    let nonce = XNonce::from_slice(&nonce_bytes);
-    let wrapped_dek = cipher.encrypt(nonce, dek.as_ref())?;
+    let nonce = XNonce::from(nonce_bytes);
+    let wrapped_dek = cipher.encrypt(&nonce, dek.as_ref())?;
     Ok((wrapped_dek, nonce_bytes))
 }
 
@@ -195,9 +195,9 @@ pub fn unwrap_dek(
     wrapped_dek: &[u8],
     nonce_bytes: &[u8; XNONCE_LEN],
 ) -> Result<UnlockedVault, chacha20poly1305::Error> {
-    let cipher = XChaCha20Poly1305::new(kek.into());
-    let nonce = XNonce::from_slice(nonce_bytes);
-    let decrypted_dek_vec = Zeroizing::new(cipher.decrypt(nonce, wrapped_dek)?);
+    let cipher = XChaCha20Poly1305::new(&Key::from(*kek));
+    let nonce = XNonce::from(*nonce_bytes);
+    let decrypted_dek_vec = Zeroizing::new(cipher.decrypt(&nonce, wrapped_dek)?);
 
     if decrypted_dek_vec.len() != KEY_LEN {
         return Err(chacha20poly1305::Error);
@@ -214,9 +214,9 @@ pub fn encrypt_chunk(
     chunk_plaintext: &[u8],
     chunk_offset: u64,
 ) -> Result<(Vec<u8>, [u8; XNONCE_LEN]), chacha20poly1305::Error> {
-    let cipher = XChaCha20Poly1305::new(unlocked_vault.dek.as_ref().into());
+    let cipher = XChaCha20Poly1305::new(&Key::from(unlocked_vault.dek));
     let nonce_bytes = generate_xnonce();
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let nonce = XNonce::from(nonce_bytes);
 
     let offset_bytes = chunk_offset.to_le_bytes();
     let payload = Payload {
@@ -224,7 +224,7 @@ pub fn encrypt_chunk(
         aad: &offset_bytes,
     };
 
-    let ciphertext = cipher.encrypt(nonce, payload)?;
+    let ciphertext = cipher.encrypt(&nonce, payload)?;
     Ok((ciphertext, nonce_bytes))
 }
 
@@ -235,8 +235,8 @@ pub fn decrypt_chunk(
     nonce_bytes: &[u8; XNONCE_LEN],
     chunk_offset: u64,
 ) -> Result<Zeroizing<Vec<u8>>, chacha20poly1305::Error> {
-    let cipher = XChaCha20Poly1305::new(unlocked_vault.dek.as_ref().into());
-    let nonce = XNonce::from_slice(nonce_bytes);
+    let cipher = XChaCha20Poly1305::new(&Key::from(unlocked_vault.dek));
+    let nonce = XNonce::from(*nonce_bytes);
 
     let offset_bytes = chunk_offset.to_le_bytes();
     let payload = Payload {
@@ -244,6 +244,6 @@ pub fn decrypt_chunk(
         aad: &offset_bytes,
     };
 
-    let plaintext_vec = cipher.decrypt(nonce, payload)?;
+    let plaintext_vec = cipher.decrypt(&nonce, payload)?;
     Ok(Zeroizing::new(plaintext_vec))
 }

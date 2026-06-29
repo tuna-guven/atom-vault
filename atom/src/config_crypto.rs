@@ -15,7 +15,7 @@
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
-    Key, XChaCha20Poly1305, XNonce,
+    XChaCha20Poly1305, XNonce,
 };
 use rand::{rngs::OsRng, RngCore};
 use std::collections::HashMap;
@@ -116,7 +116,8 @@ pub fn encrypt_config(plaintext: &[u8]) -> Vec<u8> {
     let mut nonce_bytes = [0u8; 24];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from(nonce_bytes);
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
+    let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
+        .expect("config key is always 32 bytes");
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .expect("XChaCha20-Poly1305 encryption must not fail for a valid key");
@@ -149,9 +150,10 @@ pub fn decrypt_config(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>
         return Err("Encrypted config file is truncated — possible data corruption".into());
     }
     let (nonce_bytes, ciphertext) = payload.split_at(24);
-    let nonce = XNonce::from_slice(nonce_bytes);
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
+    let nonce = XNonce::try_from(nonce_bytes).expect("nonce slice is always 24 bytes");
+    let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
+        .expect("config key is always 32 bytes");
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| "Config decryption failed — corrupted file or keyring key mismatch".into())
 }

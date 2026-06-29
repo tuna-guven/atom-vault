@@ -25,11 +25,11 @@ where
 
     let mut noise = if is_initiator {
         Builder::new(NOISE_PATTERN.parse()?)
-            .local_private_key(&temp_keys.private)
+            .local_private_key(&temp_keys.private)?
             .build_initiator()?
     } else {
         Builder::new(NOISE_PATTERN.parse()?)
-            .local_private_key(&temp_keys.private)
+            .local_private_key(&temp_keys.private)?
             .build_responder()?
     };
 

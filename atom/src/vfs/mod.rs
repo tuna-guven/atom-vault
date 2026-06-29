@@ -1,4 +1,4 @@
-use nix::sys::memfd::{MemFdCreateFlag, memfd_create};
+use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::unistd::{Whence, ftruncate, lseek};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
@@ -94,8 +94,8 @@ impl MemFile {
         let vault_name = CString::new(vault_name)?;
 
         // Enforce CLOEXEC to prevent file descriptor leaking to child processes
-        let flags = MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING;
-        let fd = memfd_create(&vault_name, flags)?;
+        let flags = MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING;
+        let fd = memfd_create(vault_name.as_c_str(), flags)?;
 
         // Allocate strict file size
         ftruncate(&fd, vault_size as i64)?;
@@ -162,7 +162,7 @@ impl Write for MemFile {
 
 impl Read for MemFile {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        nix::unistd::read(self.fd.as_raw_fd(), buf).map_err(|e| Error::new(ErrorKind::Other, e))
+        nix::unistd::read(&self.fd, buf).map_err(|e| Error::new(ErrorKind::Other, e))
     }
 }
 
@@ -174,7 +174,7 @@ impl Seek for MemFile {
             SeekFrom::End(n) => (n, Whence::SeekEnd),
         };
 
-        let new_pos = lseek(self.fd.as_raw_fd(), offset, whence)
+        let new_pos = lseek(&self.fd, offset, whence)
             .map_err(|e| Error::new(ErrorKind::Other, e))?;
 
         Ok(new_pos as u64)
