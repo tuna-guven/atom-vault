@@ -7,11 +7,14 @@ use crate::crypto::UnlockedVault;
 use crate::sandbox;
 use crate::vfs::{FileIndex, process_secure_chunk};
 
-/// A read-only mmap of the memfd that is pinned into physical RAM with
-/// `mlock()`.  This prevents the kernel from swapping the decrypted plaintext
-/// to disk (or to the hibernation image) while the viewer is open.  Dropping
-/// the guard unlocks and unmaps the region.
-struct MlockedMap {
+/// A read-only mmap of a memfd (CLI path) or tmpfs viewer file (GUI path) that
+/// is pinned into physical RAM with `mlock()`.  This prevents the kernel from
+/// swapping the decrypted plaintext to disk (or to the hibernation image) while
+/// the viewer is open.  Dropping the guard unlocks and unmaps the region.
+///
+/// Exposed to the GUI broker (`crate::gui::broker`) so the GUI viewer can pin
+/// its tmpfs-backed plaintext with the same primitive the CLI path uses.
+pub(crate) struct MlockedMap {
     ptr: *mut libc::c_void,
     len: usize,
 }
@@ -24,7 +27,7 @@ unsafe impl Send for MlockedMap {}
 impl MlockedMap {
     /// Map `len` bytes of `fd` read-only and pin them in RAM.  A zero length
     /// yields an inert guard (mmap rejects zero-length requests).
-    fn new(fd: RawFd, len: usize) -> std::io::Result<Self> {
+    pub(crate) fn new(fd: RawFd, len: usize) -> std::io::Result<Self> {
         if len == 0 {
             return Ok(Self {
                 ptr: std::ptr::null_mut(),
@@ -72,54 +75,62 @@ impl Drop for MlockedMap {
     }
 }
 
-/// All the resources that must be torn down securely once a viewer closes
-/// (or the process is interrupted).  Held in a shared slot so that whichever
-/// of the worker thread / signal handler reaches it first performs the shred.
-struct ShredJob {
-    pid: libc::pid_t,
-    /// Strict read-only handle handed to the sandbox; closed before shredding.
-    ro_memfd: std::fs::File,
-    /// Original writable handle (created before F_SEAL_FUTURE_WRITE) used to
-    /// zero and then shrink the backing pages.
-    memfd_file: std::fs::File,
-    /// RAM pin; released only after the plaintext has been overwritten.
-    locked_map: MlockedMap,
-    /// Caller notification fired after the shred completes (normal path only).
-    on_close: Box<dyn FnOnce() + Send>,
+/// A viewer teardown that securely shreds its decrypted plaintext.  Whichever
+/// of the worker thread (normal close) or the SIGINT/SIGTERM handler (interrupt)
+/// claims the shared slot first runs the teardown exactly once.
+///
+/// Implemented by both viewer paths: `MemfdShredJob` (CLI, `memfd` + bwrap) and
+/// `crate::gui::broker`'s tmpfs job (GUI, `gio open` + tmpfs file).  This lets a
+/// single process-wide signal handler shred *every* open viewer regardless of
+/// which path opened it.
+pub(crate) trait ViewerTeardown: Send {
+    /// Normal close (worker thread): shred and fire the caller's callback.
+    fn shred_on_close(self: Box<Self>);
+    /// Interrupt (signal handler): kill any child viewer, shred, skip callback.
+    fn shred_on_signal(self: Box<Self>);
 }
 
-type ShredSlot = Arc<Mutex<Option<ShredJob>>>;
+/// Shared slot holding a single in-flight teardown.  `None` once claimed.
+pub(crate) type TeardownSlot = Arc<Mutex<Option<Box<dyn ViewerTeardown>>>>;
 
-/// Registry of in-flight viewer shred jobs.  The SIGINT handler drains this on
+/// Registry of in-flight viewer teardowns.  The SIGINT handler drains this on
 /// termination so no decrypted page survives an interrupted session.
-fn registry() -> &'static Mutex<Vec<ShredSlot>> {
-    static REGISTRY: OnceLock<Mutex<Vec<ShredSlot>>> = OnceLock::new();
+fn registry() -> &'static Mutex<Vec<TeardownSlot>> {
+    static REGISTRY: OnceLock<Mutex<Vec<TeardownSlot>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register `job` in the shared registry and return its slot.  The worker thread
+/// keeps the slot to claim the job on normal close; the signal handler claims
+/// any slots still occupied at interrupt time.  Completed slots are pruned here
+/// to keep the registry small.
+pub(crate) fn register_teardown(job: Box<dyn ViewerTeardown>) -> TeardownSlot {
+    let slot: TeardownSlot = Arc::new(Mutex::new(Some(job)));
+    let mut reg = registry().lock().unwrap();
+    reg.retain(|s| s.lock().unwrap().is_some());
+    reg.push(Arc::clone(&slot));
+    slot
 }
 
 /// Install (once) a SIGINT/SIGTERM handler that shreds every open viewer's
 /// decrypted RAM before letting the process die.  Without this, a Ctrl+C while
 /// a viewer is open would kill the detached shred thread and leave plaintext
-/// resident in memory.
-fn install_signal_handler() {
+/// resident in memory.  Idempotent: safe to call from both the CLI and GUI
+/// paths.
+pub(crate) fn install_signal_handler() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         let _ = ctrlc::set_handler(|| {
             eprintln!(
                 "\n[SIGINT] Termination requested. Shredding open viewer memory before exit..."
             );
-            let jobs: Vec<ShredSlot> = {
+            let jobs: Vec<TeardownSlot> = {
                 let mut reg = registry().lock().unwrap();
                 std::mem::take(&mut *reg)
             };
             for slot in jobs {
-                if let Some(mut job) = slot.lock().unwrap().take() {
-                    // Force-close the still-running viewer child first.
-                    unsafe { libc::kill(job.pid, libc::SIGKILL) };
-                    // Drop the on_close notifier without firing it; the process
-                    // is exiting so no one is waiting on it.
-                    job.on_close = Box::new(|| {});
-                    complete_shred(job);
+                if let Some(job) = slot.lock().unwrap().take() {
+                    job.shred_on_signal();
                 }
             }
             std::process::exit(130);
@@ -207,11 +218,41 @@ fn zero_fill(memfd_file: &mut std::fs::File) {
     let _ = memfd_file.flush();
 }
 
+/// All the resources that must be torn down securely once a CLI (memfd + bwrap)
+/// viewer closes or the process is interrupted.
+struct MemfdShredJob {
+    pid: libc::pid_t,
+    /// Strict read-only handle handed to the sandbox; closed before shredding.
+    ro_memfd: std::fs::File,
+    /// Original writable handle (created before F_SEAL_FUTURE_WRITE) used to
+    /// zero and then shrink the backing pages.
+    memfd_file: std::fs::File,
+    /// RAM pin; released only after the plaintext has been overwritten.
+    locked_map: MlockedMap,
+    /// Caller notification fired after the shred completes (normal path only).
+    on_close: Box<dyn FnOnce() + Send>,
+}
+
+impl ViewerTeardown for MemfdShredJob {
+    fn shred_on_close(self: Box<Self>) {
+        complete_shred(*self);
+    }
+
+    fn shred_on_signal(mut self: Box<Self>) {
+        // Force-close the still-running viewer child first.
+        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        // Drop the on_close notifier without firing it; the process is exiting
+        // so no one is waiting on it.
+        self.on_close = Box::new(|| {});
+        complete_shred(*self);
+    }
+}
+
 /// Securely tear down a viewer's resources: close the sandbox handle, zero the
 /// RAM while it is still locked, release the lock, shrink the file to free the
 /// pages, then fire the completion callback.
-fn complete_shred(job: ShredJob) {
-    let ShredJob {
+fn complete_shred(job: MemfdShredJob) {
+    let MemfdShredJob {
         ro_memfd,
         mut memfd_file,
         locked_map,
@@ -281,20 +322,13 @@ where
 
     // Register the teardown resources in a shared slot so either the worker
     // thread (normal close) or the SIGINT handler (interrupt) can shred them.
-    let slot: ShredSlot = Arc::new(Mutex::new(Some(ShredJob {
+    let slot = register_teardown(Box::new(MemfdShredJob {
         pid,
         ro_memfd,
         memfd_file,
         locked_map,
         on_close: Box::new(on_close),
-    })));
-
-    {
-        let mut reg = registry().lock().unwrap();
-        // Prune slots whose job already completed to keep the registry small.
-        reg.retain(|s| s.lock().unwrap().is_some());
-        reg.push(Arc::clone(&slot));
-    }
+    }));
 
     std::thread::spawn(move || {
         // Wrap waitpid so a panic here still proceeds to shredding.
@@ -307,7 +341,7 @@ where
         // Take ownership of the job; if the signal handler already claimed it,
         // this is None and we do nothing.
         if let Some(job) = slot.lock().unwrap().take() {
-            complete_shred(job);
+            job.shred_on_close();
         }
     });
 
