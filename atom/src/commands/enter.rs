@@ -55,8 +55,7 @@ pub fn handle_enter(vault_path: String) -> Result<(), Box<dyn std::error::Error>
         let ro: &[&Path] = &[Path::new("/usr"), Path::new("/etc")];
         let rw: &[&Path] = &[vault_path_ref, staging_path_ref];
 
-        let status = crate::sandbox::apply_process_sandbox(ro, rw)?;
-        crate::sandbox::log_sandbox_status(status);
+        crate::sandbox::apply_process_sandbox(ro, rw)?;
     }
 
     crate::commands::shell::start_interactive_shell(

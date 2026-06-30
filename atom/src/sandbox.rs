@@ -6,18 +6,6 @@ use std::ptr;
 
 // ── Landlock inner sandbox ────────────────────────────────────────────────────
 
-/// Outcome reported by [apply_process_sandbox].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LandlockStatus {
-    /// Every requested access flag was recognised and enforced by the kernel.
-    FullyEnforced,
-    /// The kernel supports Landlock but predates some requested ABI flags;
-    /// the sandbox is still active with the rights the kernel understands.
-    PartiallyEnforced,
-    /// The running kernel has no Landlock support; the process is unrestricted.
-    NotEnforced,
-}
-
 /// Applies a Landlock LSM filesystem ruleset to the **calling thread**.
 ///
 /// After this call, the calling thread (and any threads it spawns) can only
@@ -29,66 +17,113 @@ pub enum LandlockStatus {
 /// when this is called are not restricted. Only the calling thread and the
 /// threads it creates afterwards are bound by the returned domain.
 ///
-/// **Graceful degradation**: Returns [`LandlockStatus::NotEnforced`] (not an
-/// error) when the kernel does not include Landlock support, so the caller can
-/// decide whether to abort or continue unprotected. Kernels with a Landlock
-/// ABI older than V5 produce [`LandlockStatus::PartiallyEnforced`]; the sandbox
-/// is still active but may cover fewer access types.
+/// **Fail closed**: the ruleset is always built as a
+/// [`CompatLevel::HardRequirement`](landlock::CompatLevel::HardRequirement), so
+/// a kernel that cannot honour every requested access right makes this function
+/// return `Err` instead of silently degrading. Partial enforcement is never
+/// accepted — callers must propagate the error and refuse to run. Atom Vault
+/// targets modern kernels (Landlock ABI ≥ V5, Linux 6.10+; ABI 8 on current
+/// kernels fully satisfies it).
 ///
 /// Paths that do not exist on the current machine are silently skipped; this
 /// makes the function safe to call with distro-specific optional paths.
 pub fn apply_process_sandbox(
     read_only_paths: &[&Path],
     read_write_paths: &[&Path],
-) -> Result<LandlockStatus, Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     use landlock::{
         Access, AccessFs, ABI,
+        CompatLevel, Compatible,
         PathBeneath, PathFd,
         Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
     };
 
-    // Target V5 (Linux 6.10). The landlock crate degrades automatically to
-    // whatever ABI the running kernel actually supports; the returned status
-    // tells the caller which level was achieved.
+    // `IoctlDev` (V5) is the last filesystem access right Landlock defines, so
+    // `AccessFs::from_all(V5)` is the complete FS right set — V6 adds only
+    // socket/signal scoping and V7 only audit logging, neither an FS right.
     let abi = ABI::V5;
-    let all_rights = AccessFs::from_all(abi);
 
-    // Read-only includes Execute so that fork+exec of helper programs (bwrap,
-    // flatpak) inside sandboxed threads can still find their binaries under
-    // /usr without us granting write access to the system hierarchy.
-    let ro_rights = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+    // A Landlock rule's rights must match the target's type: directory-only
+    // rights (ReadDir, MakeDir, Refer, …) are invalid on a regular file. Under
+    // HardRequirement that mismatch is a hard error (not a silent narrowing),
+    // so we request exactly the right subset per path:
+    //   - directories → the full set (`from_all`) / read+exec+listing for RO
+    //   - regular files → the file-applicable subset (`from_file`) / read+exec
+    // Read-only includes Execute so fork+exec of helper programs (bwrap,
+    // flatpak) can still find their binaries under /usr.
+    let dir_rw = AccessFs::from_all(abi);
+    let file_rw = AccessFs::from_file(abi);
+    let dir_ro = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+    let file_ro = AccessFs::ReadFile | AccessFs::Execute;
 
+    // HardRequirement: the kernel must support every requested access right.
+    // On any kernel that cannot, `handle_access`/`create`/`restrict_self` return
+    // an error (propagated by `?`) instead of dropping rights — the process then
+    // aborts rather than running partially confined.
     let mut ruleset = Ruleset::default()
-        .handle_access(all_rights)?
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(dir_rw)?
         .create()?;
 
+    // Empirical allow-list discovery (Phase 1). When ATOM_LANDLOCK_AUDIT is set
+    // in the environment we ask the kernel (Landlock ABI V7, Linux 6.14+) to
+    // record *denied* accesses in the audit log, including those from helper
+    // programs we exec after restriction (bwrap, flatpak, zathura). Watch them
+    // live with `journalctl -k -f` or `dmesg -w` and grep for "landlock".
+    //
+    // Same-exec denials (the atom process itself) are logged by the kernel by
+    // default; `log_new_exec(true)` extends that to exec'd children so the whole
+    // process tree's missing paths surface in one place. Audit logging is a V7
+    // feature, so under HardRequirement this requires a Landlock V7+ kernel —
+    // fine for the modern kernels this tool targets, and it is opt-in for dev.
+    if std::env::var_os("ATOM_LANDLOCK_AUDIT").is_some() {
+        ruleset = ruleset.log_new_exec(true)?;
+        eprintln!(
+            "[Sandbox] Landlock audit logging enabled (ATOM_LANDLOCK_AUDIT). \
+             Denied accesses → `journalctl -k -f` / `dmesg -w` (grep landlock)."
+        );
+    }
+
+    // Missing/inaccessible paths are skipped (distro-specific optional dirs);
+    // `metadata()` also tells us whether to grant directory or file rights.
     for &path in read_only_paths {
-        if !path.exists() {
-            continue;
-        }
-        match PathFd::new(path) {
-            Ok(fd) => ruleset = ruleset.add_rule(PathBeneath::new(fd, ro_rights))?,
+        let rights = match std::fs::metadata(path) {
+            Ok(m) if m.is_dir() => dir_ro,
+            Ok(_) => file_ro,
             Err(_) => continue,
+        };
+        if let Ok(fd) = PathFd::new(path) {
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, rights))?;
         }
     }
 
     for &path in read_write_paths {
-        if !path.exists() {
-            continue;
-        }
-        match PathFd::new(path) {
-            Ok(fd) => ruleset = ruleset.add_rule(PathBeneath::new(fd, all_rights))?,
+        let rights = match std::fs::metadata(path) {
+            Ok(m) if m.is_dir() => dir_rw,
+            Ok(_) => file_rw,
             Err(_) => continue,
+        };
+        if let Ok(fd) = PathFd::new(path) {
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, rights))?;
         }
     }
 
     let status = ruleset.restrict_self()?;
 
-    Ok(match status.ruleset {
-        RulesetStatus::FullyEnforced => LandlockStatus::FullyEnforced,
-        RulesetStatus::PartiallyEnforced => LandlockStatus::PartiallyEnforced,
-        RulesetStatus::NotEnforced => LandlockStatus::NotEnforced,
-    })
+    // HardRequirement should already have errored on an inadequate kernel, but
+    // defend against any path where restrict_self still reports less than full
+    // enforcement (e.g. no_new_privs refused) — refuse to continue.
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => {
+            eprintln!("[Sandbox] Landlock inner sandbox: fully enforced.");
+            Ok(())
+        }
+        other => Err(format!(
+            "Landlock could not be fully enforced (status: {:?}); refusing to continue",
+            other
+        )
+        .into()),
+    }
 }
 
 /// Activates the GUI Landlock sandbox for a single, specific vault file.
@@ -157,31 +192,16 @@ pub fn apply_gui_vault_sandbox(vault_path: &Path) {
         atom_data_dir.as_path(),
     ];
 
-    match apply_process_sandbox(&ro, &rw) {
-        Ok(s) => log_sandbox_status(s),
-        Err(e) => eprintln!("[Sandbox] Warning: could not apply Landlock: {}", e),
-    }
-}
-
-/// Logs the sandbox outcome to stderr using the standard `[Sandbox]` prefix.
-/// Called at each activation site so log output is consistent and searchable.
-pub fn log_sandbox_status(status: LandlockStatus) {
-    match status {
-        LandlockStatus::FullyEnforced => {
-            eprintln!("[Sandbox] Landlock inner sandbox: fully enforced (ABI V5).");
-        }
-        LandlockStatus::PartiallyEnforced => {
-            eprintln!(
-                "[Sandbox] Landlock inner sandbox: partially enforced \
-                 (kernel ABI < V5 — some access flags unavailable)."
-            );
-        }
-        LandlockStatus::NotEnforced => {
-            eprintln!(
-                "[Sandbox] Warning: Landlock LSM not supported on this kernel. \
-                 Process filesystem access is unrestricted."
-            );
-        }
+    // A sandbox failure is fatal: refuse to expose the unlocked vault on a
+    // process whose filesystem access could not be fully confined.
+    if let Err(e) = apply_process_sandbox(&ro, &rw) {
+        eprintln!(
+            "[Sandbox] FATAL: could not enforce Landlock: {}. \
+             This build requires a kernel with full Landlock support \
+             (ABI V5+, Linux 6.10+). Refusing to open the vault unprotected.",
+            e
+        );
+        std::process::exit(1);
     }
 }
 
@@ -725,20 +745,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sandbox_status_variants_are_distinct() {
-        assert_ne!(LandlockStatus::FullyEnforced, LandlockStatus::PartiallyEnforced);
-        assert_ne!(LandlockStatus::FullyEnforced, LandlockStatus::NotEnforced);
-        assert_ne!(LandlockStatus::PartiallyEnforced, LandlockStatus::NotEnforced);
-    }
-
-    #[test]
-    fn log_sandbox_status_does_not_panic() {
-        // Smoke-test: log_sandbox_status must not panic for any variant.
-        log_sandbox_status(LandlockStatus::FullyEnforced);
-        log_sandbox_status(LandlockStatus::PartiallyEnforced);
-        log_sandbox_status(LandlockStatus::NotEnforced);
-    }
 
     // ── extract_dbus_socket_path ─────────────────────────────────────────────
 
