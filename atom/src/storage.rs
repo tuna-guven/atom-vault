@@ -32,9 +32,8 @@ pub fn load_vault_metadata(
 
     file.seek(SeekFrom::Start(master_pointer))?;
 
-    let mut metadata_nonce = [0u8; XNONCE_LEN];
-    file.read_exact(&mut metadata_nonce)?;
-
+    // The v1 blob is self-describing (magic || salt || nonce || ct||tag), so the
+    // nonce is no longer read out of band here.
     let mut encrypted_metadata = Vec::new();
     file.take(10 * 1024 * 1024)
         .read_to_end(&mut encrypted_metadata)?;
@@ -42,8 +41,7 @@ pub fn load_vault_metadata(
     let decrypted_metadata_bytes = crate::crypto::decrypt_chunk(
         &unlocked_vault,
         &encrypted_metadata,
-        &metadata_nonce,
-        master_pointer,
+        &crate::crypto::METADATA_FILE_ID,
     )
     .map_err(|e| format!("Metadata decrypt error: {:?}", e))?;
 
@@ -64,13 +62,15 @@ pub fn save_vault_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serialized_metadata = bincode::serialize(metadata)?;
 
-    let (encrypted_metadata, metadata_nonce) =
-        crate::crypto::encrypt_chunk(unlocked_vault, &serialized_metadata, current_payload_offset)
-            .map_err(|e| format!("Metadata encrypt error: {:?}", e))?;
+    let encrypted_metadata = crate::crypto::encrypt_chunk(
+        unlocked_vault,
+        &serialized_metadata,
+        &crate::crypto::METADATA_FILE_ID,
+    )
+    .map_err(|e| format!("Metadata encrypt error: {:?}", e))?;
 
     file.seek(SeekFrom::Start(current_payload_offset))?;
 
-    file.write_all(&metadata_nonce)?;
     file.write_all(&encrypted_metadata)?;
 
     // Truncate to the exact end of the new metadata block.  Without this, residual

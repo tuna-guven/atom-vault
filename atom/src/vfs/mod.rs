@@ -8,10 +8,16 @@ use zeroize::Zeroize;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChunkEntry {
+    /// Length of the complete on-disk v1 blob, including the magic prefix,
+    /// per-chunk salt, nonce and AEAD tag.
     pub cipher_len: usize,
     pub offset: u64,
-    // TODO: Replace random bytes with deterministic nonce generation using a Merkle tree approach
-    pub nonce: [u8; crate::crypto::XNONCE_LEN],
+    /// Random per-chunk identifier. Feeds both the HKDF `info` and the AEAD's
+    /// AAD, binding the blob to this specific chunk.
+    ///
+    /// The former `nonce` field is gone: the nonce now travels inside the blob
+    /// itself (§7), alongside the per-chunk salt.
+    pub file_id: [u8; crate::crypto::FILE_ID_LEN],
     /// Actual plaintext length before uniform padding.  Zero means "no padding"
     /// (legacy vaults written before uniform-padding was introduced).
     #[serde(default)]
@@ -40,7 +46,7 @@ pub struct VaultMetadata {
 pub fn process_secure_chunk<F>(
     physical_vault: &mut std::fs::File,
     cipher_len: usize,
-    nonce: &[u8; crate::crypto::XNONCE_LEN],
+    file_id: &[u8; crate::crypto::FILE_ID_LEN],
     unlocked_vault: &crate::crypto::UnlockedVault,
     chunk_offset: u64,
     plain_len: usize,
@@ -52,7 +58,7 @@ pub fn process_secure_chunk<F>(
     let mut cipher_buffer = vec![0u8; cipher_len];
     physical_vault.read_exact(&mut cipher_buffer)?;
 
-    let mut secure_plaintext = crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, nonce, chunk_offset)
+    let mut secure_plaintext = crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, file_id)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Decryption error: {:?}", e)))?;
 
     // Lock memory page to prevent OS from swapping plaintext to disk

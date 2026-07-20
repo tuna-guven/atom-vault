@@ -17,20 +17,31 @@ pub fn handle_vacuum(
         .open(&tmp_path)
         .map_err(|e| format!("Failed to create vacuum temp file: {:?}", e))?;
 
-    let header_size: u64 = 112;
-    
+    // Header size comes from the shared constant rather than a literal. This
+    // used to be a hardcoded 112 — the pre-KdfSettings value — which copied only
+    // 112 of the 125 header bytes and then started writing chunk data at offset
+    // 112, overwriting the last 13 bytes of the wrapped DEK. The vault became
+    // permanently unopenable on the next unwrap.
+    let header_size: u64 = crate::crypto::VAULT_HEADER_SIZE;
+
     // Geçici olarak Master Pointer alanını (8 bayt) 0 ile doldur, sonra güncelleyeceğiz
     tmp_file.write_all(&[0u8; 8])?;
 
     // Header'ın geri kalanını kopyala (Master Salt, KDF parametreleri vs.)
     physical_vault.seek(SeekFrom::Start(8))?;
-    let mut header_rest = [0u8; 104];
+    let mut header_rest = vec![0u8; (header_size - 8) as usize];
     physical_vault.read_exact(&mut header_rest)?;
     tmp_file.write_all(&header_rest)?;
 
     let mut new_payload_offset = header_size;
 
-    // Sadece silinmemiş, aktif chunk'ları yeni dosyaya sıkıştırarak yaz
+    // Sadece silinmemiş, aktif chunk'ları yeni dosyaya sıkıştırarak yaz.
+    //
+    // Relocation is a pure byte-copy: a chunk's key derives from its random
+    // file_salt and file_id, and its AAD binds the file_id — never the physical
+    // offset. Moving a blob therefore cannot invalidate its tag. (Before the v1
+    // format the offset was the AAD, so this loop silently broke every chunk it
+    // moved.)
     for file_index in &mut metadata.file_table {
         for chunk in &mut file_index.chunks {
             physical_vault.seek(SeekFrom::Start(chunk.offset))?;

@@ -69,18 +69,18 @@ pub fn handle_import_from_bytes(
         rand::rngs::OsRng.fill_bytes(&mut padded[plain_len..]);
 
         let _mlock_guard = MlockGuard::new(&padded)?;
-        let (ciphertext, chunk_nonce) =
-            crypto::encrypt_chunk(unlocked_vault, &padded, *current_payload_offset)
-                .map_err(|e| format!("Encryption error: {:?}", e))?;
+        let file_id = crypto::generate_file_id();
+        let blob = crypto::encrypt_chunk(unlocked_vault, &padded, &file_id)
+            .map_err(|e| format!("Encryption error: {:?}", e))?;
 
-        physical_vault.write_all(&ciphertext)?;
+        physical_vault.write_all(&blob)?;
         new_chunks.push(ChunkEntry {
-            cipher_len: ciphertext.len(),
+            cipher_len: blob.len(),
             offset: *current_payload_offset,
-            nonce: chunk_nonce,
+            file_id,
             plain_len,
         });
-        *current_payload_offset += ciphertext.len() as u64;
+        *current_payload_offset += blob.len() as u64;
     }
 
     metadata.file_table.push(FileIndex {
@@ -180,22 +180,22 @@ pub fn handle_import(
         let _mlock_guard = MlockGuard::new(&padded)?;
 
         // Pass immutable reference safely without triggering an exclusive borrow checker conflict
-        let (ciphertext, chunk_nonce) =
-            crypto::encrypt_chunk(&unlocked_vault, &padded, *current_payload_offset)
-                .map_err(|e| format!("Encryption error: {:?}", e))?;
+        let file_id = crypto::generate_file_id();
+        let blob = crypto::encrypt_chunk(&unlocked_vault, &padded, &file_id)
+            .map_err(|e| format!("Encryption error: {:?}", e))?;
 
-        if let Err(e) = physical_vault.write_all(&ciphertext) {
+        if let Err(e) = physical_vault.write_all(&blob) {
             return Err(e.into());
         }
 
         new_chunks.push(ChunkEntry {
-            cipher_len: ciphertext.len(),
+            cipher_len: blob.len(),
             offset: *current_payload_offset,
-            nonce: chunk_nonce,
+            file_id,
             plain_len,
         });
 
-        *current_payload_offset += ciphertext.len() as u64;
+        *current_payload_offset += blob.len() as u64;
     }
 
     metadata.file_table.push(FileIndex {

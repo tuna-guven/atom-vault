@@ -53,13 +53,8 @@ pub fn decrypt_to_bytes(
         physical_vault.read_exact(&mut cipher_buffer)?;
 
         let decrypted = zeroize::Zeroizing::new(
-            crate::crypto::decrypt_chunk(
-                unlocked_vault,
-                &cipher_buffer,
-                &chunk.nonce,
-                chunk.offset,
-            )
-            .map_err(|e| format!("Decryption error: {:?}", e))?,
+            crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, &chunk.file_id)
+                .map_err(|e| format!("Decryption error: {:?}", e))?,
         );
         let _mlock_guard = MlockGuard::new(&decrypted)?;
         let content = if chunk.plain_len > 0 { &decrypted[..chunk.plain_len] } else { &decrypted[..] };
@@ -135,13 +130,8 @@ pub fn handle_export(
         physical_vault.read_exact(&mut cipher_buffer)?;
 
         let decrypted_bytes = zeroize::Zeroizing::new(
-            crate::crypto::decrypt_chunk(
-                unlocked_vault,
-                &cipher_buffer,
-                &chunk.nonce,
-                chunk.offset,
-            )
-            .map_err(|e| format!("Decryption error: {:?}", e))?,
+            crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, &chunk.file_id)
+                .map_err(|e| format!("Decryption error: {:?}", e))?,
         );
 
         let _mlock_guard = MlockGuard::new(&decrypted_bytes)?;

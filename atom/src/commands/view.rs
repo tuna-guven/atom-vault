@@ -239,7 +239,7 @@ pub fn prepare_decrypted_memfd(
         process_secure_chunk(
             physical_vault,
             chunk.cipher_len,
-            &chunk.nonce,
+            &chunk.file_id,
             unlocked_vault,
             chunk.offset,
             chunk.plain_len,
