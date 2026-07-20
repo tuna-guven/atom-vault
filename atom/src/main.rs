@@ -27,6 +27,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Purging volatile process memory and enforcing immediate emergency exit.");
     }));
 
+    // Raise the soft RLIMIT_MEMLOCK to the hard limit so viewers can pin as much
+    // plaintext in RAM as the system allows.  Before the bwrap re-exec so the
+    // raised limit is inherited.
+    crate::commands::view::raise_memlock_limit();
+
     // Load (or generate) the config-file encryption key from GNOME Keyring.
     // Must run before any config I/O and before the bwrap exec so the key is
     // available in both the original and re-exec'd process.

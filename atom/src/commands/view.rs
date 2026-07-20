@@ -55,10 +55,89 @@ impl MlockedMap {
         if unsafe { libc::mlock(ptr, len) } != 0 {
             let err = std::io::Error::last_os_error();
             unsafe { libc::munmap(ptr, len) };
+
+            // The pin only exists to keep decrypted plaintext off persistent
+            // storage (a disk swap device or the hibernation image).  When the
+            // lock cannot fit the per-process `RLIMIT_MEMLOCK` budget (`ENOMEM`)
+            // but no such storage path exists — no disk-backed swap and no
+            // hibernation — the plaintext physically cannot reach disk, so an
+            // unpinned mapping is just as safe.  Proceed with an inert guard.
+            //
+            // This is scoped narrowly: only `ENOMEM` (the budget case) is
+            // tolerated, and only when `disk_persistence_possible()` is provably
+            // false.  Any other error, or any system with a real swap/hibernation
+            // target, still fails closed.
+            if err.raw_os_error() == Some(libc::ENOMEM) && !disk_persistence_possible() {
+                eprintln!(
+                    "Note: viewer plaintext is not RAM-pinned ({} B exceeds the \
+                     RLIMIT_MEMLOCK budget), but this host has no disk-backed swap \
+                     and hibernation is unavailable, so it cannot reach disk.",
+                    len
+                );
+                return Ok(Self {
+                    ptr: std::ptr::null_mut(),
+                    len: 0,
+                });
+            }
             return Err(err);
         }
 
         Ok(Self { ptr, len })
+    }
+}
+
+/// Raise this process's soft `RLIMIT_MEMLOCK` to its hard limit so the viewer can
+/// pin as much plaintext as the system permits without privilege.  Called once at
+/// startup, before the bwrap re-exec, so the raised soft limit is inherited.
+///
+/// Unprivileged processes may raise the soft limit up to the hard limit but not
+/// beyond; where the hard limit is already the ceiling this is a no-op.  Failure
+/// is non-fatal — `MlockedMap::new` still enforces the actual pin-or-fail policy.
+pub(crate) fn raise_memlock_limit() {
+    unsafe {
+        let mut lim = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+            lim.rlim_cur = lim.rlim_max;
+            let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim);
+        }
+    }
+}
+
+/// Returns `true` if decrypted plaintext held in RAM could be written to
+/// persistent storage by the kernel — i.e. a disk-backed swap device is active.
+/// (Hibernation likewise requires a disk swap target, so this single check
+/// covers both vectors.)  Fails safe: any uncertainty returns `true`.
+fn disk_persistence_possible() -> bool {
+    let swaps = match std::fs::read_to_string("/proc/swaps") {
+        Ok(s) => s,
+        // Cannot determine the swap configuration — assume the worst.
+        Err(_) => return true,
+    };
+    // Skip the header row; each remaining row's first field is the device.
+    for line in swaps.lines().skip(1) {
+        let Some(dev) = line.split_whitespace().next() else {
+            continue;
+        };
+        if is_ram_only_zram(dev) {
+            continue;
+        }
+        return true; // a disk-backed swap (partition or file) is active
+    }
+    false
+}
+
+/// Returns `true` only for a zram device with no writeback `backing_dev` — such a
+/// device lives entirely in RAM and never spills to disk.  A zram with a backing
+/// device, or any non-zram swap, is treated as disk-backed.  Fails safe: if the
+/// backing state cannot be read, the device is not considered RAM-only.
+fn is_ram_only_zram(dev: &str) -> bool {
+    let name = dev.rsplit('/').next().unwrap_or(dev);
+    if !name.starts_with("zram") {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/sys/block/{}/backing_dev", name)) {
+        Ok(s) => s.trim() == "none",
+        Err(_) => false,
     }
 }
 

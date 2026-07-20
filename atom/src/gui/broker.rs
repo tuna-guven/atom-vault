@@ -408,7 +408,9 @@ fn wait_for_viewer_exit(mut child: std::process::Child, path: &Path) {
 ///
 /// Resolution: `xdg-mime query filetype` → `xdg-mime query default` (these are
 /// pure lookups, no portal) → locate the `.desktop` file → parse its `Exec`
-/// line and substitute the file path for the field codes.
+/// line and substitute the file path for the field codes.  A flatpak handler is
+/// rewritten by [`rewrite_flatpak_argv`] to bind-mount the staging dir directly
+/// rather than route the file through the document portal.
 fn resolve_viewer_command(path: &Path) -> Result<std::process::Command, String> {
     let path_str = path.to_string_lossy().to_string();
 
@@ -422,27 +424,101 @@ fn resolve_viewer_command(path: &Path) -> Result<std::process::Command, String> 
     let exec = parse_exec(&desktop)
         .ok_or_else(|| format!("No Exec line in {}", desktop.display()))?;
 
-    let argv = build_argv(&exec, &path_str);
+    let mut argv = build_argv(&exec, &path_str);
     if argv.is_empty() {
         return Err(format!("Empty Exec command in {}", desktop.display()));
     }
 
-    // Refuse handlers that re-enter the portal/FUSE world we are avoiding.  A
-    // Flatpak viewer cannot read our XDG_RUNTIME_DIR tmpfs without the document
-    // portal anyway, so launching it directly would only fail (or force a portal
-    // round-trip), defeating the purpose.
+    // A flatpak handler is not refused outright — the surface we avoid is the
+    // document portal's FUSE mount, not flatpak itself.  Rewrite the invocation
+    // so the sandboxed viewer reads our staged plaintext through a direct bwrap
+    // bind-mount of the staging dir instead of `xdg-document-portal` (issue #29).
     if argv[0] == "flatpak" || argv[0].ends_with("/flatpak") {
-        return Err(format!(
-            "Default handler '{}' launches via flatpak/portal; refusing to expose \
-             plaintext through the document-portal FUSE layer. Set a native viewer \
-             as the default for {}.",
-            desktop_id, mime
-        ));
+        argv = rewrite_flatpak_argv(argv, path)?;
     }
 
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     Ok(cmd)
+}
+
+/// Rewrite a flatpak handler's argv so the viewer reads our staged plaintext via
+/// a direct bwrap bind-mount instead of the XDG document portal.
+///
+/// The exported `.desktop` Exec for a flatpak app routes files through the portal:
+///
+/// ```text
+/// flatpak run --branch=… --arch=… --command=… --file-forwarding APP @@u %U @@
+/// ```
+///
+/// `--file-forwarding` plus the `@@u … @@` markers hand the file to the sandbox
+/// over `xdg-document-portal`'s FUSE mount (and its SUID `fusermount3` helper) —
+/// the exact privilege-escalation surface we avoid.  We strip that machinery and
+/// instead grant the sandbox a read-only bind-mount of *only the staged file*,
+/// sever its network, and tie its lifetime to ours:
+///
+/// ```text
+/// flatpak run --unshare=network --die-with-parent --filesystem=<staged-file>:ro \
+///     --branch=… --arch=… --command=… APP <staged-file>
+/// ```
+///
+/// Binding the single file (not the staging dir) keeps any other plaintext staged
+/// concurrently invisible to the viewer.  The viewer still runs inside its own
+/// flatpak sandbox — a confinement *upgrade* over a bare native viewer — but the
+/// decrypted bytes never transit the portal.
+fn rewrite_flatpak_argv(argv: Vec<String>, staged_file: &Path) -> Result<Vec<String>, String> {
+    // A flatpak app cannot itself spawn `flatpak run`; doing so from within a
+    // sandbox would need the `org.freedesktop.Flatpak` host-spawn hole, which
+    // would undermine atom's own confinement (it holds the DEK in RAM).  Refuse
+    // rather than silently escalate — atom is meant to run as a native binary.
+    if Path::new("/.flatpak-info").exists() {
+        return Err(
+            "atom is running inside a flatpak sandbox and cannot launch a host \
+             flatpak viewer without opening the org.freedesktop.Flatpak host-spawn \
+             hole. Install atom as a native binary so it can drive viewers directly."
+                .to_string(),
+        );
+    }
+
+    let run_idx = argv
+        .iter()
+        .position(|a| a == "run")
+        .ok_or_else(|| "Unrecognised flatpak invocation (no `run` subcommand)".to_string())?;
+
+    let mut out = Vec::with_capacity(argv.len() + 3);
+    out.push(argv[0].clone()); // flatpak
+    out.push("run".to_string());
+    // Sandbox overrides must precede the app ref.
+    out.push("--unshare=network".to_string());
+    out.push("--die-with-parent".to_string());
+    out.push(format!("--filesystem={}", flatpak_filesystem_spec(staged_file)));
+
+    // Carry over the original `flatpak run` options / app-id / path, dropping the
+    // document-portal forwarding machinery.  `build_argv` has already substituted
+    // the staged path in place of `%U`, so it survives between the `@@` markers.
+    for tok in &argv[run_idx + 1..] {
+        if tok == "--file-forwarding" || tok == "@@" || tok == "@@u" {
+            continue;
+        }
+        out.push(tok.clone());
+    }
+    Ok(out)
+}
+
+/// Express `path` as a flatpak `--filesystem` value, preferring the portable
+/// `xdg-run/…` token when it lives under `$XDG_RUNTIME_DIR` so flatpak maps it to
+/// the sandbox's runtime dir at the *same* absolute path — keeping the staged
+/// path we pass on the command line valid inside the sandbox (and keeping the
+/// `/proc/<pid>/fd` lifetime check in `is_file_open` matching).
+fn flatpak_filesystem_spec(path: &Path) -> String {
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        if !runtime.is_empty() {
+            if let Ok(rel) = path.strip_prefix(&runtime) {
+                return format!("xdg-run/{}:ro", rel.display());
+            }
+        }
+    }
+    format!("{}:ro", path.display())
 }
 
 /// Determine the MIME type of `path` via `xdg-mime`, falling back to a small
