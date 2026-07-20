@@ -4,7 +4,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::commands::daemon::SyncResponse;
-use super::{AtomVaultApp, Screen};
+use crate::commands::direct::{self, PaddingProfile};
+use super::{AtomVaultApp, DirectRole, DirectStage, Screen, TransportTab};
 
 // ── Pure helpers (tested below) ───────────────────────────────────────────────
 
@@ -138,6 +139,43 @@ impl AtomVaultApp {
                     .inner_margin(Margin::symmetric(18.0, 14.0)),
             )
             .show(ctx, |ui| {
+                // ── Transport selector ────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (TransportTab::Tor, "Tor (live sync)"),
+                        (TransportTab::Direct, "Direct — no Tor (async)"),
+                    ] {
+                        let selected = self.transport_tab == tab;
+                        let (fill, stroke_c) = if selected {
+                            (ACCENT_DARK, ACCENT)
+                        } else {
+                            (BADGE_BG, CARD_STROKE)
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(label).size(13.5).color(if selected {
+                                        Color32::WHITE
+                                    } else {
+                                        TEXT_SECONDARY
+                                    }),
+                                )
+                                .fill(fill)
+                                .stroke(Stroke::new(1.0, stroke_c)),
+                            )
+                            .clicked()
+                        {
+                            self.transport_tab = tab;
+                        }
+                    }
+                });
+                ui.add_space(12.0);
+
+                if self.transport_tab == TransportTab::Direct {
+                    self.show_direct_panel(ui);
+                    return;
+                }
+
                 egui::ScrollArea::vertical()
                     .id_salt("p2p_scroll")
                     .show(ui, |ui| {
@@ -317,6 +355,514 @@ impl AtomVaultApp {
             });
     }
 
+    // ── Non-Tor Mode A (blind store) panel ────────────────────────────────────
+
+    /// Clear the handshake *and* the shared slots a background thread may have
+    /// written. Without clearing those, `poll_direct_results` would immediately
+    /// restore the stale status on the next frame.
+    fn reset_direct(&mut self) {
+        self.direct.reset_handshake();
+        if let Ok(mut lock) = self.direct_status_shared.lock() {
+            lock.clear();
+        }
+        if let Ok(mut slot) = self.direct_sealed_result.lock() {
+            *slot = None;
+        }
+    }
+
+    pub(super) fn show_direct_panel(&mut self, ui: &mut egui::Ui) {
+        let busy = !self.direct_done.load(Ordering::SeqCst);
+
+        egui::ScrollArea::vertical()
+            .id_salt("direct_scroll")
+            .show(ui, |ui| {
+                // ── Threat-model notice (kept visible, per spec §10) ──────────
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(48, 38, 14))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(120, 95, 30)))
+                    .rounding(Rounding::same(6.0))
+                    .inner_margin(Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Non-Tor transfer. The blind store sees only equal-sized, \
+                                 opaque ciphertext under random IDs — never your vault, its \
+                                 size, or who downloads it. But your ISP and the store do see \
+                                 that you connected to the store: upload from behind a VPN if \
+                                 that matters. The short secret below is the root of trust — \
+                                 share it in person or over Signal, never alongside the blobs.",
+                            )
+                            .size(12.0)
+                            .color(Color32::from_rgb(235, 205, 130)),
+                        );
+                    });
+                ui.add_space(14.0);
+
+                // ── Role ──────────────────────────────────────────────────────
+                section_label(ui, "ROLE");
+                card_frame(CARD_BG, CARD_STROKE).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (role, label) in [
+                            (DirectRole::Send, "Send a vault"),
+                            (DirectRole::Receive, "Receive a vault"),
+                        ] {
+                            let selected = self.direct.role == role;
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(label).size(13.5).color(if selected {
+                                            Color32::WHITE
+                                        } else {
+                                            TEXT_SECONDARY
+                                        }),
+                                    )
+                                    .fill(if selected { ACCENT_DARK } else { BADGE_BG })
+                                    .stroke(Stroke::new(
+                                        1.0,
+                                        if selected { ACCENT } else { CARD_STROKE },
+                                    )),
+                                )
+                                .clicked()
+                                && !selected
+                            {
+                                self.direct.role = role;
+                                self.reset_direct();
+                            }
+                        }
+                    });
+                });
+                ui.add_space(16.0);
+
+                // ── Step 1: short secret ──────────────────────────────────────
+                section_label(ui, "STEP 1 — SHARED SHORT SECRET");
+                card_frame(CARD_BG, CARD_STROKE).show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Both sides type the same short, single-use secret. Agree on it \
+                             out-of-band — this is what protects the capability.",
+                        )
+                        .size(12.0)
+                        .color(TEXT_SECONDARY),
+                    );
+                    ui.add_space(6.0);
+
+                    let editable = self.direct.stage == DirectStage::Secret;
+                    let resp = ui.add_enabled(
+                        editable,
+                        egui::TextEdit::singleline(&mut self.direct.short_secret)
+                            .hint_text("e.g. seven word diceware phrase")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if resp.changed() {
+                        // Any edit invalidates a started handshake.
+                        self.direct.our_blob.clear();
+                    }
+                    ui.add_space(8.0);
+
+                    if editable {
+                        let btn = egui::Button::new(
+                            RichText::new("Begin handshake")
+                                .size(14.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(ACCENT_DARK)
+                        .stroke(Stroke::new(1.0, ACCENT));
+
+                        if ui.add_sized([ui.available_width(), 34.0], btn).clicked() {
+                            match direct::begin_handshake(&self.direct.short_secret) {
+                                Ok((state, blob)) => {
+                                    self.direct.spake_state = Some(state);
+                                    self.direct.our_blob = blob;
+                                    self.direct.stage = DirectStage::Exchange;
+                                    self.direct.status =
+                                        "Send your handshake message to your peer.".to_string();
+                                }
+                                Err(e) => self.direct.status = format!("Failed: {}", e),
+                            }
+                        }
+                    } else if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Restart handshake").size(13.0).color(DANGER),
+                            )
+                            .fill(Color32::from_rgb(55, 22, 20))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(140, 50, 45))),
+                        )
+                        .clicked()
+                    {
+                        self.reset_direct();
+                    }
+                });
+
+                // ── Step 2: blob exchange ─────────────────────────────────────
+                if self.direct.stage != DirectStage::Secret {
+                    ui.add_space(16.0);
+                    section_label(ui, "STEP 2 — EXCHANGE HANDSHAKE MESSAGES");
+                    card_frame(CARD_BG, CARD_STROKE).show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Send this to your peer:")
+                                .size(12.5)
+                                .color(TEXT_SECONDARY),
+                        );
+                        ui.add_space(3.0);
+                        let mut our = self.direct.our_blob.clone();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut our)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(2)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Copy").size(12.5).color(TEXT_PRIMARY),
+                                )
+                                .fill(BADGE_BG)
+                                .stroke(Stroke::new(1.0, CARD_STROKE)),
+                            )
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(self.direct.our_blob.clone());
+                        }
+
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("Paste your peer's handshake message:")
+                                .size(12.5)
+                                .color(TEXT_SECONDARY),
+                        );
+                        ui.add_space(3.0);
+                        let can_edit = self.direct.stage == DirectStage::Exchange;
+                        ui.add_enabled(
+                            can_edit,
+                            egui::TextEdit::multiline(&mut self.direct.peer_blob)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(2)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        ui.add_space(8.0);
+
+                        if can_edit {
+                            let btn = egui::Button::new(
+                                RichText::new("Derive session key")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(ACCENT_DARK)
+                            .stroke(Stroke::new(1.0, ACCENT));
+
+                            if ui.add_sized([ui.available_width(), 34.0], btn).clicked() {
+                                let peer = self.direct.peer_blob.clone();
+                                match self.direct.spake_state.take() {
+                                    Some(state) => {
+                                        match direct::complete_handshake(state, &peer) {
+                                            Ok(key) => {
+                                                self.direct.session_key = Some(key);
+                                                self.direct.stage = DirectStage::Transfer;
+                                                self.direct.status =
+                                                    "Session key derived.".to_string();
+                                            }
+                                            Err(e) => {
+                                                self.direct.status = format!("Failed: {}", e);
+                                                // State was consumed — force a clean restart.
+                                                self.reset_direct();
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        self.direct.status =
+                                            "Handshake expired. Restart it.".to_string();
+                                        self.reset_direct();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // ── Step 3: transfer ──────────────────────────────────────────
+                if self.direct.stage == DirectStage::Transfer {
+                    ui.add_space(16.0);
+                    section_label(ui, "STEP 3 — TRANSFER");
+                    card_frame(CARD_BG, CARD_STROKE).show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Blind store URL (https://)")
+                                .size(12.5)
+                                .color(TEXT_SECONDARY),
+                        );
+                        ui.add_space(3.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.direct.store_url)
+                                .hint_text("https://store.example/blobs")
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        ui.add_space(10.0);
+
+                        match self.direct.role {
+                            DirectRole::Send => self.show_direct_send_controls(ui, busy),
+                            DirectRole::Receive => self.show_direct_receive_controls(ui, busy),
+                        }
+                    });
+                }
+
+                // ── Status ────────────────────────────────────────────────────
+                if !self.direct.status.is_empty() {
+                    ui.add_space(14.0);
+                    let (color, bg) = if self.direct.status.starts_with("Failed") {
+                        (DANGER, Color32::from_rgb(55, 18, 16))
+                    } else if self.direct.status.contains("Received")
+                        || self.direct.status.contains("sealed")
+                    {
+                        (SUCCESS, Color32::from_rgb(16, 48, 26))
+                    } else {
+                        (TEXT_SECONDARY, BADGE_BG)
+                    };
+                    egui::Frame::none()
+                        .fill(bg)
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::symmetric(12.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(&self.direct.status).size(13.0).color(color),
+                            );
+                        });
+                }
+            });
+    }
+
+    fn show_direct_send_controls(&mut self, ui: &mut egui::Ui, busy: bool) {
+        ui.label(
+            RichText::new(format!(
+                "Vault to send: {}",
+                if self.current_vault_path.is_empty() {
+                    "(none open)"
+                } else {
+                    &self.current_vault_path
+                }
+            ))
+            .size(12.5)
+            .color(TEXT_SECONDARY),
+        );
+        ui.add_space(8.0);
+
+        ui.label(
+            RichText::new("Size padding (decoy blocks)")
+                .size(12.5)
+                .color(TEXT_SECONDARY),
+        );
+        ui.add_space(3.0);
+        egui::ComboBox::from_id_salt("direct_padding")
+            .selected_text(
+                RichText::new(self.direct.padding.label())
+                    .size(13.5)
+                    .color(TEXT_PRIMARY),
+            )
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for profile in PaddingProfile::ALL {
+                    ui.selectable_value(
+                        &mut self.direct.padding,
+                        profile,
+                        RichText::new(profile.label()).size(13.5).color(TEXT_PRIMARY),
+                    );
+                }
+            });
+        ui.add_space(10.0);
+
+        let ready = !self.current_vault_path.is_empty()
+            && !self.direct.store_url.trim().is_empty()
+            && self.direct.session_key.is_some();
+
+        let (fill, stroke_c, label) = if busy {
+            (BADGE_BG, CARD_STROKE, "Uploading…")
+        } else {
+            (ACCENT_DARK, ACCENT, "Encrypt & upload to store")
+        };
+
+        if ui
+            .add_enabled(
+                ready && !busy,
+                egui::Button::new(
+                    RichText::new(label).size(14.0).strong().color(Color32::WHITE),
+                )
+                .fill(fill)
+                .stroke(Stroke::new(1.0, stroke_c)),
+            )
+            .clicked()
+        {
+            self.start_direct_send();
+        }
+
+        if !self.direct.sealed_cap.is_empty() {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new("Sealed capability — send this to your recipient:")
+                    .size(12.5)
+                    .color(SUCCESS),
+            );
+            ui.add_space(3.0);
+            let mut sealed = self.direct.sealed_cap.clone();
+            ui.add(
+                egui::TextEdit::multiline(&mut sealed)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(3)
+                    .font(egui::TextStyle::Monospace),
+            );
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Copy").size(12.5).color(TEXT_PRIMARY))
+                        .fill(BADGE_BG)
+                        .stroke(Stroke::new(1.0, CARD_STROKE)),
+                )
+                .clicked()
+            {
+                ui.ctx().copy_text(self.direct.sealed_cap.clone());
+            }
+        }
+    }
+
+    fn show_direct_receive_controls(&mut self, ui: &mut egui::Ui, busy: bool) {
+        ui.label(
+            RichText::new("Sealed capability from the sender:")
+                .size(12.5)
+                .color(TEXT_SECONDARY),
+        );
+        ui.add_space(3.0);
+        ui.add(
+            egui::TextEdit::multiline(&mut self.direct.sealed_cap)
+                .desired_width(f32::INFINITY)
+                .desired_rows(3)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.add_space(10.0);
+
+        ui.label(
+            RichText::new("Save decoded vault to:")
+                .size(12.5)
+                .color(TEXT_SECONDARY),
+        );
+        ui.add_space(3.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.direct.save_path)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.add_space(10.0);
+
+        let ready = !self.direct.sealed_cap.trim().is_empty()
+            && !self.direct.store_url.trim().is_empty()
+            && !self.direct.save_path.trim().is_empty()
+            && self.direct.session_key.is_some();
+
+        let (fill, stroke_c, label) = if busy {
+            (BADGE_BG, CARD_STROKE, "Downloading…")
+        } else {
+            (SUCCESS_DARK, SUCCESS, "Fetch & decrypt from store")
+        };
+
+        if ui
+            .add_enabled(
+                ready && !busy,
+                egui::Button::new(
+                    RichText::new(label).size(14.0).strong().color(Color32::WHITE),
+                )
+                .fill(fill)
+                .stroke(Stroke::new(1.0, stroke_c)),
+            )
+            .clicked()
+        {
+            self.start_direct_receive();
+        }
+    }
+
+    /// Spawn the Mode A upload. Consumes the session key (single-use).
+    fn start_direct_send(&mut self) {
+        let Some(session) = self.direct.session_key.take() else {
+            self.direct.status = "Failed: no session key. Restart the handshake.".to_string();
+            return;
+        };
+
+        let vault_path = self.current_vault_path.clone();
+        let store_url = self.direct.store_url.clone();
+        let padding = self.direct.padding;
+        let status_shared = Arc::clone(&self.direct_status_shared);
+        let result_slot = Arc::clone(&self.direct_sealed_result);
+        let done = Arc::clone(&self.direct_done);
+        done.store(false, Ordering::SeqCst);
+
+        if let Ok(mut lock) = status_shared.lock() {
+            *lock = "Starting upload...".to_string();
+        }
+
+        std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let status_inner = Arc::clone(&status_shared);
+            std::thread::spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    if let Ok(mut lock) = status_inner.lock() {
+                        *lock = msg;
+                    }
+                }
+            });
+
+            let outcome =
+                crate::commands::direct::send_core(&vault_path, &store_url, &session, padding, Some(tx))
+                    .map_err(|e| e.to_string());
+
+            if let Ok(mut slot) = result_slot.lock() {
+                *slot = Some(outcome);
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+    }
+
+    /// Spawn the Mode A download. Consumes the session key (single-use).
+    fn start_direct_receive(&mut self) {
+        let Some(session) = self.direct.session_key.take() else {
+            self.direct.status = "Failed: no session key. Restart the handshake.".to_string();
+            return;
+        };
+
+        let save_path = self.direct.save_path.clone();
+        let store_url = self.direct.store_url.clone();
+        let sealed = self.direct.sealed_cap.clone();
+        let status_shared = Arc::clone(&self.direct_status_shared);
+        let done = Arc::clone(&self.direct_done);
+        done.store(false, Ordering::SeqCst);
+
+        if let Ok(mut lock) = status_shared.lock() {
+            *lock = "Starting download...".to_string();
+        }
+
+        std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let status_inner = Arc::clone(&status_shared);
+            std::thread::spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    if let Ok(mut lock) = status_inner.lock() {
+                        *lock = msg;
+                    }
+                }
+            });
+
+            if let Err(e) = crate::commands::direct::receive_core(
+                &save_path,
+                &store_url,
+                &session,
+                &sealed,
+                Some(tx),
+            ) {
+                if let Ok(mut lock) = status_shared.lock() {
+                    *lock = format!("Failed: {}", e);
+                }
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+    }
+
     fn start_sync(&self, friend_name: String) {
         let vault_path = self.current_vault_path.clone();
         let status_shared = Arc::clone(&self.sync_status_shared);
@@ -482,7 +1028,55 @@ impl AtomVaultApp {
 #[cfg(test)]
 mod tests {
     use super::resolve_save_path;
+    use crate::gui::{DirectStage, DirectState};
     use eframe::egui;
+
+    // — Mode A handshake state machine —
+
+    #[test]
+    fn reset_clears_all_handshake_derived_state() {
+        let mut s = DirectState::default();
+        s.stage = DirectStage::Transfer;
+        s.our_blob = "ours".into();
+        s.peer_blob = "theirs".into();
+        s.sealed_cap = "cap".into();
+        s.status = "something happened".into();
+
+        s.reset_handshake();
+
+        assert_eq!(s.stage, DirectStage::Secret);
+        assert!(s.our_blob.is_empty());
+        assert!(s.peer_blob.is_empty());
+        assert!(s.sealed_cap.is_empty());
+        assert!(s.status.is_empty());
+        assert!(s.spake_state.is_none());
+        assert!(s.session_key.is_none());
+    }
+
+    #[test]
+    fn reset_preserves_user_typed_transport_settings() {
+        // The store URL and destination are not handshake-derived; forcing the
+        // user to retype them on every restart would be hostile.
+        let mut s = DirectState::default();
+        s.store_url = "https://store.example/blobs".into();
+        s.save_path = "/tmp/out.aegis".into();
+        s.short_secret = "words".into();
+
+        s.reset_handshake();
+
+        assert_eq!(s.store_url, "https://store.example/blobs");
+        assert_eq!(s.save_path, "/tmp/out.aegis");
+        assert_eq!(s.short_secret, "words");
+    }
+
+    #[test]
+    fn default_state_starts_at_secret_stage_with_no_keys() {
+        let s = DirectState::default();
+        assert_eq!(s.stage, DirectStage::Secret);
+        assert!(s.session_key.is_none());
+        assert!(s.spake_state.is_none());
+        assert!(!s.save_path.is_empty(), "should offer a default destination");
+    }
 
     fn sync_status_color(msg: &str) -> egui::Color32 {
         if msg.contains("Failed") {

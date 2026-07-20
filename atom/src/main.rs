@@ -108,6 +108,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             vault_path,
             friend_nickname,
         }) => commands::sync::handle_sync(&vault_path, &friend_nickname),
+        Some(Commands::Direct { command }) => match command {
+            cli::DirectCommands::Send {
+                vault_path,
+                store_url,
+                padding,
+            } => commands::direct::handle_direct_send(&vault_path, &store_url, &padding),
+            cli::DirectCommands::Receive {
+                save_path,
+                store_url,
+            } => commands::direct::handle_direct_receive(&save_path, &store_url),
+        },
         None => {
             // Argüman yoksa varsayılan olarak GUI'yi ve arka plan P2P dinleyicisini başlat
             println!("[INFO] No CLI arguments provided. Launching Graphical Interface...");
