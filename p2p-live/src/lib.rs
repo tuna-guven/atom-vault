@@ -32,12 +32,14 @@
 //! makes the forward secrecy strict.
 
 pub mod bundle;
+pub mod discovery;
 pub mod framing;
 pub mod identity;
 pub mod pacing;
 pub mod pairing;
 mod pinned;
 pub mod pq_auth;
+pub mod reach;
 pub mod rendezvous;
 pub mod session;
 pub mod stun;
@@ -57,8 +59,10 @@ use identity::{LocalIdentity, PeerPublicKey};
 use pinned::{PinnedClientVerifier, PinnedServerVerifier};
 
 pub use bundle::{BundleId, IdentityBundle, LocalBundle, PqPublicKey};
+pub use discovery::{AddressRecord, Discovery, RendezvousSecret, Substrate};
 pub use pacing::{Ladder, Pacing};
 pub use pairing::{PairedChannel, PairingCode};
+pub use reach::{Path, PeerState, Reached};
 pub use session::{
     DEFAULT_KEY_UPDATE_BYTES, Listener, MAX_FRAME_LEN, QuicSession, SecureSession, dial,
 };
@@ -101,6 +105,9 @@ pub enum Error {
 
     #[error("pairing error: {0}")]
     Pairing(String),
+
+    #[error("discovery error: {0}")]
+    Discovery(String),
 
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

@@ -227,32 +227,7 @@ impl Ticket {
         v.extend_from_slice(&(bundle.len() as u16).to_be_bytes());
         v.extend_from_slice(&bundle);
 
-        v.push(self.hints.len() as u8);
-        for hint in &self.hints {
-            match hint {
-                Endpoint::Direct(addr) => {
-                    match addr.ip() {
-                        IpAddr::V4(a) => {
-                            v.push(TAG_V4);
-                            v.extend_from_slice(&a.octets());
-                        }
-                        IpAddr::V6(a) => {
-                            v.push(TAG_V6);
-                            v.extend_from_slice(&a.octets());
-                        }
-                    }
-                    v.extend_from_slice(&addr.port().to_be_bytes());
-                }
-                Endpoint::Onion(onion) => {
-                    v.push(TAG_ONION);
-                    // The label is a fixed 56 characters for every v3 address,
-                    // so no length prefix is needed — and a fixed width means a
-                    // malformed length cannot be used to desynchronise the parse.
-                    v.extend_from_slice(onion.host().as_bytes());
-                    v.extend_from_slice(&onion.port().to_be_bytes());
-                }
-            }
-        }
+        encode_hints(&self.hints, &mut v);
         v
     }
 
@@ -301,41 +276,7 @@ impl Ticket {
         let identity = IdentityBundle::from_bytes(r.take(id_len)?)
             .map_err(|e| Error::Ticket(format!("ticket carries a bad identity: {e}")))?;
 
-        let hint_count = r.u8()? as usize;
-        if hint_count > MAX_HINTS {
-            return Err(Error::Ticket(format!(
-                "ticket lists {hint_count} address hints, more than the {MAX_HINTS} allowed"
-            )));
-        }
-        let mut hints = Vec::with_capacity(hint_count);
-        for _ in 0..hint_count {
-            let hint = match r.u8()? {
-                TAG_V4 => {
-                    let o: [u8; 4] = r.take(4)?.try_into().expect("4 bytes taken");
-                    let port = r.u16()?;
-                    Endpoint::Direct(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(o)), port))
-                }
-                TAG_V6 => {
-                    let o: [u8; 16] = r.take(16)?.try_into().expect("16 bytes taken");
-                    let port = r.u16()?;
-                    Endpoint::Direct(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(o)), port))
-                }
-                TAG_ONION => {
-                    let label = r.take(ONION_LABEL_BYTES)?;
-                    let host = std::str::from_utf8(label)
-                        .map_err(|_| Error::Ticket("onion hint is not valid UTF-8".into()))?;
-                    let port = r.u16()?;
-                    // Validated on the way in, not merely copied: a ticket is
-                    // attacker-influenced input, and an unvalidated host here
-                    // would reach the SOCKS proxy.
-                    Endpoint::Onion(OnionAddress::new(host, port).map_err(|e| {
-                        Error::Ticket(format!("ticket carries a bad onion hint: {e}"))
-                    })?)
-                }
-                tag => return Err(Error::Ticket(format!("unknown address family tag {tag}"))),
-            };
-            hints.push(hint);
-        }
+        let hints = decode_hints(&mut r)?;
 
         if !r.is_empty() {
             return Err(Error::Ticket(
@@ -401,6 +342,81 @@ impl fmt::Display for Ticket {
     }
 }
 
+/// Append a length-prefixed hint list.
+///
+/// Shared with [`crate::discovery`]'s address record so the two never drift into
+/// two subtly different encodings of the same thing — an address that survives a
+/// ticket must survive a record identically.
+pub(crate) fn encode_hints(hints: &[Endpoint], v: &mut Vec<u8>) {
+    v.push(hints.len() as u8);
+    for hint in hints {
+        match hint {
+            Endpoint::Direct(addr) => {
+                match addr.ip() {
+                    IpAddr::V4(a) => {
+                        v.push(TAG_V4);
+                        v.extend_from_slice(&a.octets());
+                    }
+                    IpAddr::V6(a) => {
+                        v.push(TAG_V6);
+                        v.extend_from_slice(&a.octets());
+                    }
+                }
+                v.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            Endpoint::Onion(onion) => {
+                v.push(TAG_ONION);
+                // The label is a fixed 56 characters for every v3 address, so no
+                // length prefix is needed — and a fixed width means a malformed
+                // length cannot be used to desynchronise the parse.
+                v.extend_from_slice(onion.host().as_bytes());
+                v.extend_from_slice(&onion.port().to_be_bytes());
+            }
+        }
+    }
+}
+
+/// Read back a hint list written by [`encode_hints`], enforcing [`MAX_HINTS`].
+pub(crate) fn decode_hints(r: &mut Reader<'_>) -> Result<Vec<Endpoint>, Error> {
+    let hint_count = r.u8()? as usize;
+    if hint_count > MAX_HINTS {
+        return Err(Error::Ticket(format!(
+            "lists {hint_count} address hints, more than the {MAX_HINTS} allowed"
+        )));
+    }
+    let mut hints = Vec::with_capacity(hint_count);
+    for _ in 0..hint_count {
+        let hint = match r.u8()? {
+            TAG_V4 => {
+                let o: [u8; 4] = r.take(4)?.try_into().expect("4 bytes taken");
+                let port = r.u16()?;
+                Endpoint::Direct(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(o)), port))
+            }
+            TAG_V6 => {
+                let o: [u8; 16] = r.take(16)?.try_into().expect("16 bytes taken");
+                let port = r.u16()?;
+                Endpoint::Direct(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(o)), port))
+            }
+            TAG_ONION => {
+                let label = r.take(ONION_LABEL_BYTES)?;
+                let host = std::str::from_utf8(label)
+                    .map_err(|_| Error::Ticket("onion hint is not valid UTF-8".into()))?;
+                let port = r.u16()?;
+                // Validated on the way in, not merely copied: this is
+                // attacker-influenced input, and an unvalidated host here would
+                // reach the SOCKS proxy.
+                Endpoint::Onion(
+                    OnionAddress::new(host, port)
+                        .map_err(|e| Error::Ticket(format!("bad onion hint: {e}")))?,
+                )
+            }
+            tag => return Err(Error::Ticket(format!("unknown address family tag {tag}"))),
+        };
+        hints.push(hint);
+    }
+    Ok(hints)
+}
+
 fn checksum(payload: &[u8]) -> [u8; CHECKSUM_LEN] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(CHECKSUM_DOMAIN);
@@ -418,25 +434,35 @@ fn now_secs() -> Result<u64, Error> {
 }
 
 /// Bounds-checked cursor. Every read is length-checked before it indexes, so a
-/// hostile or truncated ticket produces an error rather than a panic.
-struct Reader<'a> {
+/// hostile or truncated input produces an error rather than a panic.
+///
+/// `noun` names what is being parsed so the same cursor can serve the ticket and
+/// the address record ([`crate::discovery`]) without either one's errors talking
+/// about the other.
+pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    noun: &'static str,
 }
 
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Self {
-        Reader { buf, pos: 0 }
+        Reader::named(buf, "ticket")
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+    pub(crate) fn named(buf: &'a [u8], noun: &'static str) -> Self {
+        Reader { buf, pos: 0, noun }
+    }
+
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        let noun = self.noun;
         let end = self
             .pos
             .checked_add(n)
-            .ok_or_else(|| Error::Ticket("ticket length overflow".into()))?;
+            .ok_or_else(|| Error::Ticket(format!("{noun} length overflow")))?;
         if end > self.buf.len() {
             return Err(Error::Ticket(format!(
-                "ticket truncated: wanted {n} bytes at offset {}, only {} remain",
+                "{noun} truncated: wanted {n} bytes at offset {}, only {} remain",
                 self.pos,
                 self.buf.len() - self.pos
             )));
@@ -446,21 +472,21 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
-    fn u8(&mut self) -> Result<u8, Error> {
+    pub(crate) fn u8(&mut self) -> Result<u8, Error> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, Error> {
+    pub(crate) fn u16(&mut self) -> Result<u16, Error> {
         let b = self.take(2)?;
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
-    fn u64(&mut self) -> Result<u64, Error> {
+    pub(crate) fn u64(&mut self) -> Result<u64, Error> {
         let b: [u8; 8] = self.take(8)?.try_into().expect("8 bytes taken");
         Ok(u64::from_be_bytes(b))
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.pos == self.buf.len()
     }
 }

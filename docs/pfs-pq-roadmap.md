@@ -1,10 +1,12 @@
 # Roadmap — Strict Forward Secrecy & Post-Quantum Security
 
-> **Status: all seven phases resolved and shipped to both UIs.** Phases 0–6 are
-> implemented in the `p2p-live` crate; Phase 7 is decided and executed — **Mode A
-> has been deleted** (§6 option A). The whole path is now reachable as
+> **Status: phases 0–7 resolved and shipped to both UIs; phase 8 in progress.**
+> Phases 0–6 are implemented in the `p2p-live` crate; Phase 7 is decided and
+> executed — **Mode A has been deleted** (§6 option A). That path is reachable as
 > `atom live …` and from the GUI's **Live** transport tab, both driving the same
-> `commands::live::*` functions.
+> `commands::live::*` functions. **Phase 8** adds reachability from an ID alone,
+> so a pairing survives dynamic addresses; its protocol layer is built and tested
+> in `p2p-live/src/{discovery,reach}.rs` but is not yet wired to either UI.
 >
 > This roadmap **replaces** the Mode A (blind store) design; the `p2p-direct`
 > crate no longer exists. Companion docs: `p2p-live/p2p_live_architecture.md`
@@ -442,6 +444,78 @@ high-risk recipient (§1), accepted deliberately.
 
 The prior Mode A architecture document went with the crate; it is recoverable
 from git history if the analysis is ever wanted again.
+
+### Phase 8 — Reachability by ID 🔨 **protocol done, not yet wired to the UIs**
+
+**The problem.** Phases 0–7 assume a human carries an `ip:port` to the other
+human. Home and mobile addresses are dynamic, so a ticket is stale within days
+and every reconnection means another out-of-band exchange. What is wanted is
+Syncthing's property: **pair once, then an ID is enough, forever.**
+
+**What Syncthing actually costs, since it is the model.** A device announces
+`device-ID -> current addresses` to global discovery servers and queries them by
+ID; a relay pool covers failed hole punches. Because the ID is a hash of the
+device key, a hostile discovery server **cannot impersonate** — only misdirect.
+But it learns every device's current IP and, from the queries, **who is looking
+for whom**. That is exactly the pairing metadata `CLAUDE.md` §2.1 denies. So
+"only an ID" is not broker-free; it trades a broker that cannot lie for a broker
+that watches. Phase 8 keeps the first property and strips as much of the second
+as is achievable without Tor.
+
+**The construction** (`p2p-live/src/discovery/`, `p2p-live/src/reach.rs`):
+
+- **Pairing gains one persistent output.** `PairedChannel::rendezvous_secret()`
+  derives a 32-byte pairwise secret under its own HKDF label, stored in the
+  encrypted peer record. *Not* a static DH over the identity keys — §3 forbids
+  identity keys in key agreement, and that separation is what makes the forward
+  secrecy strict.
+- **Blinded, rotating slots.** `tag‖key = BLAKE3-keyed(secret, "slot-v1" ‖
+  direction ‖ epoch)`, one hour per epoch, two directions so both peers publish
+  without collision. The substrate sees an opaque rotating label, never an
+  identity, and cannot be compelled to watch a named person because computing
+  that person's tags needs a secret it never holds.
+- **Fixed-width sealed records.** Every record is exactly 680 bytes whatever it
+  carries, so "publishes an onion" is not visible from outside. The tag is bound
+  in as AAD, so a record cannot be relocated between slots. `seq` + a 6-hour
+  maximum TTL bound rollback.
+- **A ladder, cheapest-and-least-exposing first** (`reach::connect`): remembered
+  address (no third party) → blind lookup → onion. The rung actually used is
+  reported to the caller rather than hidden, because the rungs differ in who
+  learns about the connection.
+
+**The invariant that makes this safe to add at all:** a record supplies *hints*,
+never identity. The peer is authenticated by the mutually-pinned hybrid-PQ
+handshake against the bundle fixed at pairing. A forged, stale or
+attacker-chosen record can cause a failed connection and nothing else. **If a
+future change ever lets a discovered record influence _who_ is trusted rather
+than _where_ they are tried, that is the canonical bug in this layer.**
+
+**The leak that remains, stated plainly.** A substrate sees "IP `X` wrote tag
+`T`" and later "IP `Y` read tag `T`". It learns neither identity, and the tag is
+meaningless an hour later, but for that hour it can infer those two addresses are
+*a pair*. Only not using a substrate removes this. Hence: self-host the endpoint,
+or set `BlindEndpoint::via_socks` so the requests arrive from Tor and the
+endpoint never sees either real address.
+
+**The new operational cost.** Discovery answers "where is my peer", not "where am
+I". A peer behind NAT still cannot learn its own external `ip:port` — so STUN
+(§6 of `CLAUDE.md`, opt-in with a disclosure warning) becomes close to
+**mandatory** for the ID-only path, where it was previously a convenience. A
+peer that will not use it can still receive over an onion, but cannot publish a
+direct address. This trade should be on screen, not in a manual.
+
+**Still to build:**
+
+- **Relay fallback for symmetric NAT / CGNAT** — decided in favour, against the
+  recommendation here, so it must be built as narrowly as possible: self-hosted,
+  addressed by the *same* blinded pairwise tag so it never sees an ID, a dumb
+  byte pipe with the pinned hybrid-PQ handshake running end-to-end through it,
+  Phase 4 pacing on top, last resort only, with an explicit downgrade notice. A
+  relay is the one component that re-introduces the pairing visibility this
+  design deleted; that must stay stated in the UI, not just here.
+- **Persistence** — `reach::PeerState` (identity, rendezvous secret,
+  `last_known`, `newest_seen`) in the keyring-encrypted peer store.
+- **CLI/GUI** — `atom live connect <id>`, an announce loop, endpoint config.
 
 ---
 

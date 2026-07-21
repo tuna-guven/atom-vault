@@ -52,6 +52,7 @@ use spake2::{Ed25519Group, Identity, Password, Spake2};
 use zeroize::Zeroizing;
 
 use crate::Error;
+use crate::discovery::secret::{self, RendezvousSecret};
 use crate::ticket::Ticket;
 
 /// Shared SPAKE2 identity string, so both sides run the *symmetric* variant.
@@ -209,7 +210,8 @@ impl PairingState {
         aad.extend_from_slice(msgs[1]);
 
         Ok(PairedChannel {
-            key: derive_seal_key(&key),
+            key: derive(&key, SEAL_LABEL),
+            rendezvous: derive(&key, secret::RENDEZVOUS_SECRET_LABEL),
             aad,
         })
     }
@@ -223,10 +225,33 @@ impl PairingState {
 /// separately, with its own ephemeral hybrid-PQ handshake.
 pub struct PairedChannel {
     key: Zeroizing<[u8; 32]>,
+    rendezvous: Zeroizing<[u8; 32]>,
     aad: Vec<u8>,
 }
 
 impl PairedChannel {
+    /// The long-term pairwise secret this pairing establishes for discovery
+    /// (roadmap Phase 8).
+    ///
+    /// Everything else this channel produces is consumed and forgotten within the
+    /// pairing. This one output is meant to be **kept**, in the encrypted peer
+    /// record, so the two peers can find each other by ID after their addresses
+    /// change — see [`crate::discovery`].
+    ///
+    /// Keeping it is a deliberate and bounded exception to the "nothing survives
+    /// the pairing" rule, and its scope is worth being precise about. It is not a
+    /// key agreement, authenticates nobody, and decrypts no vault data. Its sole
+    /// power is to address and seal *address records*. An attacker who steals it
+    /// can learn where the peer says it is and can forge a record pointing
+    /// somewhere else — which fails the pinned handshake — but cannot become the
+    /// peer. See [`crate::discovery::secret`] for the full statement.
+    ///
+    /// Derived under its own HKDF label, so it is independent of the key that
+    /// sealed the tickets: recovering one reveals nothing about the other.
+    pub fn rendezvous_secret(&self) -> RendezvousSecret {
+        RendezvousSecret::from_bytes(*self.rendezvous)
+    }
+
     /// Seal our ticket for the peer. The output is safe to paste into the
     /// observed channel.
     pub fn seal_ticket(&self, ticket: &Ticket) -> Result<String, Error> {
@@ -290,10 +315,11 @@ impl PairedChannel {
     }
 }
 
-fn derive_seal_key(spake_key: &[u8]) -> Zeroizing<[u8; 32]> {
+/// Split one SPAKE2 output into independent keys by label.
+fn derive(spake_key: &[u8], label: &[u8]) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(None, spake_key);
     let mut okm = Zeroizing::new([0u8; 32]);
-    hk.expand(SEAL_LABEL, okm.as_mut_slice())
+    hk.expand(label, okm.as_mut_slice())
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     okm
 }
