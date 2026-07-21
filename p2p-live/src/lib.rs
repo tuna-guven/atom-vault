@@ -33,6 +33,7 @@
 
 pub mod identity;
 mod pinned;
+pub mod session;
 
 use std::sync::Arc;
 
@@ -43,6 +44,10 @@ use rustls::server::AlwaysResolvesServerRawPublicKeys;
 
 use identity::{LocalIdentity, PeerPublicKey};
 use pinned::{PinnedClientVerifier, PinnedServerVerifier};
+
+pub use session::{
+    DEFAULT_KEY_UPDATE_BYTES, Listener, MAX_FRAME_LEN, QuicSession, SecureSession, dial,
+};
 
 /// ALPN identifying this protocol version. Bound into the handshake, so a peer
 /// speaking a different version cannot be silently misinterpreted.
@@ -62,6 +67,9 @@ pub enum Error {
 
     #[error("connection error: {0}")]
     Connect(String),
+
+    #[error("session error: {0}")]
+    Session(String),
 
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

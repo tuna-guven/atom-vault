@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1.91"
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
 rcgen = "0.14.8"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
 rustls-pki-types = "1.15.0"
 thiserror = "2.0.19"
 tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync"] }
+zeroize = "1.9.0"

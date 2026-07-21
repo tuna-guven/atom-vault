@@ -18,6 +18,9 @@ fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
 }
 
+/// The bytes echoed back by the server task, or a failure description.
+type EchoResult = tokio::task::JoinHandle<Result<Vec<u8>, String>>;
+
 /// Spin up a server endpoint that accepts exactly one connection, echoing the
 /// bytes of the first bi-directional stream back to the client.
 ///
@@ -25,10 +28,7 @@ fn loopback() -> SocketAddr {
 fn spawn_echo_server(
     server_id: LocalIdentity,
     expect_client: PeerPublicKey,
-) -> Result<
-    (SocketAddr, tokio::task::JoinHandle<Result<Vec<u8>, String>>),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(SocketAddr, EchoResult), Box<dyn std::error::Error>> {
     let cfg = server_config(&server_id, &expect_client)?;
     let socket = UdpSocket::bind(loopback())?;
     let addr = socket.local_addr()?;

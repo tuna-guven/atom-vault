@@ -185,10 +185,86 @@ store, no manifest, no decoy objects. That is a security win in itself.
 
 ### Phase 2 — Live transfer protocol
 - Port the chunk/framing logic onto `SecureSession`.
-- Resumption across dropped connections **without** weakening PFS (resume by
-  re-running a fresh handshake and negotiating a byte offset — never by
-  persisting session keys).
-- Progress reporting, cancellation, integrity verification of the assembled file.
+- Progress reporting, cancellation.
+- **Resume-without-loss + end-to-end integrity — designed in §2.1 below.** This is
+  the part most likely to be built in a way that silently breaks PFS, so the
+  design is fixed here before implementation.
+
+#### 2.1 Resume-without-loss & integrity (design locked)
+
+**Requirement:** if the connection is interrupted mid-transfer, resume from exactly
+where it left off, with no lost bytes and no corruption at the seam.
+
+**The hard rule — resume must never persist session keys.** TLS session resumption,
+tickets, and 0-RTT are the obvious way to do this and are *precisely* what §3.3
+disables for strict PFS. So resume is a transport-reliability feature layered on
+top of the crypto, kept strictly separate from the key lifecycle:
+
+> Every reconnection is a **full, fresh hybrid-PQ handshake** with new ephemeral
+> keys. Nothing cryptographic survives the drop. What survives is only the
+> *plaintext-payload progress* (a byte offset + the partial data), never a key.
+
+This preserves PFS: a segment recorded before the drop used ephemeral keys that
+were destroyed, so resuming grants an adversary no new decryption power.
+
+**Protocol (each session — initial or resumed):**
+
+1. **Fresh handshake** — the Phase 0 mutually-pinned hybrid-PQ handshake. Re-dial
+   using the L0 ticket's address/transport hints.
+2. **Offset negotiation** — receiver sends, *inside* the fresh encrypted +
+   authenticated channel: `have = N` (bytes) and `prefix_hash = BLAKE3(payload[0..N])`.
+3. **Boundary verification** — sender recomputes `BLAKE3(source[0..N])` and requires
+   it to equal `prefix_hash`. Divergence ⇒ the receiver's partial is corrupt/wrong
+   ⇒ roll back to the last verified checkpoint (or restart). This is what stops a
+   good suffix being stitched onto a bad prefix — "no loss" also means "no
+   corruption at the seam."
+4. **Resume** — sender seeks to `N` and streams on.
+5. **Completion** — full-payload `BLAKE3` check, end-to-end.
+
+**Integrity decision — BLAKE3 streaming hash, not a hand-rolled Merkle tree.** For
+a single-source, in-order stream over an already-authenticated channel (QUIC+TLS
+1.3 AEAD authenticates every record; the peer is mutually pinned), a Merkle tree
+buys nothing against wire tampering — that threat is already closed. What integrity
+verification *does* catch is our own reassembly / resume-seam / disk-write bugs and
+bit-rot at the sender before the bytes entered the channel. A BLAKE3 streaming hash
+covers that, and the **same rolling hash doubles as the offset-negotiation
+commitment** in step 2. BLAKE3 is internally a Merkle tree, so if a future
+random-access or prefix-proof need ever arises, adopt `bao` verified streaming
+rather than hand-rolling a tree (which invites length-extension / duplicate-leaf
+bugs).
+
+**Determinism requirements (or resume-by-offset is unsound):**
+
+- **Offset is over the logical payload, not the wire.** Cover traffic, pacing, and
+  the per-session ephemeral TLS encryption are non-deterministic and must never be
+  part of the resumable stream. `N` counts payload bytes.
+- **The source is stable for the transfer's duration.** Resume assumes
+  `source[0..N]` is byte-identical across sessions; the vault file must be immutable
+  (or snapshotted at start), else the seam check correctly rejects a changed source.
+
+**What each side persists across the outage:**
+
+- **Sender:** nothing but the source file — it re-seeks to `N`.
+- **Receiver:** the partial bytes + the verified offset (hash state is recomputable
+  from the partial). Advance the durable verified offset only at chunk boundaries
+  and only *after* `fsync` of the data, so a crash mid-chunk rolls back to the last
+  fully-durable chunk and never counts half-written bytes as received.
+
+**At-rest note (why on-disk checkpointing is acceptable here).** Surviving a
+process/host restart — not just a connection blip — requires persisting the partial
+to disk, which normally reintroduces the "data at rest" that going-live eliminates.
+It is acceptable here *only because the streamed artifact is the already-encrypted
+`.aegis` vault file*: the on-disk partial is ciphertext under the vault's own
+password, strictly less exposure than the completed transfer the recipient already
+opted into. **Guard this assumption in code:** if a future change ever streams a
+decrypted tree instead of the encrypted vault file, the on-disk partial becomes
+plaintext and this decision must be revisited.
+
+**QUIC already handles the small stuff.** Packet loss, reordering, and
+retransmission *within* a connection are QUIC's job (do not rebuild them), and
+connection migration survives many IP/port changes without dropping. The resume
+protocol above is only for **full** drops: process death, sleep past the idle
+timeout, peer restart, long outage.
 
 ### Phase 3 — L0 pairing & rendezvous UX
 - Ticket format: identity key(s), transport hints, capability/suite IDs.
@@ -245,6 +321,13 @@ Every phase lands with:
 - **Key-lifetime tests** — verify key material is zeroized after session close.
 - **KATs** against NIST FIPS 203 vectors, pinned like the existing
   `EXPECTED_BLOCK0` HKDF vector in `crypto.rs`.
+- **Resume tests** (Phase 2, §2.1): a transfer interrupted at an arbitrary offset
+  and resumed produces a byte-identical result to an uninterrupted one; the resume
+  handshake is a *fresh* full handshake (no reused session keys — assert
+  resumption/0-RTT stay off across the reconnect); a **tampered or divergent
+  prefix is rejected** at the seam rather than stitched; and a crash mid-chunk
+  rolls the durable offset back to the last fsync'd chunk boundary (no half-written
+  bytes counted as received).
 
 ---
 

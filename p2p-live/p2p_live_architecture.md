@@ -225,7 +225,7 @@ certificate. This is the Syncthing device-ID trust model.
 ## 7. Sequences
 
 Textual sequences for the diagrams to be drawn later. Phase 0 implements only
-§7.2 (the handshake); §7.1, §7.3, §7.4 describe the surrounding flow the later
+§7.2 (the handshake); §7.1 and §7.3–§7.5 describe the surrounding flow the later
 phases will build.
 
 ### 7.1 L0 — one-time out-of-band pairing (Phase 3, planned)
@@ -283,19 +283,42 @@ Failure modes, each covered by a gate test:
 
 ```
   |  open bi-directional stream on the established session               |
-  |  S: serialize vault tree -> fixed-size blocks (reuse encode framing) |
-  |-- block 0 .. block N (constant-rate paced, cover traffic fills gaps) ->|
-  |                                        R: reassemble, verify integrity |
+  |  S: stream the encrypted vault file -> fixed-size frames            |
+  |-- frame 0 .. frame N (constant-rate paced, cover traffic fills gaps) ->|
+  |                                   R: append, advance BLAKE3, fsync   |
   |  periodic QUIC key update every N MB / N min (intra-session ratchet)  |
   |  randomized ramp-down so stop time != true end-of-data               |
   |  close: zeroize ephemeral + derived keys                             |
 ```
 
-Resumption across a dropped connection is done by **re-running a fresh handshake**
-and negotiating a byte offset — never by persisting session keys, which would
-break strict PFS.
+### 7.4 L3 — resume after interruption (Phase 2, planned; design locked)
 
-### 7.4 Transport substitution (Phase 5, planned)
+Resume is done by **re-running a fresh handshake** and negotiating a payload byte
+offset — never by persisting session keys, which would break strict PFS. The full
+design (determinism requirements, at-rest reasoning, crash-safe checkpointing) is
+fixed in `docs/pfs-pq-roadmap.md` §2.1.
+
+```
+Sender S (has source file)                        Receiver R (has partial, N bytes)
+  |====== FRESH full hybrid-PQ handshake (new ephemerals; no reused keys) =========|
+  |                                                 |
+  |<---- have = N, prefix_hash = BLAKE3(payload[0..N]) ----------------------------|
+  |  require BLAKE3(source[0..N]) == prefix_hash                                    |
+  |    mismatch -> reject seam, roll R back to last verified checkpoint            |
+  |  seek source to N                                                              |
+  |------ frame @N .. end (paced + cover) ----------------------------------------->|
+  |                                        R: append, advance offset at chunk       |
+  |                                           boundaries only, after fsync          |
+  |<---- final BLAKE3(payload) for end-to-end verification ------------------------|
+```
+
+The BLAKE3 rolling hash serves double duty: end-to-end integrity **and** the
+offset-negotiation commitment. On-disk checkpointing of the partial is acceptable
+only because the streamed artifact is the already-encrypted `.aegis` vault (the
+partial at rest is ciphertext); a guard comment must flag that this stops holding
+if a decrypted tree is ever streamed instead.
+
+### 7.5 Transport substitution (Phase 5, planned)
 
 The same L2 handshake and L3 transfer run unchanged over the existing Tor onion
 transport instead of direct QUIC. This recovers the peer-IP-pairing metadata

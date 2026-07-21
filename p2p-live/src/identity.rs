@@ -10,6 +10,7 @@ use rcgen::{KeyPair, PKCS_ED25519, PublicKeyData};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
+use zeroize::Zeroizing;
 
 use crate::Error;
 
@@ -41,9 +42,15 @@ impl PeerPublicKey {
 }
 
 /// A local peer identity — the private half stays here and never leaves.
+///
+/// The private key is held in `Zeroizing`, so its bytes are wiped when the
+/// identity is dropped rather than lingering in freed heap memory. This is the
+/// long-term *authentication* key, not a session key, so its lifetime does not
+/// affect forward secrecy — but wiping it is the same discipline the rest of the
+/// codebase applies to secret material, and it is cheap.
 pub struct LocalIdentity {
     public: PeerPublicKey,
-    pkcs8: Vec<u8>,
+    pkcs8: Zeroizing<Vec<u8>>,
 }
 
 impl LocalIdentity {
@@ -57,7 +64,7 @@ impl LocalIdentity {
             .map_err(|e| Error::Identity(format!("key generation failed: {e}")))?;
         Ok(LocalIdentity {
             public: PeerPublicKey(kp.subject_public_key_info()),
-            pkcs8: kp.serialize_der(),
+            pkcs8: Zeroizing::new(kp.serialize_der()),
         })
     }
 
@@ -72,7 +79,9 @@ impl LocalIdentity {
     /// provider other than the default hybrid one.
     pub fn certified_key(&self, provider: &CryptoProvider) -> Result<Arc<CertifiedKey>, Error> {
         let spki_as_cert = CertificateDer::from(self.public.0.clone());
-        let key = PrivateKeyDer::try_from(self.pkcs8.clone())
+        // rustls takes ownership of the key bytes; we hand it a transient copy and
+        // keep our own in `Zeroizing`. rustls manages its own copy's lifetime.
+        let key = PrivateKeyDer::try_from(self.pkcs8.as_slice().to_vec())
             .map_err(|e| Error::Identity(format!("bad private key: {e}")))?;
 
         // Load the signing key directly and use `CertifiedKey::new` rather than
