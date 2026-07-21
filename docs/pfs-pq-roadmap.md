@@ -1,10 +1,12 @@
 # Roadmap — Strict Forward Secrecy & Post-Quantum Security
 
-> **Status: proposal.** Nothing here is implemented yet.
+> **Status: Phases 0–2 implemented** in the `p2p-live` crate (handshake, session
+> layer, live transfer with resume). Phases 3–7 remain proposals.
 >
 > This roadmap supersedes the Mode A (blind store) design as the *primary*
-> transfer mechanism. Companion docs: `p2p-direct/p2p_direct_architecture.md`
-> (what exists today), `CLAUDE.md` (original spec).
+> transfer mechanism. Companion docs: `p2p-live/p2p_live_architecture.md` (what
+> the new path looks like as built), `p2p-direct/p2p_direct_architecture.md`
+> (the Mode A path it supersedes), `CLAUDE.md` (original spec).
 
 ---
 
@@ -168,7 +170,7 @@ store, no manifest, no decoy objects. That is a security win in itself.
 
 ## 5. Phases
 
-### Phase 0 — Spike: prove the hybrid PQ QUIC handshake
+### Phase 0 — Spike: prove the hybrid PQ QUIC handshake ✅ **done**
 *Smallest thing that de-risks everything downstream.*
 
 - Stand up `quinn` + `rustls`/`aws-lc-rs` with `X25519MLKEM768` between two local
@@ -177,18 +179,35 @@ store, no manifest, no decoy objects. That is a security win in itself.
 - **Gate:** if hybrid + RPK cannot be made to work together on current crates,
   the design changes — find out now, in a throwaway binary, not in month two.
 
-### Phase 1 — Transport-agnostic session layer
+### Phase 1 — Transport-agnostic session layer ✅ **done** (`p2p-live/src/session.rs`)
 - Define a `SecureSession` trait (open, send/recv framed messages, close).
 - Implement over QUIC with the Phase 0 handshake.
 - Enforce §3.3: no 0-RTT, no resumption, zeroize-on-drop, key-update scheduling.
 - Identity pinning from L0 tickets.
 
-### Phase 2 — Live transfer protocol
+Landed as specified. Caveats worth carrying forward: zeroization covers the
+long-term identity key, not rustls's internal session secrets (we do not own that
+memory); and the key-update counter records updates *requested*, not confirmed.
+
+### Phase 2 — Live transfer protocol ✅ **done** (`p2p-live/src/transfer.rs`)
 - Port the chunk/framing logic onto `SecureSession`.
 - Progress reporting, cancellation.
 - **Resume-without-loss + end-to-end integrity — designed in §2.1 below.** This is
   the part most likely to be built in a way that silently breaks PFS, so the
   design is fixed here before implementation.
+
+Built exactly to §2.1. Two implementation choices worth recording:
+
+- **No sidecar offset file.** The partial's own length, rounded *down* to a
+  checkpoint boundary, is the durable offset; the prefix hash is what proves it.
+  A separate metadata file would need its own fsync ordering and could fall out of
+  sync with the data it describes.
+- **The at-rest guard is a type, not a comment.** `Transfer::new` requires an
+  `EncryptedAtRest` witness, so the assumption that the streamed artifact is the
+  already-encrypted `.aegis` file has to be restated at every call site.
+
+Not yet integrated into any CLI or GUI command — that follows Phase 3's pairing UX,
+since a transfer needs a paired peer to be useful.
 
 #### 2.1 Resume-without-loss & integrity (design locked)
 

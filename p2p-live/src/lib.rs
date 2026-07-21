@@ -34,6 +34,7 @@
 pub mod identity;
 mod pinned;
 pub mod session;
+pub mod transfer;
 
 use std::sync::Arc;
 
@@ -48,6 +49,7 @@ use pinned::{PinnedClientVerifier, PinnedServerVerifier};
 pub use session::{
     DEFAULT_KEY_UPDATE_BYTES, Listener, MAX_FRAME_LEN, QuicSession, SecureSession, dial,
 };
+pub use transfer::{Cancel, EncryptedAtRest, Progress, Summary, Transfer};
 
 /// ALPN identifying this protocol version. Bound into the handshake, so a peer
 /// speaking a different version cannot be silently misinterpreted.
@@ -70,6 +72,15 @@ pub enum Error {
 
     #[error("session error: {0}")]
     Session(String),
+
+    #[error("transfer error: {0}")]
+    Transfer(String),
+
+    #[error("integrity check failed: {0}")]
+    Integrity(String),
+
+    #[error("transfer cancelled")]
+    Cancelled,
 
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

@@ -65,10 +65,13 @@ The roadmap's target architecture, and where this crate sits in it:
 +-------------------------------------------------------------+
 ```
 
-What `p2p-live` contains **today** is L2: the authenticated key exchange, plus the
-identity primitive (L0's payload) it authenticates against. L1 is present only as
-the QUIC binding used to prove the handshake works end-to-end. L3/L4 are not yet
-built; §7 describes the sequences they will implement.
+What `p2p-live` contains **today** is L2 (the authenticated key exchange and the
+`SecureSession` channel built on it), the identity primitive (L0's payload) it
+authenticates against, and L3's transfer protocol — chunked, resumable and
+integrity-checked. L1 is the QUIC binding; the `SecureSession` boundary is what
+lets Phase 5 substitute Tor without touching L2 or L3. Still absent: L3's
+traffic-analysis hardening (pacing, cover traffic — Phase 4) and L4 pairing
+(Phase 3). §7 describes the sequences those will implement.
 
 Note what is **absent** compared to `p2p-direct`: there is no capability layer and
 no object store. The design deletes more than it adds — no cap, no manifest, no
@@ -76,7 +79,7 @@ decoy objects, no ciphertext at rest.
 
 ---
 
-## 3. Module map (as built, Phase 0)
+## 3. Module map (as built, Phases 0–2)
 
 ```
 p2p-live/
@@ -85,14 +88,26 @@ p2p-live/
                   strict-PFS switches, and the negotiation/PFS unit tests.
     identity.rs   L0 payload: Ed25519 identity as an RFC 7250 raw public key (SPKI).
     pinned.rs     L2 auth: raw-public-key pinning verifiers (both directions).
+    session.rs    L2 channel: the `SecureSession` trait, its QUIC implementation,
+                  message framing, and the intra-session key-update ratchet.
+    transfer.rs   L3 protocol: chunked transfer, resume-by-fresh-handshake,
+                  BLAKE3 integrity, crash-safe checkpointing, cancellation.
   tests/
-    pq_handshake.rs   End-to-end gate tests over real QUIC (Phases 0 gate).
+    pq_handshake.rs   End-to-end gate tests over real QUIC (Phase 0 gate).
+    session.rs        Framing, identity, frame caps, key-update (Phase 1).
+    transfer.rs       Round-trip, resume, seam rejection, rollback (Phase 2).
 ```
 
-Everything public is deliberately small: three functions (`client_config`,
-`server_config`, `hybrid_pq_provider`), the `LocalIdentity`/`PeerPublicKey`
-types, and the `ALPN` constant. The pinning verifiers are crate-private — they are
-an implementation detail of "pin the peer's key", not an API surface.
+The public surface is deliberately small. L2 exposes the config builders
+(`client_config`, `server_config`, `hybrid_pq_provider`), the
+`LocalIdentity`/`PeerPublicKey` types, `ALPN`, and the `SecureSession` /
+`QuicSession` / `dial` / `Listener` quartet. L3 exposes `Transfer` and its
+`Progress`/`Summary`/`Cancel` types. The pinning verifiers stay crate-private —
+they are an implementation detail of "pin the peer's key", not an API surface.
+
+**The seam that matters** is `SecureSession`: L3 names no transport, so
+`transfer.rs` is already Tor-ready. Nothing in the transfer protocol knows it is
+running over QUIC.
 
 ---
 
@@ -279,49 +294,74 @@ Failure modes, each covered by a gate test:
 - Peer offers only classical X25519 → **no common group → handshake fails**, never
   downgrades (`classical_only_client_cannot_downgrade_the_server`).
 
-### 7.3 L3 — live transfer over the session (Phase 2, planned)
+### 7.3 L3 — live transfer over the session (Phase 2, **implemented**)
+
+One protocol serves both the initial attempt and every resumption; there is no
+separate "resume mode". Each message is one `SecureSession` frame.
 
 ```
-  |  open bi-directional stream on the established session               |
-  |  S: stream the encrypted vault file -> fixed-size frames            |
-  |-- frame 0 .. frame N (constant-rate paced, cover traffic fills gaps) ->|
-  |                                   R: append, advance BLAKE3, fsync   |
-  |  periodic QUIC key update every N MB / N min (intra-session ratchet)  |
-  |  randomized ramp-down so stop time != true end-of-data               |
-  |  close: zeroize ephemeral + derived keys                             |
-```
-
-### 7.4 L3 — resume after interruption (Phase 2, planned; design locked)
-
-Resume is done by **re-running a fresh handshake** and negotiating a payload byte
-offset — never by persisting session keys, which would break strict PFS. The full
-design (determinism requirements, at-rest reasoning, crash-safe checkpointing) is
-fixed in `docs/pfs-pq-roadmap.md` §2.1.
-
-```
-Sender S (has source file)                        Receiver R (has partial, N bytes)
-  |====== FRESH full hybrid-PQ handshake (new ephemerals; no reused keys) =========|
+Sender S (source file)                            Receiver R (dest path)
+  |====== L2 handshake (§7.2) — always a FRESH one =============================|
   |                                                 |
-  |<---- have = N, prefix_hash = BLAKE3(payload[0..N]) ----------------------------|
-  |  require BLAKE3(source[0..N]) == prefix_hash                                    |
-  |    mismatch -> reject seam, roll R back to last verified checkpoint            |
-  |  seek source to N                                                              |
-  |------ frame @N .. end (paced + cover) ----------------------------------------->|
-  |                                        R: append, advance offset at chunk       |
-  |                                           boundaries only, after fsync          |
-  |<---- final BLAKE3(payload) for end-to-end verification ------------------------|
+  |---- OFFER(total_len) -------------------------->|  open <dest>.part
+  |                                                 |  have = floor(len/CKPT)*CKPT
+  |                                                 |  truncate to have
+  |<--- RESUME(have, BLAKE3(partial[0..have])) -----|
+  |  verify BLAKE3(source[0..have]) == prefix_hash  |
+  |    match    -> offset = have                    |
+  |    mismatch -> offset = 0  (reject the seam)    |
+  |---- START(offset) ----------------------------->|  truncate to offset
+  |  seek(offset)                                   |  seek(offset)
+  |---- DATA(chunk) ------------------------------->|  write, BLAKE3 update
+  |            ...  (1 MiB chunks)                  |  fsync every CKPT bytes
+  |  QUIC key update every 256 MiB sent (ratchet)   |  progress callback / cancel
+  |---- DONE(BLAKE3(source)) ---------------------->|  verify full hash
+  |                                                 |  fsync, rename .part -> dest
+  |<--- ACK ----------------------------------------|
 ```
 
-The BLAKE3 rolling hash serves double duty: end-to-end integrity **and** the
+Phase 4 adds constant-rate pacing, cover traffic and a randomized ramp-down on top
+of this frame sequence. Until then the stream's rate and stop time still track the
+real payload.
+
+### 7.4 L3 — resume after interruption (Phase 2, **implemented**)
+
+Resume re-runs §7.3 unchanged over a **fresh handshake**; the only thing that
+carries across the outage is the partial file. No session key is ever persisted,
+so strict PFS survives an arbitrary number of reconnections. The full design
+rationale (determinism requirements, at-rest reasoning, crash-safe checkpointing)
+is in `docs/pfs-pq-roadmap.md` §2.1.
+
+Three properties do the work:
+
+- **The file length is the offset.** Rounded *down* to a checkpoint boundary, so
+  bytes written but never `fsync`ed are discarded rather than counted. No sidecar
+  metadata file exists to fall out of sync with the data.
+- **The prefix hash is the proof.** `BLAKE3(partial[0..have])` must equal
+  `BLAKE3(source[0..have])` or the sender rewinds the receiver to 0. This is what
+  stops a good suffix being stitched onto a bad prefix — "no loss" has to mean
+  "no corruption at the seam" too.
+- **The destination appears only when verified.** Data lands in `<dest>.part` and
+  is renamed into place only after the end-to-end hash matches.
+
+The same BLAKE3 hash serves double duty: end-to-end integrity **and** the
 offset-negotiation commitment. On-disk checkpointing of the partial is acceptable
 only because the streamed artifact is the already-encrypted `.aegis` vault (the
-partial at rest is ciphertext); a guard comment must flag that this stops holding
-if a decrypted tree is ever streamed instead.
+partial at rest is ciphertext). That assumption is guarded in code by the
+`EncryptedAtRest` witness a `Transfer` requires: if a future change ever streams a
+decrypted tree, the partial becomes plaintext at rest and the decision must be
+revisited rather than inherited.
+
+**Cost:** both sides re-hash the prefix on reconnect (a resumed 4 GiB prefix means
+a 4 GiB read each side). Persisting hasher state would avoid it, and would be
+exactly the "trust what we wrote down" the seam check exists to reject.
 
 ### 7.5 Transport substitution (Phase 5, planned)
 
 The same L2 handshake and L3 transfer run unchanged over the existing Tor onion
-transport instead of direct QUIC. This recovers the peer-IP-pairing metadata
+transport instead of direct QUIC — `transfer.rs` takes a `&mut dyn SecureSession`
+and never names QUIC, so this is an added implementation of the trait, not a
+change to the protocol. This recovers the peer-IP-pairing metadata
 property for recipients who need it, without a second crypto stack. (Non-goal: the
 Tor layer itself stays classical — onion v3 identity is Ed25519 and ntor is
 X25519, outside our control; our session *inside* it is PQ, which is genuine
@@ -331,30 +371,53 @@ defense in depth but must not be described as a post-quantum Tor path.)
 
 ## 8. Current status and limitations
 
-**Implemented (Phase 0 — gate cleared):**
+**Implemented (Phases 0–2):**
 
-- Hybrid-PQ (`X25519MLKEM768`), TLS-1.3-only, mutually-pinned raw-public-key
-  handshake over real QUIC.
-- Fail-closed guarantees: single kx group, single TLS version, resumption and
-  0-RTT disabled on both sides.
-- 8 passing tests: 4 end-to-end over QUIC (`tests/pq_handshake.rs`) proving the
-  roundtrip, both pinning directions, and the no-downgrade property; and 4
-  in-memory rustls unit tests (`src/lib.rs`) that read the negotiated group back
-  and assert it is `X25519MLKEM768`, assert TLS 1.3, and guard the PFS switches.
+- *Phase 0* — hybrid-PQ (`X25519MLKEM768`), TLS-1.3-only, mutually-pinned
+  raw-public-key handshake over real QUIC. Fail-closed: single kx group, single
+  TLS version, resumption and 0-RTT disabled on both sides.
+- *Phase 1* — `SecureSession` over QUIC: length-prefixed framing with a 16 MiB
+  cap enforced before allocation, a QUIC key-update ratchet every 256 MiB sent,
+  race-free graceful close, and the identity private key held in `Zeroizing`.
+- *Phase 2* — the L3 transfer protocol of §7.3/§7.4: 1 MiB chunks, BLAKE3
+  end-to-end integrity, resume-by-fresh-handshake with seam verification,
+  checkpointed `fsync` durability, verify-then-rename, progress reporting and
+  cooperative cancellation.
+- **23 passing tests** across four targets: 8 unit (`src/`), 4 QUIC gate tests,
+  5 session tests, 6 transfer/resume tests. The resume set covers the roadmap §7
+  requirements directly — byte-identical resumed output, a divergent prefix
+  rejected at the seam, a non-durable tail rolled back to the last checkpoint,
+  and a behavioural assertion that a second connection offers no 0-RTT.
 
 **Not yet built (later phases):**
 
 - **L4/L0 pairing** — SPAKE2 ticket authentication and the rendezvous UX
   (Phase 3). Today identities are generated and pinned directly in tests.
-- **L3 transfer** — framing, constant-rate pacing, cover traffic, key-update
-  scheduling, resumption-by-fresh-handshake (Phases 2, 4).
-- **Key-lifetime hardening** — zeroize-on-drop of session key material, and a test
-  asserting it (roadmap §3.3, §7).
+- **Traffic-analysis hardening** — constant-rate pacing, cover traffic,
+  randomized ramp-down (Phase 4). Until it lands, the transfer's rate, duration
+  and stop time still track the real payload, and the final short chunk reveals
+  the length to within one chunk.
 - **Tor transport binding** (Phase 5) and **hybrid PQ signatures** (Phase 6).
-- The `resumption`-disabled assertion is currently structural (there is no public
-  accessor on `ClientConfig.resumption` to compare against `disabled()`); a
-  behavioural "second connection is a full handshake" test should replace it once
-  a session abstraction exists.
+- **CLI/GUI integration** — nothing yet drives `Transfer` from a user-facing
+  command; `commands/direct.rs` still runs the Mode A blob flow.
+
+**Known limitations, stated plainly:**
+
+- **Session-key zeroization is bounded by what rustls does.** Our own long-term
+  identity key is in `Zeroizing`, but the ephemeral TLS secrets live inside
+  rustls/aws-lc-rs and we do not own that memory. Forward secrecy holds — the keys
+  are ephemeral and nothing persists them — but "scrub the freed heap" is not
+  something this crate can fully guarantee, and the roadmap §3.3.2 item should be
+  read that way.
+- **The key-update counter proves intent, not completion.** `key_updates()` counts
+  updates *we requested*; quinn exposes no confirmation that the peer completed
+  them, and documents `force_key_update` as existing "primarily for testing".
+- **Cancellation is observed at chunk boundaries**, so it is prompt while data
+  flows but relies on the 30 s QUIC idle timeout for a fully stalled peer.
+- **No cap on the offered size by default.** `Transfer::max_total_len` exists but
+  is unset: an authenticated-but-compromised sender could fill the receiver's
+  disk. A default cap was rejected because a wrong one silently breaks legitimate
+  multi-gigabyte vaults; the CLI should set it from available free space.
 
 ---
 
@@ -377,8 +440,11 @@ defense in depth but must not be described as a post-quantum Tor path.)
 | `rustls` 0.23 | TLS 1.3, raw public keys, `aws_lc_rs` provider |
 | `rcgen` | Ed25519 keypair generation / SPKI + PKCS#8 serialization |
 | `rustls-pki-types` | `CertificateDer` / `PrivateKeyDer` / `SubjectPublicKeyInfoDer` |
-| `tokio` | async runtime for the QUIC endpoints |
+| `tokio` | async runtime for the QUIC endpoints; async file I/O for L3 |
 | `thiserror` | error enum |
+| `async-trait` | object-safe async methods on `SecureSession` |
+| `zeroize` | wipe the long-term identity private key on drop |
+| `blake3` | L3 end-to-end integrity and the resume offset commitment |
 
 Versions are pinned in `p2p-live/Cargo.toml`; verify current releases before
 bumping — the hybrid-PQ group availability in particular is moving fast.
