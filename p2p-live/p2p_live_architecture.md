@@ -92,6 +92,8 @@ p2p-live/
                   message framing, and the intra-session key-update ratchet.
     transfer.rs   L3 protocol: chunked transfer, resume-by-fresh-handshake,
                   BLAKE3 integrity, crash-safe checkpointing, cancellation.
+    pacing.rs     L3 traffic-analysis hardening: constant-rate pacing, the
+                  frame-count ladder, and the randomised ramp-down.
     ticket.rs     L0: the connection ticket — identity, address hints, suite,
                   expiry — and its checksummed text form.
     pairing.rs    L4: SPAKE2 over a short secret, sealing the ticket exchange.
@@ -372,12 +374,45 @@ Sender S (source file)                            Receiver R (dest path)
   |  QUIC key update every 256 MiB sent (ratchet)   |  progress callback / cancel
   |---- DONE(BLAKE3(source)) ---------------------->|  verify full hash
   |                                                 |  fsync, rename .part -> dest
+  |---- COVER x (plan - real) --------------------->|  discard (ramp-down, §7.6)
+  |---- FINISH ------------------------------------>|
   |<--- ACK ----------------------------------------|
 ```
 
-Phase 4 adds constant-rate pacing, cover traffic and a randomized ramp-down on top
-of this frame sequence. Until then the stream's rate and stop time still track the
-real payload.
+The receiver deliberately does **not** acknowledge at `DONE`, though it holds the
+whole payload by then: a reply at that instant would mark the true end of data
+with a reverse-direction packet and undo the ramp-down. The `ACK` waits for
+`FINISH`, at the randomised end.
+
+### 7.6 L3 — traffic shaping (Phase 4, **implemented**)
+
+Everything below the payload is encrypted, but the *shape* of the flow is not. An
+unshaped transfer announces its volume (bytes on the wire ≈ bytes in the vault),
+its duration, and the exact moment the recipient finished receiving. Four
+mechanisms, all in `pacing.rs`:
+
+| Mechanism | What it removes |
+|-----------|-----------------|
+| **Uniform frame size** — every frame padded to `chunk_len + 5`, control messages included | The short final chunk revealing length mod chunk size; control frames identifiable by their small size |
+| **Constant rate** — one frame per fixed interval, not as fast as the link allows | Throughput and duration tracking the payload |
+| **Frame-count ladder** — emitted count rounded up (default: next power of two, floor 16 frames) | Volume tracking the payload; a 5.0 GB and 6.3 GB vault present the same count |
+| **Randomised tail** — 0–64 extra frames past the ladder | The stop time landing exactly on a ladder boundary, itself a fingerprint |
+
+Padding is zeros, not random bytes: it all sits inside the session AEAD, so an
+observer sees ciphertext either way and drawing gigabytes from the CSPRNG would
+buy nothing.
+
+Shaping is **on by default** and `Pacing::disabled()` has to be asked for by
+name. Frames stay uniformly padded even when it is disabled — that costs almost
+nothing and closes a leak no rate setting can.
+
+**Three honest limits.** *The rate must be sustainable or the guarantee degrades
+silently:* if the configured rate exceeds what the link or source disk can hold,
+the real bottleneck sets the pace again and throughput starts tracking conditions
+rather than the schedule. *Padding costs real bandwidth:* a power-of-two ladder
+bounds overhead below 2×, but under 2× of a 5 GB vault is still gigabytes of
+cover. *It hides the payload, not the conversation:* none of this touches the
+fact that two particular addresses exchanged packets.
 
 ### 7.4 L3 — resume after interruption (Phase 2, **implemented**)
 
@@ -441,23 +476,25 @@ defense in depth but must not be described as a post-quantum Tor path.)
 - *Phase 3* — L0 tickets with expiry and a checksummed text form, SPAKE2 pairing
   with transcript binding, brokerless rendezvous with deterministic roles, and
   an opt-in STUN client that is never called automatically.
-- **53 passing tests** across five targets: 35 unit (`src/`), 4 QUIC gate tests,
+- *Phase 4* — traffic shaping per §7.6: uniform frame padding, constant-rate
+  pacing, a quantised frame count and a randomised ramp-down, on by default.
+- **70 passing tests** across five targets: 52 unit (`src/`), 4 QUIC gate tests,
   5 session tests, 6 transfer/resume tests, 3 end-to-end pairing tests. The
   resume set covers the roadmap §7 requirements directly — byte-identical
   resumed output, a divergent prefix rejected at the seam, a non-durable tail
   rolled back to the last checkpoint, and a behavioural assertion that a second
-  connection offers no 0-RTT. `pairing_e2e.rs` drives the entire path from a
-  spoken code to a verified vault with no server of any kind involved.
+  connection offers no 0-RTT. The shaping set asserts against the **actual byte
+  stream** via an in-memory session double: every frame identical in size, cover
+  frames between `DONE` and `FINISH`, two different payloads presenting the same
+  frame count, and the rate limit measurably holding. `pairing_e2e.rs` drives the
+  entire path from a spoken code to a verified vault with no server of any kind
+  involved.
 
 **Not yet built (later phases):**
 
 - **Rendezvous UX** — the protocol exists; the human-facing part (getting two
   people online at once, guiding the two-round paste, showing fingerprints to
   compare) is the hard problem and is not designed yet.
-- **Traffic-analysis hardening** — constant-rate pacing, cover traffic,
-  randomized ramp-down (Phase 4). Until it lands, the transfer's rate, duration
-  and stop time still track the real payload, and the final short chunk reveals
-  the length to within one chunk.
 - **Tor transport binding** (Phase 5) and **hybrid PQ signatures** (Phase 6).
 - **CLI/GUI integration** — nothing yet drives `Transfer` from a user-facing
   command; `commands/direct.rs` still runs the Mode A blob flow.
@@ -479,6 +516,11 @@ defense in depth but must not be described as a post-quantum Tor path.)
   is unset: an authenticated-but-compromised sender could fill the receiver's
   disk. A default cap was rejected because a wrong one silently breaks legitimate
   multi-gigabyte vaults; the CLI should set it from available free space.
+- **Shaping protects the payload's shape, not the reverse direction's timing.**
+  The receiver's `RESUME` frame is padded like everything else, but it is sent
+  once the receiver has hashed its partial — so *when* it appears leaks roughly
+  how large that partial was, and therefore roughly how far an earlier attempt
+  got. Fixing it means a fixed-duration setup phase; not done.
 - **Rendezvous requires reachable addresses.** Behind symmetric or carrier-grade
   NAT it cannot succeed, and it cannot tell you that is why — it just times out.
   Adding a relay would fix it and would also add a broker, so it is excluded.

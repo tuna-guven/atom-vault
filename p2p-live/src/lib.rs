@@ -32,6 +32,7 @@
 //! makes the forward secrecy strict.
 
 pub mod identity;
+pub mod pacing;
 pub mod pairing;
 mod pinned;
 pub mod rendezvous;
@@ -50,6 +51,7 @@ use rustls::server::AlwaysResolvesServerRawPublicKeys;
 use identity::{LocalIdentity, PeerPublicKey};
 use pinned::{PinnedClientVerifier, PinnedServerVerifier};
 
+pub use pacing::{Ladder, Pacing};
 pub use pairing::{PairedChannel, PairingCode};
 pub use session::{
     DEFAULT_KEY_UPDATE_BYTES, Listener, MAX_FRAME_LEN, QuicSession, SecureSession, dial,

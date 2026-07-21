@@ -1,8 +1,9 @@
 # Roadmap — Strict Forward Secrecy & Post-Quantum Security
 
-> **Status: Phases 0–3 implemented** in the `p2p-live` crate (handshake, session
-> layer, live transfer with resume, pairing and rendezvous). Phase 3's *UX* and
-> Phases 4–7 remain outstanding. Nothing is wired into the CLI or GUI yet.
+> **Status: Phases 0–4 implemented** in the `p2p-live` crate (handshake, session
+> layer, live transfer with resume, pairing and rendezvous, traffic shaping).
+> Phase 3's *UX* and Phases 5–7 remain outstanding. Nothing is wired into the
+> CLI or GUI yet.
 >
 > This roadmap supersedes the Mode A (blind store) design as the *primary*
 > transfer mechanism. Companion docs: `p2p-live/p2p_live_architecture.md` (what
@@ -306,8 +307,31 @@ Suite IDs are the hook for §6 below: a non-forward-secret async mode would have
 to take a **new** suite value, so a peer can never silently reinterpret a live
 ticket as something with weaker guarantees.
 
-### Phase 4 — Traffic-analysis hardening
+### Phase 4 — Traffic-analysis hardening ✅ **done** (`p2p-live/src/pacing.rs`)
 - Constant-rate pacing, cover traffic, randomized ramp-down (§3.5).
+
+Delivered as four mechanisms, on by default (`Pacing::disabled()` must be asked
+for by name):
+
+- **Uniform frame size** — every frame padded to `chunk_len + 5`, control
+  messages included. Without this the short final chunk reveals the payload
+  length modulo the chunk size and control frames are identifiable by size alone.
+- **Constant rate** — default 4 MiB/s. **The rate must be sustainable or the
+  guarantee degrades silently**: above what the link or disk can hold, the
+  bottleneck sets the pace again.
+- **Frame-count ladder** — default next-power-of-two with a 16-frame floor, so a
+  5.0 GB and a 6.3 GB vault present the same count. Power-of-two rather than a
+  fixed multiple because it bounds overhead below 2× at *any* size; an absolute
+  ladder pads a small vault by an enormous multiple.
+- **Randomised tail** — 0–64 extra frames past the ladder, so the stop time does
+  not land exactly on a boundary (itself a fingerprint of this tool).
+
+The receiver holds its `ACK` until `FINISH` rather than sending it at `DONE`: an
+acknowledgement the moment the data completes would mark the true end with a
+reverse-direction packet and undo the ramp-down.
+
+Residual leak, not fixed: the receiver's `RESUME` timing reveals roughly how long
+it spent hashing its partial, hence roughly how far an earlier attempt got.
 
 ### Phase 5 — Tor transport binding
 - Run the same `SecureSession` over the existing onion transport.

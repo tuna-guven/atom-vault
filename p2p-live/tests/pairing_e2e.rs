@@ -9,11 +9,25 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use p2p_live::identity::LocalIdentity;
+use p2p_live::pacing::Pacing;
 use p2p_live::pairing::{self, PairingCode};
 use p2p_live::rendezvous::{self, Role};
 use p2p_live::ticket::Ticket;
 use p2p_live::transfer::{EncryptedAtRest, Transfer};
 use p2p_live::{SecureSession, transfer::Cancel};
+
+/// Traffic shaping stays **on** — this test is meant to exercise the real path —
+/// but at a loopback-appropriate rate and with a bounded tail, so the run takes
+/// a fraction of a second instead of minutes at the 4 MiB/s default.
+fn shaped() -> Transfer {
+    Transfer::new(EncryptedAtRest::aegis_vault())
+        .chunk_len(64 * 1024)
+        .pacing(
+            Pacing::default()
+                .at_rate(32 * 1024 * 1024)
+                .with_bounds(16, 8),
+        )
+}
 
 /// Claim a loopback port, then release it so the endpoint can take it.
 ///
@@ -94,8 +108,7 @@ async fn short_secret_to_verified_vault_over_a_brokerless_path() {
             .await
             .expect("alice rendezvous");
         // Alice sends the vault.
-        let t = Transfer::new(EncryptedAtRest::aegis_vault());
-        let summary = t.send(&mut session, &src, &mut |_| {}).await;
+        let summary = shaped().send(&mut session, &src, &mut |_| {}).await;
         let _ = session.close().await;
         summary
     });
@@ -109,8 +122,7 @@ async fn short_secret_to_verified_vault_over_a_brokerless_path() {
             bobs_view_of_alice.fingerprint(),
             "the authenticated peer must be the one from the ticket"
         );
-        let t = Transfer::new(EncryptedAtRest::aegis_vault());
-        let summary = t.recv(&mut session, &dst, &mut |_| {}).await;
+        let summary = shaped().recv(&mut session, &dst, &mut |_| {}).await;
         let _ = session.close().await;
         summary
     });
@@ -121,6 +133,12 @@ async fn short_secret_to_verified_vault_over_a_brokerless_path() {
 
     assert_eq!(sent.hash, received.hash, "both sides agree on the payload");
     assert_eq!(sent.total, vault.len() as u64);
+    assert!(
+        sent.cover_frames > 0 && sent.cover_frames == received.cover_frames,
+        "the shaped path must have emitted cover traffic, got {} / {}",
+        sent.cover_frames,
+        received.cover_frames
+    );
     assert_eq!(
         std::fs::read(dir.path().join("received.aegis")).unwrap(),
         vault,
