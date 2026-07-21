@@ -1,6 +1,7 @@
 # `p2p-live` — Strict-PFS, Post-Quantum Live Transfer Architecture
 
-> Sibling crate to `p2p-sync` (Tor) and `p2p-direct` (Mode A blind store).
+> Sibling crate to `p2p-sync` (the older Noise-over-Tor sync path). The former
+> `p2p-direct` (Mode A blind store) has been **deleted** — see roadmap Phase 7.
 > Implements the **live, both-peers-online** transfer mechanism from
 > `docs/pfs-pq-roadmap.md`. This document describes the architecture as built
 > **through Phase 5** (handshake, session layer, resumable transfer, pairing and
@@ -36,9 +37,12 @@ key entirely:
 
 ### What it costs (surfaced deliberately, per `CLAUDE.md` §10)
 
-1. **Async capability is gone.** A recipient who cannot be online at the same time
-   as the sender simply cannot receive through this crate. `p2p-direct` (Mode A)
-   remains the tool for the time-decoupled case, at the cost of PFS.
+1. **Async capability is gone, with no fallback.** A recipient who cannot be
+   online at the same time as the sender cannot receive at all. Mode A was the
+   time-decoupled option and has been deleted (roadmap Phase 7): it bought async
+   at the price of a `root_key` bearer capability, the one artifact a future
+   break could unlock a whole harvested vault with. This is a real operational
+   cost, accepted deliberately.
 2. **Peer-IP pairing becomes visible.** A direct connection tells both ISPs that A
    talked to B, when, and for how long. Mode A's strongest metadata property — the
    two peers never co-occurring on the wire — is not present in a direct live
@@ -72,9 +76,10 @@ and session channel, L3's resumable transfer with traffic shaping, and L4's
 SPAKE2 pairing. What remains is the human-facing rendezvous UX (Phase 3's hard
 half), hybrid PQ signatures (Phase 6), and integration into the CLI and GUI.
 
-Note what is **absent** compared to `p2p-direct`: there is no capability layer and
-no object store. The design deletes more than it adds — no cap, no manifest, no
-decoy objects, no ciphertext at rest.
+Note what is **absent** compared to the deleted Mode A: there is no capability
+layer and no object store. The design deleted more than it added — no cap, no
+manifest, no decoy objects, no ciphertext at rest, and now no second transfer
+mechanism to keep in sync.
 
 ---
 

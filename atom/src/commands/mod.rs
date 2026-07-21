@@ -1,7 +1,6 @@
 pub mod cat;
 pub mod create;
 pub mod daemon;
-pub mod direct;
 pub mod enter;
 pub mod export;
 pub mod friend;

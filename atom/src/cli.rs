@@ -108,55 +108,6 @@ pub enum Commands {
         friend_nickname: String,
     },
 
-    /// Transfer a vault without Tor, via a blind object store (async Mode A)
-    #[command(
-        long_about = "Transfer a vault without Tor, via a blind object store (Mode A).\n\n\
-        The store only ever sees equal-sized, opaque ciphertext under random IDs — never \
-        your vault, its true size, or who downloads it. Sender and recipient never appear \
-        on the wire at the same time.\n\n\
-        Because the two peers are never online together, the capability is delivered by a \
-        SPAKE2 handshake driven from a short secret you agree on out-of-band. Three short \
-        blobs travel your own secure channel (in person, Signal, ...):\n\
-        \x20 1. sender    -> recipient : handshake message A\n\
-        \x20 2. recipient -> sender    : handshake message B\n\
-        \x20 3. sender    -> recipient : sealed capability\n\n\
-        Keep the short secret OFF that channel. Your ISP and the store still see that you \
-        connected to the store — upload from behind a VPN if that matters."
-    )]
-    Direct {
-        #[command(subcommand)]
-        command: DirectCommands,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum DirectCommands {
-    /// Encode, encrypt, and upload a vault to a blind store
-    Send {
-        /// Path to the .aegis vault file to send
-        #[arg(long, value_parser = parse_vault_path)]
-        vault_path: String,
-
-        /// HTTPS base URL of the blind object store
-        #[arg(long, value_parser = parse_store_url)]
-        store_url: String,
-
-        /// Decoy padding for the on-store block count. More padding hides the
-        /// vault's true size better, at the cost of extra upload.
-        #[arg(long, default_value = "maximum", value_parser = parse_padding)]
-        padding: String,
-    },
-
-    /// Fetch and decrypt a vault from a blind store
-    Receive {
-        /// Where to write the decoded vault
-        #[arg(long, value_parser = parse_vault_path)]
-        save_path: String,
-
-        /// HTTPS base URL of the blind object store
-        #[arg(long, value_parser = parse_store_url)]
-        store_url: String,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -201,23 +152,6 @@ fn parse_vault_path(s: &str) -> Result<String, String> {
         return Err("Vault path is too long".to_string());
     }
     Ok(s.to_string())
-}
-
-fn parse_store_url(s: &str) -> Result<String, String> {
-    // Refuse plaintext HTTP up front rather than after a long upload. The store
-    // is untrusted, but the transport to it should still not be trivially
-    // observable or tamperable.
-    if !s.starts_with("https://") {
-        return Err("Store URL must start with 'https://'".to_string());
-    }
-    Ok(s.to_string())
-}
-
-fn parse_padding(s: &str) -> Result<String, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "maximum" | "balanced" | "none" => Ok(s.to_ascii_lowercase()),
-        _ => Err("Padding must be one of: maximum, balanced, none".to_string()),
-    }
 }
 
 fn parse_atom_url(s: &str) -> Result<String, String> {

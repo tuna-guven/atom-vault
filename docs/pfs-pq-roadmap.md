@@ -1,15 +1,14 @@
 # Roadmap — Strict Forward Secrecy & Post-Quantum Security
 
-> **Status: Phases 0–6 implemented** in the `p2p-live` crate (handshake, session
-> layer, live transfer with resume, pairing and rendezvous, traffic shaping, Tor
-> transport, hybrid PQ authentication). Phase 3's *UX* and Phase 7 remain
-> outstanding, as does the §6 open question. Nothing is wired into the CLI or
-> GUI yet.
+> **Status: all seven phases resolved.** Phases 0–6 are implemented in the
+> `p2p-live` crate; Phase 7 is decided and executed — **Mode A has been deleted**
+> (§6 option A). What remains outstanding is Phase 3's *UX* and the fact that
+> none of this is wired into the CLI or GUI yet.
 >
-> This roadmap supersedes the Mode A (blind store) design as the *primary*
-> transfer mechanism. Companion docs: `p2p-live/p2p_live_architecture.md` (what
-> the new path looks like as built), `p2p-direct/p2p_direct_architecture.md`
-> (the Mode A path it supersedes), `CLAUDE.md` (original spec).
+> This roadmap **replaces** the Mode A (blind store) design; the `p2p-direct`
+> crate no longer exists. Companion docs: `p2p-live/p2p_live_architecture.md`
+> (what the live path looks like as built), `CLAUDE.md` (original spec — note its
+> §1/§6 two-mode framing is now historical, see §6 below).
 
 ---
 
@@ -157,14 +156,16 @@ decoy ladder addressed. `encode.rs` remains relevant, but its job changes from
 
 ## 4. Disposition of existing code
 
-| Module | Fate | Rationale |
-|--------|------|-----------|
-| `encode.rs` (L3) | **Keep, adapt** | Framing reused; ladder → pacing/cover |
-| `crypto.rs` (L2) | **Mostly retire** | `root_key`/block-key machinery is the harvestable artifact we are eliminating. Keep AEAD/HKDF helpers. |
-| `pake.rs` (L4) | **Repurpose** | SPAKE2 moves from *cap delivery* to *pairing/ticket authentication* — a smaller, safer role |
-| `store.rs` (L1/A) | **Demote** | Keep only if an explicitly-labelled, non-PFS async fallback is wanted (§6) |
-| `p2p-sync` handshake | **Supersede** | Noise XX already gives PFS but is X25519-only; the new AKE replaces it and serves the Tor transport too |
-| `commands/direct.rs`, GUI panel | **Rework** | Three-step blob flow collapses into a live rendezvous |
+*Resolved as follows (Phase 7):*
+
+| Module | Fate | Outcome |
+|--------|------|---------|
+| `encode.rs` (L3) | Keep, adapt | **Deleted.** Its job — fixed framing and the decoy ladder — was rebuilt against the live stream in `p2p-live/src/pacing.rs`, not ported. |
+| `crypto.rs` (L2) | Mostly retire | **Deleted.** The `root_key`/block-key machinery *was* the harvestable artifact; TLS 1.3 supplies the AEAD now. |
+| `pake.rs` (L4) | Repurpose | **Deleted, reimplemented.** `p2p-live/src/pairing.rs` uses SPAKE2 for ticket authentication instead of cap delivery — a smaller, safer role. |
+| `store.rs` (L1/A) | Demote | **Deleted.** §6 answered A, so no async fallback is kept. |
+| `p2p-sync` handshake | Supersede | **Still present.** Superseded in principle by `p2p-live`, but not yet removed — nothing has migrated onto the new AKE. |
+| `commands/direct.rs`, GUI panel | Rework | **Deleted.** The live rendezvous that replaces them is not yet wired into the CLI or GUI. |
 
 **Note the direction of travel: this deletes more than it adds.** No cap, no
 store, no manifest, no decoy objects. That is a security win in itself.
@@ -412,13 +413,34 @@ still interoperate, so Phase 6 strands nobody.
 migrated — `p2p-live` has the types, the rest of the workspace still stores
 inline Ed25519 keys.
 
-### Phase 7 — Decide the fate of Mode A
+### Phase 7 — Decide the fate of Mode A ✅ **done — deleted**
 - Either delete it, or keep it behind a loud, explicitly-labelled
   "no forward secrecy" flag for the async case (§6).
 
+**Decision: option A. Mode A is gone.** Removed in full:
+
+| Removed | Lines |
+|---------|-------|
+| `p2p-direct/` crate (`crypto`, `encode`, `pake`, `store`, `lib`) | 1,059 |
+| `atom/src/commands/direct.rs` | 456 |
+| `atom direct send` / `atom direct receive` CLI + arg validators | ~90 |
+| GUI: the Direct transport tab, `DirectState`/`DirectRole`/`DirectStage`, the Mode A panel and its background-thread plumbing | ~560 |
+
+**What this removes from the threat surface.** The `root_key` bearer capability
+no longer exists anywhere in the codebase. That was the single artifact one
+discrete-log break unlocked a whole harvested vault with, and the only long-lived
+secret in the design. There is now no ciphertext at rest and nothing to harvest.
+
+**What it costs.** A recipient who genuinely cannot be online at the same time as
+the sender is unserved, with no fallback. This is a real operational cost for a
+high-risk recipient (§1), accepted deliberately.
+
+The prior Mode A architecture document went with the crate; it is recoverable
+from git history if the analysis is ever wanted again.
+
 ---
 
-## 6. The open question you should decide
+## 6. The open question — **answered: A**
 
 Phases 0–5 give strict PFS + PQ for peers who can be online together. **They do
 not serve a recipient who cannot.** Three options:
@@ -429,10 +451,19 @@ not serve a recipient who cannot.** Three options:
 | **B. Live + labelled async fallback** | Strict / none | Yes | Honest, but a fallback that silently loses PFS is a footgun — it must be hard to pick by accident. |
 | **C. Live + short-TTL async** | Bounded | Limited | Mode A with mandatory expiry + burn-after-fetch. Bounds the harvest window without pretending to be forward secret. |
 
-**Recommendation: A now, revisit C later.** Ship the strict path first and keep
-the codebase small; only reintroduce an async mode if a real recipient is
-actually blocked by its absence. Adding a weaker mode "just in case" tends to
-become the default, which defeats the purpose.
+**Decided: A.** Mode A is deleted (Phase 7). Two facts drove it:
+
+1. **Phase 5 narrowed Mode A's advantage to one thing.** Its two selling points
+   were async *and* peers never co-occurring on the wire. Live-over-Tor now
+   delivers the second **with** strict PFS, so async was all that remained — and
+   it still cost a bearer capability.
+2. **A weaker mode kept "just in case" tends to become the default.** Nothing
+   else in the design has a long-lived secret; keeping one path that does would
+   have made it the one people reach for when a rendezvous is inconvenient.
+
+Revisit C only if a real recipient is actually blocked by the absence of async —
+not pre-emptively. The reasoning above is the record of why it was removed, so
+re-adding it should have to argue against this, not rediscover it.
 
 ---
 

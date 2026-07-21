@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["atom", "p2p-sync", "p2p-direct", "p2p-live"]
+members = ["atom", "p2p-sync", "p2p-live"]

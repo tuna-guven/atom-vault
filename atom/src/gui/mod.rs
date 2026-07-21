@@ -42,93 +42,6 @@ struct RenameState {
     new_name: String,
 }
 
-/// Which transport the P2P screen is showing.
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum TransportTab {
-    /// Live sync over Tor onion services (the original mechanism).
-    Tor,
-    /// Non-Tor async transfer via a blind object store (Mode A).
-    Direct,
-}
-
-/// Which side of a Mode A transfer this user is performing.
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum DirectRole {
-    Send,
-    Receive,
-}
-
-/// Progress through the three-step out-of-band handshake. Mode A has no live
-/// channel, so the peers exchange blobs through their own secure channel.
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-enum DirectStage {
-    /// Enter the short secret; produce our handshake blob.
-    Secret,
-    /// Paste the peer's handshake blob; derive the session key.
-    Exchange,
-    /// Transfer, then hand over (or consume) the sealed capability.
-    Transfer,
-}
-
-/// State for the non-Tor Mode A panel.
-struct DirectState {
-    role: DirectRole,
-    stage: DirectStage,
-    short_secret: String,
-    /// Our outbound handshake blob, shown once `stage >= Exchange`.
-    our_blob: String,
-    /// The peer's handshake blob, pasted by the user.
-    peer_blob: String,
-    /// Held between step 1 and step 2; consumed by `complete_handshake`.
-    spake_state: Option<p2p_direct::pake::SpakeState>,
-    /// Derived at step 2; consumed by the transfer thread at step 3.
-    session_key: Option<p2p_direct::pake::SessionKey>,
-    store_url: String,
-    padding: crate::commands::direct::PaddingProfile,
-    /// Sender: produced by upload. Recipient: pasted by the user.
-    sealed_cap: String,
-    /// Recipient only — where the decoded vault is written.
-    save_path: String,
-    status: String,
-}
-
-impl Default for DirectState {
-    fn default() -> Self {
-        Self {
-            role: DirectRole::Send,
-            stage: DirectStage::Secret,
-            short_secret: String::new(),
-            our_blob: String::new(),
-            peer_blob: String::new(),
-            spake_state: None,
-            session_key: None,
-            store_url: String::new(),
-            padding: crate::commands::direct::PaddingProfile::Maximum,
-            sealed_cap: String::new(),
-            save_path: dirs::home_dir()
-                .unwrap_or_default()
-                .join(".atom_vault/received/direct.aegis")
-                .to_string_lossy()
-                .to_string(),
-            status: String::new(),
-        }
-    }
-}
-
-impl DirectState {
-    /// Reset everything derived from the short secret. Called when the user
-    /// edits the secret or restarts — a SPAKE2 exchange is strictly single-use.
-    fn reset_handshake(&mut self) {
-        self.stage = DirectStage::Secret;
-        self.our_blob.clear();
-        self.peer_blob.clear();
-        self.spake_state = None;
-        self.session_key = None;
-        self.sealed_cap.clear();
-        self.status.clear();
-    }
-}
-
 enum FileAction {
     Open(String),
     Export(String),
@@ -199,16 +112,6 @@ struct AtomVaultApp {
     sync_status_shared: Arc<Mutex<String>>,
     sync_done: Arc<AtomicBool>,
 
-    // P2P screen — non-Tor Mode A (blind store)
-    transport_tab: TransportTab,
-    direct: DirectState,
-    /// Status text written by the background transfer thread.
-    direct_status_shared: Arc<Mutex<String>>,
-    /// False while a Mode A upload/download is in flight.
-    direct_done: Arc<AtomicBool>,
-    /// Set by the upload thread with the sealed capability blob to hand over.
-    direct_sealed_result: Arc<Mutex<Option<Result<String, String>>>>,
-
     // Overlay dialogs
     incoming_sync: Option<IncomingSyncState>,
     rename_dialog: Option<RenameState>,
@@ -257,11 +160,6 @@ impl AtomVaultApp {
             selected_friend_idx: 0,
             sync_status_shared: Arc::new(Mutex::new(String::new())),
             sync_done: Arc::new(AtomicBool::new(true)),
-            transport_tab: TransportTab::Tor,
-            direct: DirectState::default(),
-            direct_status_shared: Arc::new(Mutex::new(String::new())),
-            direct_done: Arc::new(AtomicBool::new(true)),
-            direct_sealed_result: Arc::new(Mutex::new(None)),
             incoming_sync: None,
             rename_dialog: None,
         }
@@ -382,35 +280,6 @@ impl AtomVaultApp {
         }
     }
 
-    /// Pull the sealed capability (or error) produced by a finished Mode A
-    /// upload thread into the panel state.
-    fn poll_direct_results(&mut self, ctx: &Context) {
-        // Mirror the background thread's latest message. The slot is not cleared
-        // here so the final message stays visible after the thread exits; it is
-        // cleared explicitly by `reset_direct`.
-        if let Ok(guard) = self.direct_status_shared.lock() {
-            if !guard.is_empty() {
-                self.direct.status = guard.clone();
-            }
-        }
-
-        if let Some(result) = self
-            .direct_sealed_result
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
-        {
-            match result {
-                Ok(blob) => self.direct.sealed_cap = blob,
-                Err(e) => self.direct.status = format!("Failed: {}", e),
-            }
-        }
-
-        if !self.direct_done.load(Ordering::SeqCst) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        }
-    }
-
     fn poll_viewer_done(&mut self, ctx: &Context) {
         let done = self
             .viewer_done
@@ -462,7 +331,6 @@ impl eframe::App for AtomVaultApp {
         self.poll_file_dialog_results();
         self.poll_viewer_done(ctx);
         self.poll_broker_results(ctx);
-        self.poll_direct_results(ctx);
 
         // Refresh friends list once after each completed sync so the home
         // screen online/offline indicator reflects the latest last_seen value.
