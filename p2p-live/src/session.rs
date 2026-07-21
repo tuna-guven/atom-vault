@@ -31,7 +31,7 @@ use crate::{ALPN, Error, client_config, server_config};
 
 /// Server name presented in the TLS handshake. Authentication comes from the
 /// pinned raw public key, not from this name, so it is a fixed placeholder.
-const SERVER_NAME: &str = "atom-vault";
+pub(crate) const SERVER_NAME: &str = "atom-vault";
 
 /// Upper bound on a single framed message. Bounds the memory a peer can make the
 /// receiver allocate from one length prefix. The bulk transfer (Phase 2) streams
@@ -69,7 +69,7 @@ pub trait SecureSession: Send {
 
 /// Transport parameters shared by both ends: a keep-alive short enough that an
 /// idle pause during a transfer does not trip the idle timeout.
-fn transport_config() -> Arc<quinn::TransportConfig> {
+pub(crate) fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     t.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("30s is a valid idle timeout"),
@@ -90,6 +90,18 @@ pub struct QuicSession {
     key_update_bytes: u64,
     bytes_since_update: u64,
     key_updates: u64,
+}
+
+impl std::fmt::Debug for QuicSession {
+    /// Shows the peer by fingerprint and the ratchet state. There is no key
+    /// material in this struct, but keeping the impl explicit means a field
+    /// added later cannot start printing itself by accident.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicSession")
+            .field("peer", &self.peer.fingerprint())
+            .field("key_updates", &self.key_updates)
+            .finish_non_exhaustive()
+    }
 }
 
 impl QuicSession {
@@ -153,6 +165,20 @@ impl QuicSession {
             .await
             .map_err(|e| Error::Session(format!("write payload: {e}")))?;
         self.account_sent(len.len() as u64 + msg.len() as u64);
+        Ok(())
+    }
+
+    /// Read the peer's application hello and check it names our protocol.
+    async fn expect_hello(&mut self) -> Result<(), Error> {
+        let hello = self
+            .recv_frame_opt()
+            .await?
+            .ok_or_else(|| Error::Session("peer closed before sending a hello".into()))?;
+        if hello != ALPN {
+            return Err(Error::Session(
+                "peer sent an unexpected application hello".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -255,15 +281,59 @@ pub async fn dial(
         .await
         .map_err(|e| Error::Connect(e.to_string()))?;
 
-    // The dialing side must open and write first so the accepting side's
-    // `accept_bi` can complete (a QUIC bi-stream is not visible to the peer until
-    // the opener writes). The hello frame both establishes the stream and lets
-    // the peer sanity-check the application version.
+    client_session(endpoint, conn, expected_peer).await
+}
+
+/// Finish establishing a session on the *dialing* side of an existing
+/// connection.
+///
+/// Split out from [`dial`] so the rendezvous path, which owns a single endpoint
+/// acting as both client and server, can reuse it.
+///
+/// The dialing side must open and write first: a QUIC bi-directional stream is
+/// not visible to the peer until the opener writes, so the peer's `accept_bi`
+/// cannot complete otherwise. The hello frame does that job and lets the peer
+/// sanity-check the application version.
+///
+/// **The hello is a round trip, and that is load-bearing.** In TLS 1.3 the
+/// client finishes its handshake *before* the server has processed the client's
+/// certificate, so `connect().await` can resolve on a connection the peer is
+/// about to reject for failing its pin check. Waiting for the peer's hello back
+/// means a returned session is one where **both** sides completed
+/// authentication, rather than one where only we did. Without it, a caller can
+/// hold what looks like a session and only discover the rejection on its next
+/// read.
+pub(crate) async fn client_session(
+    endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+    peer: &PeerPublicKey,
+) -> Result<QuicSession, Error> {
     let (send, recv) = conn
         .open_bi()
         .await
         .map_err(|e| Error::Session(e.to_string()))?;
-    let mut session = QuicSession::new(endpoint, conn, send, recv, expected_peer.clone());
+    let mut session = QuicSession::new(endpoint, conn, send, recv, peer.clone());
+    session.send_frame(ALPN).await?;
+    session.expect_hello().await?;
+    Ok(session)
+}
+
+/// Finish establishing a session on the *accepting* side of an existing
+/// connection, validating the peer's hello and answering it.
+///
+/// The reply is what tells the dialer we accepted its identity; see
+/// [`client_session`].
+pub(crate) async fn server_session(
+    endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+    peer: &PeerPublicKey,
+) -> Result<QuicSession, Error> {
+    let (send, recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| Error::Session(e.to_string()))?;
+    let mut session = QuicSession::new(endpoint, conn, send, recv, peer.clone());
+    session.expect_hello().await?;
     session.send_frame(ALPN).await?;
     Ok(session)
 }
@@ -309,27 +379,6 @@ impl Listener {
             .await
             .ok_or_else(|| Error::Connect("endpoint closed".into()))?;
         let conn = incoming.await.map_err(|e| Error::Connect(e.to_string()))?;
-        let (send, recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| Error::Session(e.to_string()))?;
-        let mut session = QuicSession::new(
-            self.endpoint.clone(),
-            conn,
-            send,
-            recv,
-            self.expected_peer.clone(),
-        );
-
-        let hello = session
-            .recv_frame_opt()
-            .await?
-            .ok_or_else(|| Error::Session("peer closed before sending a hello".into()))?;
-        if hello != ALPN {
-            return Err(Error::Session(
-                "peer sent an unexpected application hello".into(),
-            ));
-        }
-        Ok(session)
+        server_session(self.endpoint.clone(), conn, &self.expected_peer).await
     }
 }

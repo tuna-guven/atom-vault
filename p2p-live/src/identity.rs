@@ -30,14 +30,26 @@ impl PeerPublicKey {
         &self.0
     }
 
-    /// Short hex fingerprint for display / ticket verification by humans.
+    /// Short fingerprint for display and for humans to compare out-of-band.
+    ///
+    /// This **must** be a hash of the whole SPKI, never a prefix of it: an
+    /// Ed25519 SPKI DER begins with a fixed 12-byte algorithm identifier
+    /// (`302a300506032b6570032100`), so any prefix-based fingerprint is
+    /// identical for every key in existence and would let a swapped identity
+    /// pass a human check unnoticed.
+    ///
+    /// 64 bits shown. Not a security boundary on its own — the full SPKI is what
+    /// is pinned — but it is what a human actually compares, so it has to
+    /// distinguish keys.
     pub fn fingerprint(&self) -> String {
         use std::fmt::Write;
-        // Not a security boundary on its own — the full SPKI is what is pinned.
-        self.0.iter().take(8).fold(String::new(), |mut acc, b| {
-            let _ = write!(acc, "{:02x}", b);
-            acc
-        })
+        let digest = blake3::hash(&self.0);
+        digest.as_bytes()[..8]
+            .iter()
+            .fold(String::new(), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
     }
 }
 
@@ -103,5 +115,31 @@ impl std::fmt::Debug for LocalIdentity {
         f.debug_struct("LocalIdentity")
             .field("public", &self.public.fingerprint())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for a real bug: `fingerprint` used to return the first
+    /// bytes of the SPKI DER, which is a *constant* algorithm identifier for
+    /// Ed25519. Every identity printed the same fingerprint, so a human
+    /// comparing them out-of-band could not have detected a swapped key.
+    #[test]
+    fn fingerprints_distinguish_identities() {
+        let a = LocalIdentity::generate().unwrap();
+        let b = LocalIdentity::generate().unwrap();
+        assert_ne!(
+            a.public_key().fingerprint(),
+            b.public_key().fingerprint(),
+            "distinct identities must have distinct fingerprints"
+        );
+        assert_eq!(
+            a.public_key().fingerprint(),
+            a.public_key().fingerprint(),
+            "fingerprints must be stable"
+        );
+        assert_eq!(a.public_key().fingerprint().len(), 16, "64 bits as hex");
     }
 }

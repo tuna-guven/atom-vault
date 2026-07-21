@@ -64,9 +64,13 @@ async fn peer_identity_is_the_pinned_key() {
     let client_pub = client_id.public_key().clone();
 
     let server = tokio::spawn(async move {
-        let s = listener.accept().await.unwrap();
+        let mut s = listener.accept().await.unwrap();
         // The server's view of its peer must be the client's key.
-        s.peer().clone()
+        let peer = s.peer().clone();
+        // Hold the session open until the client is done: dropping it here would
+        // tear the connection down before the handshake's hello reply flushes.
+        let _ = s.recv().await;
+        peer
     });
 
     let c = dial(unspecified(), addr, &client_id, &server_pub)
@@ -74,6 +78,8 @@ async fn peer_identity_is_the_pinned_key() {
         .unwrap();
     assert_eq!(c.peer(), &server_pub, "client's peer is the server");
 
+    // Release the connection so the server's blocking `recv` returns.
+    drop(c);
     let server_view_of_peer = server.await.unwrap();
     assert_eq!(
         server_view_of_peer, client_pub,
@@ -113,7 +119,8 @@ async fn oversized_frame_is_refused() {
     let server_pub = server_id.public_key().clone();
 
     tokio::spawn(async move {
-        let _ = listener.accept().await;
+        let mut s = listener.accept().await.unwrap();
+        let _ = s.recv().await; // keep the session alive for the client
     });
 
     let mut c = dial(unspecified(), addr, &client_id, &server_pub)

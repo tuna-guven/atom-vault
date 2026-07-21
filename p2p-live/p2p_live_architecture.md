@@ -92,10 +92,16 @@ p2p-live/
                   message framing, and the intra-session key-update ratchet.
     transfer.rs   L3 protocol: chunked transfer, resume-by-fresh-handshake,
                   BLAKE3 integrity, crash-safe checkpointing, cancellation.
+    ticket.rs     L0: the connection ticket — identity, address hints, suite,
+                  expiry — and its checksummed text form.
+    pairing.rs    L4: SPAKE2 over a short secret, sealing the ticket exchange.
+    rendezvous.rs L1: brokerless simultaneous-open / NAT hole punching.
+    stun.rs       L1, opt-in and off by default: external-address discovery.
   tests/
     pq_handshake.rs   End-to-end gate tests over real QUIC (Phase 0 gate).
     session.rs        Framing, identity, frame caps, key-update (Phase 1).
     transfer.rs       Round-trip, resume, seam rejection, rollback (Phase 2).
+    pairing_e2e.rs    Short secret → ticket → rendezvous → vault (Phase 3).
 ```
 
 The public surface is deliberately small. L2 exposes the config builders
@@ -243,25 +249,74 @@ Textual sequences for the diagrams to be drawn later. Phase 0 implements only
 §7.2 (the handshake); §7.1 and §7.3–§7.5 describe the surrounding flow the later
 phases will build.
 
-### 7.1 L0 — one-time out-of-band pairing (Phase 3, planned)
+### 7.1 L0/L4 — one-time out-of-band pairing (Phase 3, **implemented**)
+
+Two rounds over whatever channel the humans have. Both rounds are assumed
+**observed**; neither reveals anything to an observer who lacks the code.
 
 ```
-Sender S                        Recipient R
-  |  generate LocalIdentity (Ed25519)   |  generate LocalIdentity (Ed25519)
-  |                                     |
-  |-- ticket_S = {SPKI_S, transport hints, suite id} -->|   (out-of-band channel:
-  |<-- ticket_R = {SPKI_R, transport hints, suite id} --|    in person / Signal / QR)
-  |                                     |
-  |  short secret spoken/typed out-of-band (both sides)  |
-  |  SPAKE2(short secret) authenticates the ticket swap  |
-  |                                     |
-  |  each side now pins the OTHER's SPKI as PeerPublicKey |
+A                                                B
+  |  generate LocalIdentity (Ed25519, once)       |  generate LocalIdentity
+  |                                               |
+  |  A reads a short code aloud; B types it in    |   ~55 bits, single use
+  |                                               |
+  |  (state, msg_a) = pairing::start(code)        |  (state, msg_b) = start(code)
+  |------ round 1: msg_a -------------------------->|
+  |<----- round 1: msg_b ---------------------------|
+  |  chan = state.finish(msg_b)                   |  chan = state.finish(msg_a)
+  |                                               |
+  |  ticket_a = {SPKI_a, hints, suite, expiry}    |  ticket_b = {...}
+  |------ round 2: chan.seal_ticket(ticket_a) ----->|
+  |<----- round 2: chan.seal_ticket(ticket_b) ------|
+  |                                               |
+  |  each side now pins the OTHER's SPKI, and can compare fingerprints aloud
 ```
 
 The short secret is the **root of trust for the whole transfer** (spec §7): the
 crypto below is all downstream of one human exchanging a few words safely. SPAKE2
 expands it so that an eavesdropper who lacks the exact secret learns nothing and
-gets a single online guess.
+an active attacker gets a single online guess rather than an offline dictionary
+attack on the transcript.
+
+Three properties beyond plain SPAKE2:
+
+- **Two rounds are inherent.** Neither side can derive the key until it has seen
+  the other's SPAKE2 message, so nothing can be sealed in round 1. Any one-paste
+  scheme either drops the PAKE or sends the ticket unprotected.
+- **Sealed tickets are bound to their exchange.** Both SPAKE2 messages go into
+  the AEAD's associated data, so a sealed ticket captured from one pairing cannot
+  be replayed into another — even between the same two people reusing a code.
+- **What crosses is a ticket, not a capability.** Compare with the Mode A design
+  this replaces, where the same PAKE delivered a vault's master key. A ticket
+  carries no key material: it lets you *attempt* a connection to someone who has
+  pinned you, and decrypts nothing.
+
+### 7.1a L1 — rendezvous (Phase 3, **implemented**)
+
+Both peers run `rendezvous` at roughly the same wall-clock time. No discovery
+server, no relay, no signalling.
+
+```
+A (smaller identity -> Dialer)                   B (larger identity -> Accepter)
+  |  bind ONE UDP socket, client+server config    |  bind ONE UDP socket
+  |                                               |
+  |-- QUIC Initial -> B's hint (opens A's NAT) -->|  <-- punch attempts open B's
+  |     retry every 500ms until connected         |      NAT; results discarded
+  |                                               |
+  |===== §7.2 handshake on the winning path ======|
+```
+
+Roles come from comparing the two identity keys — the smaller dials — so both
+sides agree with **no extra round trip**. Without a fixed rule, two connections
+can form and a sender could end up on one while the receiver waits on the other.
+
+Both sides transmit regardless of role: a stateful NAT only forwards inbound
+packets that match a mapping some earlier outbound packet created, so the
+accepter's discarded attempts are what make it reachable at all. This defeats
+full-cone, restricted-cone and port-restricted NATs. It does **not** defeat
+symmetric or carrier-grade NAT, which allocate a fresh external port per
+destination; there is no relay fallback by design, so those cases need port
+forwarding, a VPN, or the Tor transport (Phase 5).
 
 ### 7.2 L2 — the live handshake (Phase 0, **implemented**)
 
@@ -383,16 +438,22 @@ defense in depth but must not be described as a post-quantum Tor path.)
   end-to-end integrity, resume-by-fresh-handshake with seam verification,
   checkpointed `fsync` durability, verify-then-rename, progress reporting and
   cooperative cancellation.
-- **23 passing tests** across four targets: 8 unit (`src/`), 4 QUIC gate tests,
-  5 session tests, 6 transfer/resume tests. The resume set covers the roadmap §7
-  requirements directly — byte-identical resumed output, a divergent prefix
-  rejected at the seam, a non-durable tail rolled back to the last checkpoint,
-  and a behavioural assertion that a second connection offers no 0-RTT.
+- *Phase 3* — L0 tickets with expiry and a checksummed text form, SPAKE2 pairing
+  with transcript binding, brokerless rendezvous with deterministic roles, and
+  an opt-in STUN client that is never called automatically.
+- **53 passing tests** across five targets: 35 unit (`src/`), 4 QUIC gate tests,
+  5 session tests, 6 transfer/resume tests, 3 end-to-end pairing tests. The
+  resume set covers the roadmap §7 requirements directly — byte-identical
+  resumed output, a divergent prefix rejected at the seam, a non-durable tail
+  rolled back to the last checkpoint, and a behavioural assertion that a second
+  connection offers no 0-RTT. `pairing_e2e.rs` drives the entire path from a
+  spoken code to a verified vault with no server of any kind involved.
 
 **Not yet built (later phases):**
 
-- **L4/L0 pairing** — SPAKE2 ticket authentication and the rendezvous UX
-  (Phase 3). Today identities are generated and pinned directly in tests.
+- **Rendezvous UX** — the protocol exists; the human-facing part (getting two
+  people online at once, guiding the two-round paste, showing fingerprints to
+  compare) is the hard problem and is not designed yet.
 - **Traffic-analysis hardening** — constant-rate pacing, cover traffic,
   randomized ramp-down (Phase 4). Until it lands, the transfer's rate, duration
   and stop time still track the real payload, and the final short chunk reveals
@@ -418,6 +479,28 @@ defense in depth but must not be described as a post-quantum Tor path.)
   is unset: an authenticated-but-compromised sender could fill the receiver's
   disk. A default cap was rejected because a wrong one silently breaks legitimate
   multi-gigabyte vaults; the CLI should set it from available free space.
+- **Rendezvous requires reachable addresses.** Behind symmetric or carrier-grade
+  NAT it cannot succeed, and it cannot tell you that is why — it just times out.
+  Adding a relay would fix it and would also add a broker, so it is excluded.
+- **A ticket is not public.** It links an identity to an IP address, which is
+  precisely the pairing metadata the threat model protects. It carries no key
+  material, but it must still travel the pairing channel rather than the clear.
+- **STUN, if used, tells a server your IP** moments before a transfer. It is off
+  by default, never called automatically, and the manual-address path is the
+  documented default everywhere.
+
+**Fixed during Phase 3 — worth recording:**
+
+- `PeerPublicKey::fingerprint` returned the first bytes of the SPKI DER, which
+  for Ed25519 is a **constant** algorithm identifier. Every identity displayed
+  the same fingerprint, so the human comparison step — the thing that catches a
+  swapped key — could not have caught anything. It is now BLAKE3 over the whole
+  SPKI, with a test asserting two identities differ.
+- The application hello is now a **round trip**. In TLS 1.3 the client finishes
+  its handshake before the server processes the client certificate, so `dial`
+  could return a session the peer was in the middle of rejecting; the caller
+  only found out on its next read. Waiting for the peer's hello means a returned
+  session is one where *both* sides completed authentication.
 
 ---
 

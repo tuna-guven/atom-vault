@@ -1,7 +1,8 @@
 # Roadmap — Strict Forward Secrecy & Post-Quantum Security
 
-> **Status: Phases 0–2 implemented** in the `p2p-live` crate (handshake, session
-> layer, live transfer with resume). Phases 3–7 remain proposals.
+> **Status: Phases 0–3 implemented** in the `p2p-live` crate (handshake, session
+> layer, live transfer with resume, pairing and rendezvous). Phase 3's *UX* and
+> Phases 4–7 remain outstanding. Nothing is wired into the CLI or GUI yet.
 >
 > This roadmap supersedes the Mode A (blind store) design as the *primary*
 > transfer mechanism. Companion docs: `p2p-live/p2p_live_architecture.md` (what
@@ -285,13 +286,25 @@ connection migration survives many IP/port changes without dropping. The resume
 protocol above is only for **full** drops: process death, sleep past the idle
 timeout, peer restart, long outage.
 
-### Phase 3 — L0 pairing & rendezvous UX
+### Phase 3 — L0 pairing & rendezvous ✅ **protocol done**, UX outstanding
 - Ticket format: identity key(s), transport hints, capability/suite IDs.
+  → `ticket.rs`, plus an expiry (a stale ticket names an address that may have
+  been reassigned) and a checksummed text form.
 - SPAKE2 repurposed to authenticate ticket exchange over an untrusted channel.
-- Rendezvous UX: both peers online simultaneously — the hardest *human* problem
-  here, and the one most likely to sink adoption. Budget real design time.
+  → `pairing.rs`. Note it now delivers a *ticket*, not a capability: if this
+  exchange is compromised the attacker can attempt a MITM at pairing time but
+  obtains no key that decrypts anything, because none exists.
 - NAT traversal: manual address entry by default, STUN opt-in with an explicit
-  warning (per spec §6).
+  warning (per spec §6). → `rendezvous.rs` and `stun.rs`; STUN is never called
+  automatically.
+- **Rendezvous UX: still outstanding.** The protocol works; getting two people
+  online at once, guiding a two-round paste, and making fingerprint comparison
+  something users actually do is the hard part and is not designed yet. It
+  remains, as noted, the thing most likely to sink adoption.
+
+Suite IDs are the hook for §6 below: a non-forward-secret async mode would have
+to take a **new** suite value, so a peer can never silently reinterpret a live
+ticket as something with weaker guarantees.
 
 ### Phase 4 — Traffic-analysis hardening
 - Constant-rate pacing, cover traffic, randomized ramp-down (§3.5).

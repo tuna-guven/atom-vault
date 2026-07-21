@@ -32,8 +32,12 @@
 //! makes the forward secrecy strict.
 
 pub mod identity;
+pub mod pairing;
 mod pinned;
+pub mod rendezvous;
 pub mod session;
+pub mod stun;
+pub mod ticket;
 pub mod transfer;
 
 use std::sync::Arc;
@@ -46,9 +50,11 @@ use rustls::server::AlwaysResolvesServerRawPublicKeys;
 use identity::{LocalIdentity, PeerPublicKey};
 use pinned::{PinnedClientVerifier, PinnedServerVerifier};
 
+pub use pairing::{PairedChannel, PairingCode};
 pub use session::{
     DEFAULT_KEY_UPDATE_BYTES, Listener, MAX_FRAME_LEN, QuicSession, SecureSession, dial,
 };
+pub use ticket::{Suite, Ticket};
 pub use transfer::{Cancel, EncryptedAtRest, Progress, Summary, Transfer};
 
 /// ALPN identifying this protocol version. Bound into the handshake, so a peer
@@ -81,6 +87,12 @@ pub enum Error {
 
     #[error("transfer cancelled")]
     Cancelled,
+
+    #[error("ticket error: {0}")]
+    Ticket(String),
+
+    #[error("pairing error: {0}")]
+    Pairing(String),
 
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
