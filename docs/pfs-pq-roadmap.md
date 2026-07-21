@@ -1,9 +1,10 @@
 # Roadmap — Strict Forward Secrecy & Post-Quantum Security
 
-> **Status: Phases 0–5 implemented** in the `p2p-live` crate (handshake, session
+> **Status: Phases 0–6 implemented** in the `p2p-live` crate (handshake, session
 > layer, live transfer with resume, pairing and rendezvous, traffic shaping, Tor
-> transport). Phase 3's *UX*, Phase 6 and Phase 7 remain outstanding. Nothing is
-> wired into the CLI or GUI yet.
+> transport, hybrid PQ authentication). Phase 3's *UX* and Phase 7 remain
+> outstanding, as does the §6 open question. Nothing is wired into the CLI or
+> GUI yet.
 >
 > This roadmap supersedes the Mode A (blind store) design as the *primary*
 > transfer mechanism. Companion docs: `p2p-live/p2p_live_architecture.md` (what
@@ -362,9 +363,54 @@ the AKE be transport-agnostic.
 Framing was factored into `framing.rs` and is now shared, so the frame size cap
 cannot drift between transports.
 
-### Phase 6 — Hybrid PQ signatures
+### Phase 6 — Hybrid PQ signatures ⚠️ **partly done** (`p2p-live/src/{bundle,pq_auth}.rs`)
 - Ed25519 + ML-DSA-65 identity.
 - Requires the `atom://` URI → identity-bundle-hash migration (§3.4).
+
+**Gate finding: PQ signatures cannot go in the TLS handshake on this stack.**
+Checked before building anything, per the Phase 0 discipline:
+
+- `rustls` 0.23 defines `SignatureScheme::ML_DSA_65` as a draft code point, but
+  its `aws-lc-rs` provider implements **neither signing nor verification** for
+  it. There is nothing to switch on.
+- Even given an implementation, TLS 1.3's `CertificateVerify` carries exactly
+  **one** signature. Hybrid would need a composite scheme
+  (draft-ietf-lamps-pq-composite-sigs); defining our own is inventing
+  cryptography in the one area §3.1 forbids it.
+- ML-DSA *instead of* Ed25519 fails §3.2's hybrid-never-PQ-only reasoning, which
+  applies to signatures as much as to key agreement.
+
+**What was built instead:** the PQ signature moved *above* the handshake, where
+it needs no new cryptography. After the session is established, each side signs a
+BLAKE3 transcript over the **TLS exporter** (RFC 5705, exposed by both
+transports) plus a side label and both bundle IDs, using ML-DSA-65, and verifies
+the peer's. This is channel binding, not a new key exchange.
+
+- **What it buys:** an attacker who forges Ed25519 completes the handshake but
+  cannot produce the proof, so the session is refused before any payload moves.
+  Impersonation requires breaking **both** primitives — the Phase 6 goal.
+- **Why the exporter matters:** a man in the middle runs two sessions with
+  different exporter values, so a proof captured on one leg does not verify on
+  the other. Without the binding the scheme would be relayable and worthless.
+- **What it is not:** a post-quantum TLS handshake. The attacker still completes
+  a handshake and derives session keys before rejection. When rustls ships
+  ML-DSA, the signature belongs in `CertificateVerify` and this layer becomes
+  redundant.
+
+**The §3.4 migration is done.** `IdentityBundle` = Ed25519 SPKI + optional
+ML-DSA-65 key; `BundleId` = BLAKE3 over the whole bundle, 32 bytes, **52 base32
+characters — the same shape as the inline key it replaces**, so the `atom://` URI
+format is unchanged in size. Tickets carry the full bundle (they travel over the
+pairing channel, where ~2 KB is free); the URI carries only the ID. The ID covers
+*both* keys, so substituting the PQ half changes the fingerprint a human reads.
+
+**Requirement is undowngradeable:** whether a proof is demanded comes from the
+**pinned** bundle, never from what the peer presents. Classical-only identities
+still interoperate, so Phase 6 strands nobody.
+
+**Still outstanding:** the `atom://` friend-list format in `atom/` has not been
+migrated — `p2p-live` has the types, the rest of the workspace still stores
+inline Ed25519 keys.
 
 ### Phase 7 — Decide the fate of Mode A
 - Either delete it, or keep it behind a loud, explicitly-labelled

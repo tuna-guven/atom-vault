@@ -211,14 +211,14 @@ async fn an_onion_only_ticket_is_not_dialled_directly() {
     use p2p_live::ticket::{Endpoint, Ticket};
     use p2p_live::tor::OnionAddress;
 
-    let me = LocalIdentity::generate().unwrap();
-    let peer = LocalIdentity::generate().unwrap();
+    let me = p2p_live::bundle::LocalBundle::generate().unwrap();
+    let peer = p2p_live::bundle::LocalBundle::generate().unwrap();
     let onion = OnionAddress::new(
         "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion",
         4433,
     )
     .unwrap();
-    let ticket = Ticket::new(peer.public_key().clone(), vec![Endpoint::Onion(onion)]).unwrap();
+    let ticket = Ticket::new(peer.bundle(), vec![Endpoint::Onion(onion)]).unwrap();
 
     let err = rendezvous::rendezvous(
         "127.0.0.1:0".parse().unwrap(),

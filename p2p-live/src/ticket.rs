@@ -36,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use data_encoding::BASE32_NOPAD;
 
 use crate::Error;
-use crate::identity::PeerPublicKey;
+use crate::bundle::{BundleId, IdentityBundle};
 use crate::tor::OnionAddress;
 
 /// Human-visible prefix. Includes the format version so a future incompatible
@@ -145,7 +145,13 @@ impl Suite {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ticket {
     /// The peer's identity — this is what the session pins.
-    pub identity: PeerPublicKey,
+    ///
+    /// Carries the **full** hybrid bundle, not just its identifier: a ticket
+    /// travels over the pairing channel where a couple of kilobytes costs
+    /// nothing, and the recipient needs the actual post-quantum key to verify
+    /// the channel proof. The 32-byte [`BundleId`] is the short form for a URI
+    /// or for a human to read aloud (roadmap §3.4).
+    pub identity: IdentityBundle,
     /// Places to try, in preference order. May be empty when the peer will be
     /// the one dialling.
     pub hints: Vec<Endpoint>,
@@ -157,7 +163,7 @@ pub struct Ticket {
 
 impl Ticket {
     /// Build a ticket valid for [`DEFAULT_TTL_SECS`] from now.
-    pub fn new(identity: PeerPublicKey, hints: Vec<Endpoint>) -> Result<Self, Error> {
+    pub fn new(identity: IdentityBundle, hints: Vec<Endpoint>) -> Result<Self, Error> {
         Ok(Ticket {
             identity,
             hints,
@@ -189,9 +195,23 @@ impl Ticket {
         Ok(())
     }
 
-    /// The peer fingerprint humans compare out-of-band.
+    /// The identity this ticket names, in short form.
+    pub fn id(&self) -> BundleId {
+        self.identity.id()
+    }
+
+    /// The fingerprint humans compare out-of-band.
+    ///
+    /// Derived from the whole bundle, so it changes if *either* key is
+    /// substituted — a fingerprint over the classical key alone would let the
+    /// post-quantum half be swapped without the human check noticing.
     pub fn fingerprint(&self) -> String {
-        self.identity.fingerprint()
+        self.identity.id().fingerprint()
+    }
+
+    /// Whether the named identity carries post-quantum authentication.
+    pub fn is_hybrid(&self) -> bool {
+        self.identity.is_hybrid()
     }
 
     /// Canonical binary encoding — the input to both the text form and the
@@ -202,9 +222,10 @@ impl Ticket {
         v.push(self.suite.to_byte());
         v.extend_from_slice(&self.not_after.to_be_bytes());
 
-        let der = self.identity.as_der();
-        v.push(der.len() as u8);
-        v.extend_from_slice(der);
+        let bundle = self.identity.to_bytes();
+        // A hybrid bundle is ~2 KB, well past a one-byte length.
+        v.extend_from_slice(&(bundle.len() as u16).to_be_bytes());
+        v.extend_from_slice(&bundle);
 
         v.push(self.hints.len() as u8);
         for hint in &self.hints {
@@ -273,11 +294,12 @@ impl Ticket {
         let suite = Suite::from_byte(r.u8()?)?;
         let not_after = r.u64()?;
 
-        let id_len = r.u8()? as usize;
+        let id_len = r.u16()? as usize;
         if id_len == 0 {
             return Err(Error::Ticket("ticket carries no identity".into()));
         }
-        let identity = PeerPublicKey::from_der(r.take(id_len)?.to_vec());
+        let identity = IdentityBundle::from_bytes(r.take(id_len)?)
+            .map_err(|e| Error::Ticket(format!("ticket carries a bad identity: {e}")))?;
 
         let hint_count = r.u8()? as usize;
         if hint_count > MAX_HINTS {
@@ -446,7 +468,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::LocalIdentity;
+    use crate::bundle::LocalBundle;
 
     const ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion";
 
@@ -455,9 +477,9 @@ mod tests {
     }
 
     fn sample() -> Ticket {
-        let id = LocalIdentity::generate().unwrap();
+        let id = LocalBundle::generate().unwrap();
         Ticket::new(
-            id.public_key().clone(),
+            id.bundle(),
             vec![
                 direct("203.0.113.7:4433"),
                 direct("[2001:db8::1]:4433"),
@@ -535,8 +557,8 @@ mod tests {
 
     #[test]
     fn too_many_hints_are_refused() {
-        let id = LocalIdentity::generate().unwrap();
-        let mut t = Ticket::new(id.public_key().clone(), vec![]).unwrap();
+        let id = LocalBundle::generate().unwrap();
+        let mut t = Ticket::new(id.bundle(), vec![]).unwrap();
         t.hints = (0..=MAX_HINTS)
             .map(|i| {
                 Endpoint::Direct(SocketAddr::new(
@@ -564,25 +586,45 @@ mod tests {
     #[test]
     fn fingerprint_comes_from_the_identity() {
         let t = sample();
-        assert_eq!(t.fingerprint(), t.identity.fingerprint());
+        assert_eq!(t.fingerprint(), t.identity.id().fingerprint());
         assert_ne!(t.fingerprint(), sample().fingerprint());
+    }
+
+    /// A ticket must carry the *whole* hybrid identity, not just its id: the
+    /// recipient needs the actual post-quantum key to verify the channel proof.
+    #[test]
+    fn a_ticket_carries_the_full_hybrid_identity() {
+        let t = Ticket::from_text(&sample().to_text()).unwrap();
+        assert!(t.is_hybrid(), "the bundle's PQ key must survive the ticket");
+        assert_eq!(t.identity.pq().unwrap().as_bytes().len(), 1952);
     }
 
     /// A ticket contains no secret: everything in it is derivable from the
     /// peer's public key and address.
     #[test]
     fn ticket_carries_no_key_material() {
-        let id = LocalIdentity::generate().unwrap();
-        let t = Ticket::new(id.public_key().clone(), vec![]).unwrap();
+        let id = LocalBundle::generate().unwrap();
+        let t = Ticket::new(id.bundle(), vec![]).unwrap();
         let bytes = t.to_bytes();
-        // The only identity-derived bytes present are the public SPKI itself.
-        let der = id.public_key().as_der();
-        let occurrences = bytes.windows(der.len()).filter(|w| *w == der).count();
+        // Only public halves appear: the Ed25519 SPKI and the ML-DSA public key,
+        // each exactly once, and nothing else.
+        let der = id.classical().public_key().as_der();
         assert_eq!(
-            occurrences, 1,
-            "the SPKI appears once and nothing else does"
+            bytes.windows(der.len()).filter(|w| *w == der).count(),
+            1,
+            "the SPKI appears once"
         );
-        assert_eq!(bytes.len(), 1 + 1 + 8 + 1 + der.len() + 1);
+        let pq = id.bundle().pq().unwrap().as_bytes().to_vec();
+        assert_eq!(
+            bytes.windows(pq.len()).filter(|w| *w == pq).count(),
+            1,
+            "the post-quantum public key appears once"
+        );
+        // Header, the bundle, and an empty hint list — no room for anything else.
+        assert_eq!(
+            bytes.len(),
+            1 + 1 + 8 + 2 + id.bundle().to_bytes().len() + 1
+        );
     }
 
     /// Both transports must survive the round trip, and each must be selectable
@@ -601,9 +643,9 @@ mod tests {
     /// v3 address must be rejected while decoding, not handed to a SOCKS proxy.
     #[test]
     fn a_malformed_onion_hint_is_rejected_while_decoding() {
-        let id = LocalIdentity::generate().unwrap();
+        let id = LocalBundle::generate().unwrap();
         let t = Ticket::new(
-            id.public_key().clone(),
+            id.bundle(),
             vec![Endpoint::Onion(OnionAddress::new(ONION, 443).unwrap())],
         )
         .unwrap();

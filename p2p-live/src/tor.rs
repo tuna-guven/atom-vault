@@ -152,7 +152,7 @@ pub async fn connect_onion(
 pub async fn dial(
     socks: std::net::SocketAddr,
     ticket: &crate::ticket::Ticket,
-    local: &crate::identity::LocalIdentity,
+    local: &crate::bundle::LocalBundle,
 ) -> Result<crate::tls::TlsSession<TcpStream>, Error> {
     ticket.check_valid()?;
 
@@ -166,7 +166,36 @@ pub async fn dial(
     })?;
 
     let stream = connect_onion(socks, addr).await?;
-    crate::tls::TlsSession::connect(stream, local, &ticket.identity).await
+    let mut session =
+        crate::tls::TlsSession::connect(stream, local.classical(), ticket.identity.classical())
+            .await?;
+    // Same reasoning as the direct rendezvous: the post-quantum proof runs here,
+    // not in the caller, so it cannot be skipped by omission.
+    crate::pq_auth::authenticate(
+        &mut session,
+        local,
+        &ticket.identity,
+        crate::pq_auth::Side::Initiator,
+    )
+    .await?;
+    Ok(session)
+}
+
+/// Accept a circuit on `listener` and complete both authentication steps.
+///
+/// The onion counterpart of [`dial`]. `peer` is the pinned identity bundle from
+/// the peer's ticket.
+pub async fn accept(
+    listener: &OnionListener,
+    local: &crate::bundle::LocalBundle,
+    peer: &crate::bundle::IdentityBundle,
+) -> Result<crate::tls::TlsSession<TcpStream>, Error> {
+    let stream = listener.accept().await?;
+    let mut session =
+        crate::tls::TlsSession::accept(stream, local.classical(), peer.classical()).await?;
+    crate::pq_auth::authenticate(&mut session, local, peer, crate::pq_auth::Side::Responder)
+        .await?;
+    Ok(session)
 }
 
 /// The local side of an onion service.

@@ -101,6 +101,8 @@ p2p-live/
     framing.rs    Length-prefixed framing + size cap, shared by both transports.
     tls.rs        L2 over any byte stream: the second SecureSession impl.
     tor.rs        L1 over Tor: onion address validation, SOCKS5, onion listener.
+    bundle.rs     Hybrid identity: Ed25519 + ML-DSA-65, the bundle id, URI form.
+    pq_auth.rs    Post-quantum channel proof over the TLS exporter.
   tests/
     pq_handshake.rs   End-to-end gate tests over real QUIC (Phase 0 gate).
     session.rs        Framing, identity, frame caps, key-update (Phase 1).
@@ -498,6 +500,58 @@ Tor layer itself stays classical — onion v3 identity is Ed25519 and ntor is
 X25519, outside our control; our session *inside* it is PQ, which is genuine
 defense in depth but must not be described as a post-quantum Tor path.)
 
+### 7.7 L2 — post-quantum channel authentication (Phase 6, **implemented**)
+
+Roadmap Phase 6 asked for hybrid PQ **signatures in the handshake**. That is not
+available on this stack, and the check was worth making before building:
+
+- `rustls` 0.23 has `SignatureScheme::ML_DSA_65` as a draft code point but its
+  `aws-lc-rs` provider implements neither signing nor verification for it.
+- TLS 1.3's `CertificateVerify` carries exactly **one** signature, so "hybrid"
+  would need a composite scheme; defining our own is inventing cryptography in
+  the one area §4.1 forbids it.
+- ML-DSA *instead of* Ed25519 fails the hybrid-never-PQ-only rule (§4.2), which
+  applies to signatures as much as to key agreement.
+
+So the signature moved above the handshake, where it needs no new cryptography:
+
+```
+  === §7.2 handshake completes (Ed25519-authenticated, hybrid-PQ kx) ===
+    exporter = export_keying_material("atom-vault/live/1 pq-auth", ctx)   RFC 5705
+    transcript = BLAKE3(domain || side || signer_id || peer_id || exporter)
+  A --- ML-DSA-65-Sign(transcript_A) ------------------------------> B   verify
+  A <-- ML-DSA-65-Sign(transcript_B) ------------------------------- B   verify
+  === only now may payload flow ===
+```
+
+**What it buys.** An attacker who forges Ed25519 — the CRQC case — completes the
+TLS handshake but cannot produce the proof, so the session is refused before any
+payload moves. Impersonation requires breaking **both** primitives.
+
+**Why the exporter is load-bearing.** A man in the middle runs two sessions with
+different exporter values, so a proof captured on one leg does not verify on the
+other. Without that binding the scheme would be relayable and worth nothing. The
+side label separates the two directions so a proof cannot be reflected at its
+author.
+
+**What it is not.** Not a post-quantum TLS handshake, and it must not be
+described as one: the attacker still completes a handshake and derives session
+keys before being rejected. When rustls ships ML-DSA support the signature
+belongs in `CertificateVerify` and this layer becomes redundant.
+
+**Undowngradeable.** Whether a proof is required is decided from the **pinned**
+bundle, never from what the peer presents, so omitting a key cannot downgrade
+someone whose pinned identity has one. Classical-only identities still
+interoperate, so this strands no existing peer.
+
+**Identity and the URI (§3.4 migration).** An identity is now an
+`IdentityBundle` — Ed25519 SPKI plus an optional ML-DSA-65 key — and its
+`BundleId` is BLAKE3 over the whole bundle. At 32 bytes it is **52 base32
+characters, the same shape as the inline Ed25519 key it replaces**, so the
+`atom://` URI does not grow. Tickets carry the full bundle (~2 KB, free over the
+pairing channel); the URI carries only the ID. Because the ID covers both keys,
+substituting the post-quantum half changes the fingerprint a human reads aloud.
+
 ---
 
 ## 8. Current status and limitations
@@ -522,8 +576,11 @@ defense in depth but must not be described as a post-quantum Tor path.)
 - *Phase 5* — the Tor transport per §7.5: `TlsSession` over any byte stream
   sharing the QUIC path's rustls config, onion address validation, a loopback-only
   onion listener, and tickets that can carry onion endpoints.
-- **91 passing tests** across six targets: 70 unit (`src/`), 4 QUIC gate tests,
-  5 session tests, 6 transfer/resume tests, 3 end-to-end pairing tests, 3 Tor
+- *Phase 6, partly* — hybrid identity (Ed25519 + ML-DSA-65) with a bundle-hash
+  identifier, and a post-quantum **channel proof** over the TLS exporter. PQ
+  signatures could not go in the handshake itself; see §7.7.
+- **107 passing tests** across six targets: 84 unit (`src/`), 4 QUIC gate tests,
+  5 session tests, 6 transfer/resume tests, 5 end-to-end pairing tests, 3 Tor
   transport tests. The
   resume set covers the roadmap §7 requirements directly — byte-identical
   resumed output, a divergent prefix rejected at the seam, a non-durable tail
@@ -564,6 +621,15 @@ defense in depth but must not be described as a post-quantum Tor path.)
   is unset: an authenticated-but-compromised sender could fill the receiver's
   disk. A default cap was rejected because a wrong one silently breaks legitimate
   multi-gigabyte vaults; the CLI should set it from available free space.
+- **The post-quantum proof does not protect the handshake itself.** An attacker
+  who forges Ed25519 still completes a TLS handshake and derives session keys
+  before the proof rejects them. No payload is exposed — the proof runs first —
+  but the connection was made, and a real PQ handshake signature would prevent
+  even that.
+- **`atom/` has not been migrated.** `p2p-live` has the bundle types, but the
+  friend list and `atom://` parsing in the rest of the workspace still store
+  inline Ed25519 keys. Until that lands, hybrid identities exist only inside
+  this crate.
 - **Shaping protects the payload's shape, not the reverse direction's timing.**
   The receiver's `RESUME` frame is padded like everything else, but it is sent
   once the receiver has hashed its partial — so *when* it appears leaks roughly

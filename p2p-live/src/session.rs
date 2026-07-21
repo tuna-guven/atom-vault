@@ -63,6 +63,19 @@ pub trait SecureSession: Send {
 
     /// Close the channel gracefully.
     async fn close(&mut self) -> Result<(), Error>;
+
+    /// Export keying material bound to this specific session (RFC 5705).
+    ///
+    /// Two different sessions — including two legs of a man-in-the-middle —
+    /// produce different values for the same label, which is what makes a
+    /// signature over this output prove *which channel* the signer is on.
+    /// [`crate::pq_auth`] depends on that; without it a proof could be relayed.
+    fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), Error>;
 }
 
 /// Transport parameters shared by both ends: a keep-alive short enough that an
@@ -186,6 +199,18 @@ impl SecureSession for QuicSession {
         self.recv_frame_opt()
             .await?
             .ok_or_else(|| Error::Session("channel closed by peer".into()))
+    }
+
+    fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), Error> {
+        self.conn
+            .export_keying_material(out, label, context)
+            .map_err(|e| Error::Session(format!("export keying material: {e:?}")))?;
+        Ok(())
     }
 
     /// Graceful, race-free close.

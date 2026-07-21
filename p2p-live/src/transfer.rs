@@ -849,6 +849,19 @@ mod tests {
         async fn close(&mut self) -> Result<(), Error> {
             Ok(())
         }
+        fn export_keying_material(
+            &self,
+            _out: &mut [u8],
+            _label: &[u8],
+            _context: &[u8],
+        ) -> Result<(), Error> {
+            // Deliberately unavailable: an in-memory pipe has no handshake to
+            // bind to, and returning arbitrary bytes would let a test "pass"
+            // channel binding that the real transports would have to earn.
+            Err(Error::Session(
+                "the mock session has no channel binding".into(),
+            ))
+        }
     }
 
     /// Run a whole transfer over the mock pair, returning the sender's frame

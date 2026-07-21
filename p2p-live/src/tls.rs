@@ -232,6 +232,27 @@ where
             .ok_or_else(|| Error::Session("channel closed by peer".into()))
     }
 
+    fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), Error> {
+        let result = match &self.stream {
+            TlsStream::Client(s) => s
+                .get_ref()
+                .1
+                .export_keying_material(out, label, Some(context)),
+            TlsStream::Server(s) => s
+                .get_ref()
+                .1
+                .export_keying_material(out, label, Some(context)),
+        };
+        result
+            .map(|_| ())
+            .map_err(|e| Error::Session(format!("export keying material: {e}")))
+    }
+
     /// Send a TLS `close_notify` and shut the stream down.
     ///
     /// Unlike QUIC's connection close, this does not discard data the peer has

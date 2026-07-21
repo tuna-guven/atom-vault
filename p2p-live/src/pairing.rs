@@ -272,12 +272,11 @@ fn derive_seal_key(spake_key: &[u8]) -> Zeroizing<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::LocalIdentity;
 
     fn ticket_for(port: u16) -> Ticket {
-        let id = LocalIdentity::generate().unwrap();
+        let id = crate::bundle::LocalBundle::generate().unwrap();
         Ticket::new(
-            id.public_key().clone(),
+            id.bundle(),
             vec![crate::ticket::Endpoint::Direct(
                 format!("198.51.100.9:{port}").parse().unwrap(),
             )],

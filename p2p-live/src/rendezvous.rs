@@ -42,7 +42,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::identity::{LocalIdentity, PeerPublicKey};
+use crate::bundle::LocalBundle;
+use crate::identity::PeerPublicKey;
+use crate::pq_auth::{self, Side};
 use crate::session::{QuicSession, SERVER_NAME, client_session, server_session, transport_config};
 use crate::ticket::Ticket;
 use crate::{Error, client_config, server_config};
@@ -71,14 +73,23 @@ pub enum Role {
     Accepter,
 }
 
-/// Decide roles by comparing raw public keys.
+/// Decide roles by comparing identity-bundle identifiers.
 ///
 /// Keys are distinct in any real pairing (they are different peers), but the
 /// equal case is defined rather than left to chance: it means a peer is being
 /// pointed at itself, which cannot succeed and is reported as an error by
 /// [`rendezvous`] rather than deadlocking.
-pub fn role_for(local: &LocalIdentity, peer: &Ticket) -> Role {
-    if local.public_key().as_der() < peer.identity.as_der() {
+///
+/// A consequence worth knowing: because the identifier covers the *pinned*
+/// bundle, two peers holding different bundles for each other — the result of a
+/// tampered or stale ticket — compute roles that do not complement, and the
+/// rendezvous times out rather than connecting. That is fail-closed, but the
+/// timeout message describes a reachability problem, so a pairing that
+/// mysteriously never connects is worth re-checking the fingerprints for.
+pub fn role_for(local: &LocalBundle, peer: &Ticket) -> Role {
+    // Compared on the bundle identifier, which covers both keys, so the role a
+    // peer computes cannot be steered by swapping half of an identity.
+    if local.id().as_bytes() < peer.id().as_bytes() {
         Role::Dialer
     } else {
         Role::Accepter
@@ -95,12 +106,12 @@ pub fn role_for(local: &LocalIdentity, peer: &Ticket) -> Role {
 pub async fn rendezvous(
     bind: SocketAddr,
     ticket: &Ticket,
-    local: &LocalIdentity,
+    local: &LocalBundle,
     timeout: Duration,
 ) -> Result<QuicSession, Error> {
     ticket.check_valid()?;
 
-    if local.public_key() == &ticket.identity {
+    if local.id() == ticket.id() {
         return Err(Error::Connect(
             "this ticket is our own identity — a peer cannot rendezvous with itself".into(),
         ));
@@ -126,10 +137,10 @@ pub async fn rendezvous(
         ));
     }
 
-    let peer = &ticket.identity;
-    let mut client_cfg = client_config(local, peer)?;
+    let peer = ticket.identity.classical();
+    let mut client_cfg = client_config(local.classical(), peer)?;
     client_cfg.transport_config(transport_config());
-    let mut server_cfg = server_config(local, peer)?;
+    let mut server_cfg = server_config(local.classical(), peer)?;
     server_cfg.transport_config(transport_config());
 
     // One socket doing both jobs. This matters beyond tidiness: the NAT mapping
@@ -146,13 +157,27 @@ pub async fn rendezvous(
         Role::Accepter => accept_loop(&endpoint, ticket, &hints, deadline).await,
     };
 
-    match result {
-        Ok(session) => Ok(session),
+    let mut session = match result {
+        Ok(session) => session,
         Err(e) => {
             endpoint.close(0u32.into(), b"rendezvous failed");
-            Err(e)
+            return Err(e);
         }
+    };
+
+    // Post-quantum authentication, before the caller can send anything. Run
+    // here rather than left to the caller: a proof that is easy to forget is a
+    // proof that will be forgotten, and the failure mode is silent.
+    let side = match role {
+        Role::Dialer => Side::Initiator,
+        Role::Accepter => Side::Responder,
+    };
+    if let Err(e) = pq_auth::authenticate(&mut session, local, &ticket.identity, side).await {
+        endpoint.close(0u32.into(), b"pq auth failed");
+        return Err(e);
     }
+
+    Ok(session)
 }
 
 /// Retry outbound connections across every hint until one completes.
@@ -217,7 +242,10 @@ async fn accept_loop(
                     return Err(Error::Connect("endpoint closed while awaiting the peer".into()));
                 };
                 match incoming.await {
-                    Ok(conn) => return server_session(endpoint.clone(), conn, &ticket.identity).await,
+                    Ok(conn) => {
+                        return server_session(endpoint.clone(), conn, ticket.identity.classical())
+                            .await;
+                    }
                     // A failed inbound handshake here is normal: it is usually the
                     // peer's own punch traffic, which by design nobody accepts.
                     // Keep waiting rather than giving up on the rendezvous.
@@ -262,9 +290,9 @@ mod tests {
     use super::*;
     use crate::ticket::Ticket;
 
-    fn ticket_for(id: &LocalIdentity, addr: &str) -> Ticket {
+    fn ticket_for(id: &LocalBundle, addr: &str) -> Ticket {
         let addr: SocketAddr = addr.parse().unwrap();
-        Ticket::new(id.public_key().clone(), vec![addr.into()]).unwrap()
+        Ticket::new(id.bundle(), vec![addr.into()]).unwrap()
     }
 
     /// Both peers must independently compute complementary roles, or two
@@ -272,8 +300,8 @@ mod tests {
     #[test]
     fn roles_are_complementary_and_deterministic() {
         for _ in 0..32 {
-            let a = LocalIdentity::generate().unwrap();
-            let b = LocalIdentity::generate().unwrap();
+            let a = LocalBundle::generate().unwrap();
+            let b = LocalBundle::generate().unwrap();
             let (ta, tb) = (ticket_for(&a, "10.0.0.1:1"), ticket_for(&b, "10.0.0.2:2"));
 
             let role_a = role_for(&a, &tb);
@@ -289,8 +317,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_expired_ticket_is_refused_before_any_packet() {
-        let a = LocalIdentity::generate().unwrap();
-        let b = LocalIdentity::generate().unwrap();
+        let a = LocalBundle::generate().unwrap();
+        let b = LocalBundle::generate().unwrap();
         let stale = ticket_for(&b, "10.0.0.2:2").expiring_at(0);
 
         let err = rendezvous(
@@ -306,9 +334,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_ticket_without_hints_is_refused() {
-        let a = LocalIdentity::generate().unwrap();
-        let b = LocalIdentity::generate().unwrap();
-        let no_hints = Ticket::new(b.public_key().clone(), vec![]).unwrap();
+        let a = LocalBundle::generate().unwrap();
+        let b = LocalBundle::generate().unwrap();
+        let no_hints = Ticket::new(b.bundle(), vec![]).unwrap();
 
         let err = rendezvous(
             "127.0.0.1:0".parse().unwrap(),
@@ -325,7 +353,7 @@ mod tests {
     /// sides would compute `Accepter` and wait forever.
     #[tokio::test]
     async fn rendezvous_with_self_is_refused() {
-        let a = LocalIdentity::generate().unwrap();
+        let a = LocalBundle::generate().unwrap();
         let mine = ticket_for(&a, "127.0.0.1:1");
 
         let err = rendezvous(

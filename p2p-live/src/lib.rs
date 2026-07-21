@@ -31,11 +31,13 @@
 //! cannot retroactively decrypt a recorded session. That separation is what
 //! makes the forward secrecy strict.
 
+pub mod bundle;
 pub mod framing;
 pub mod identity;
 pub mod pacing;
 pub mod pairing;
 mod pinned;
+pub mod pq_auth;
 pub mod rendezvous;
 pub mod session;
 pub mod stun;
@@ -54,12 +56,13 @@ use rustls::server::AlwaysResolvesServerRawPublicKeys;
 use identity::{LocalIdentity, PeerPublicKey};
 use pinned::{PinnedClientVerifier, PinnedServerVerifier};
 
+pub use bundle::{BundleId, IdentityBundle, LocalBundle, PqPublicKey};
 pub use pacing::{Ladder, Pacing};
 pub use pairing::{PairedChannel, PairingCode};
 pub use session::{
     DEFAULT_KEY_UPDATE_BYTES, Listener, MAX_FRAME_LEN, QuicSession, SecureSession, dial,
 };
-pub use ticket::{Suite, Ticket};
+pub use ticket::{Endpoint, Suite, Ticket};
 pub use transfer::{Cancel, EncryptedAtRest, Progress, Summary, Transfer};
 
 /// ALPN identifying this protocol version. Bound into the handshake, so a peer

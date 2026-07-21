@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.91"
+aws-lc-rs = { version = "1.17", features = ["unstable"] }
 blake3 = "1.8.5"
 chacha20poly1305 = "0.11.0"
 data-encoding = "2.11"
