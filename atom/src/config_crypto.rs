@@ -14,10 +14,10 @@
 //! write (one-time migration).
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit},
 };
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use zeroize::Zeroizing;
@@ -38,14 +38,15 @@ pub fn init_config_key() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()
         .map_err(|e| format!("Could not create runtime for keyring init: {e}"))?;
-    let key = rt.block_on(fetch_or_create_key())
+    let key = rt
+        .block_on(fetch_or_create_key())
         .map_err(|e| -> Box<dyn std::error::Error> { format!("{e}").into() })?;
     let _ = CONFIG_KEY.set(key);
     Ok(())
 }
 
-async fn fetch_or_create_key(
-) -> Result<Zeroizing<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
+async fn fetch_or_create_key()
+-> Result<Zeroizing<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
     use secret_service::{EncryptionType, SecretService};
 
     let ss = SecretService::connect(EncryptionType::Dh)
@@ -116,8 +117,8 @@ pub fn encrypt_config(plaintext: &[u8]) -> Vec<u8> {
     let mut nonce_bytes = [0u8; 24];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from(nonce_bytes);
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
-        .expect("config key is always 32 bytes");
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key.as_ref()).expect("config key is always 32 bytes");
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .expect("XChaCha20-Poly1305 encryption must not fail for a valid key");
@@ -151,8 +152,8 @@ pub fn decrypt_config(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>
     }
     let (nonce_bytes, ciphertext) = payload.split_at(24);
     let nonce = XNonce::try_from(nonce_bytes).expect("nonce slice is always 24 bytes");
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
-        .expect("config key is always 32 bytes");
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key.as_ref()).expect("config key is always 32 bytes");
     cipher
         .decrypt(&nonce, ciphertext)
         .map_err(|_| "Config decryption failed — corrupted file or keyring key mismatch".into())

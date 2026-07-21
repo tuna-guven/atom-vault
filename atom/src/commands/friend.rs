@@ -3,8 +3,8 @@ use crate::commands::p2p_utils::{FriendRecord, load_friends, parse_atom_uri, sav
 use std::fs;
 
 pub fn add_friend_core(url: &str, nickname: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let (_new_onion, new_pubkey) = parse_atom_uri(url)
-        .map_err(|e| format!("Invalid atom:// link: {}", e))?;
+    let (_new_onion, new_pubkey) =
+        parse_atom_uri(url).map_err(|e| format!("Invalid atom:// link: {}", e))?;
 
     if let Some(mut my_onion_path) = dirs::home_dir() {
         my_onion_path.push(".atom_vault/onion.txt");
@@ -23,13 +23,16 @@ pub fn add_friend_core(url: &str, nickname: &str) -> Result<String, Box<dyn std:
     let mut friends = load_friends();
 
     if let Some(existing_by_key) = friends.iter().find(|f| {
-        parse_atom_uri(&f.url).map(|(_, k)| k == new_pubkey).unwrap_or(false)
+        parse_atom_uri(&f.url)
+            .map(|(_, k)| k == new_pubkey)
+            .unwrap_or(false)
     }) {
         if existing_by_key.nickname != nickname {
             return Err(format!(
                 "This identity is already saved under the nickname '{}'.",
                 existing_by_key.nickname
-            ).into());
+            )
+            .into());
         }
     }
 
@@ -45,7 +48,10 @@ pub fn add_friend_core(url: &str, nickname: &str) -> Result<String, Box<dyn std:
 
         existing_friend.url = url.to_string();
         save_friends(&friends);
-        return Ok(format!("Friend '{}' routing address successfully updated!", nickname));
+        return Ok(format!(
+            "Friend '{}' routing address successfully updated!",
+            nickname
+        ));
     }
 
     friends.push(FriendRecord {
@@ -54,19 +60,20 @@ pub fn add_friend_core(url: &str, nickname: &str) -> Result<String, Box<dyn std:
         shared_vaults: Vec::new(),
         last_seen: None,
     });
-    
+
     save_friends(&friends);
-    Ok(format!("Friend '{}' securely added! Make sure they add your atom link too.", nickname))
+    Ok(format!(
+        "Friend '{}' securely added! Make sure they add your atom link too.",
+        nickname
+    ))
 }
 
 pub fn handle_friend(command: FriendCommands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        FriendCommands::Add { url, nickname } => {
-            match add_friend_core(&url, &nickname) {
-                Ok(msg) => println!("✅ {}", msg),
-                Err(e) => return Err(e),
-            }
-        }
+        FriendCommands::Add { url, nickname } => match add_friend_core(&url, &nickname) {
+            Ok(msg) => println!("✅ {}", msg),
+            Err(e) => return Err(e),
+        },
         FriendCommands::List => {
             let friends = load_friends();
             if friends.is_empty() {

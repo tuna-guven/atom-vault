@@ -43,7 +43,7 @@ pub fn start_interactive_shell(
                 } else {
                     let from_disk = parts[1].to_string();
                     let vfs_name = parts[2].to_string();
-                    
+
                     if let Err(e) = crate::commands::import::handle_import(
                         from_disk,
                         vfs_name,
@@ -83,16 +83,17 @@ pub fn start_interactive_shell(
                 } else {
                     let vfs_name = parts[1].to_string();
                     let to_disk = parts[2].to_string();
-                    
-                    print!("\n[WARNING] You are about to extract decrypted data to the physical disk (Staging Area).\nAre you sure you want to proceed? [y/N]: ");
+
+                    print!(
+                        "\n[WARNING] You are about to extract decrypted data to the physical disk (Staging Area).\nAre you sure you want to proceed? [y/N]: "
+                    );
                     std::io::stdout().flush().unwrap_or_default();
-                    
+
                     // Girdi tamponunu temiz tutmak için Zeroizing
                     let mut input = Zeroizing::new(String::new());
                     std::io::stdin().read_line(&mut input).unwrap_or_default();
-                    
+
                     if input.trim().eq_ignore_ascii_case("y") {
-                        
                         // 1. ADIM: Normal deneme (force_overwrite: false)
                         match crate::commands::export::handle_export(
                             vfs_name.clone(),
@@ -100,18 +101,22 @@ pub fn start_interactive_shell(
                             metadata,
                             physical_vault,
                             unlocked_vault,
-                            false 
+                            false,
                         ) {
                             Ok(_) => {}
                             Err(e) => {
                                 // 2. ADIM: Dosya zaten varsa uyarı ver ve sor
                                 if e.to_string() == "ALREADY_EXISTS" {
-                                    print!("Warning: The file already exists in the staging area. Do you want to overwrite it? [y/N]: ");
+                                    print!(
+                                        "Warning: The file already exists in the staging area. Do you want to overwrite it? [y/N]: "
+                                    );
                                     std::io::stdout().flush().unwrap_or_default();
-                                    
+
                                     let mut ow_input = Zeroizing::new(String::new());
-                                    std::io::stdin().read_line(&mut ow_input).unwrap_or_default();
-                                    
+                                    std::io::stdin()
+                                        .read_line(&mut ow_input)
+                                        .unwrap_or_default();
+
                                     if ow_input.trim().eq_ignore_ascii_case("y") {
                                         // Kullanıcı zorla yaz dedi, parametreyi true gönder
                                         if let Err(err2) = crate::commands::export::handle_export(
@@ -120,19 +125,20 @@ pub fn start_interactive_shell(
                                             metadata,
                                             physical_vault,
                                             unlocked_vault,
-                                            true // GÜÇLÜ YAZMA
+                                            true, // GÜÇLÜ YAZMA
                                         ) {
                                             eprintln!("Export failed: {}", err2);
                                         }
                                     } else {
-                                        println!("Export cancelled by user. Existing file was preserved.");
+                                        println!(
+                                            "Export cancelled by user. Existing file was preserved."
+                                        );
                                     }
                                 } else {
                                     eprintln!("Export failed: {}", e);
                                 }
                             }
                         }
-                        
                     } else {
                         println!("Export operation cancelled by user. The vault remains secure.");
                     }
@@ -156,7 +162,7 @@ pub fn start_interactive_shell(
                     }
                 }
             }
-            
+
             "view" => {
                 if parts.len() < 2 {
                     println!("Error: Missing argument.");
@@ -164,8 +170,9 @@ pub fn start_interactive_shell(
                 } else {
                     let vfs_name = parts[1];
 
-                    if let Some(file_index) = metadata.file_table.iter().find(|f| f.vfs_name == vfs_name) {
-                        
+                    if let Some(file_index) =
+                        metadata.file_table.iter().find(|f| f.vfs_name == vfs_name)
+                    {
                         // KORUMA 1: Okumadan önce bekleyen tüm yazma işlemlerini diske zorla
                         let _ = physical_vault.sync_all();
 
@@ -179,8 +186,8 @@ pub fn start_interactive_shell(
                             unlocked_vault,
                             move || {
                                 // Harici okuyucu kapanıp RAM silindikten sonra sinyal gönder
-                                let _ = tx.send(()); 
-                            }
+                                let _ = tx.send(());
+                            },
                         ) {
                             Ok(_) => {
                                 // Harici okuyucu açık olduğu sürece CLI burada sessizce bekler (blocking)
@@ -190,15 +197,19 @@ pub fn start_interactive_shell(
                                 eprintln!("❌ View Error: {}", e);
                             }
                         }
-                        
                     } else {
                         println!("Error: File '{}' not found inside the vault.", vfs_name);
                     }
                 }
             }
-            
+
             "vacuum" => {
-                match crate::commands::vacuum::handle_vacuum(&vault_path, metadata, physical_vault, unlocked_vault) {
+                match crate::commands::vacuum::handle_vacuum(
+                    &vault_path,
+                    metadata,
+                    physical_vault,
+                    unlocked_vault,
+                ) {
                     Ok(new_offset) => {
                         // Kasa yeniden oluşturulduğu için dosya tanımlayıcısını tazele ve offset'i güncelle
                         match File::options().read(true).write(true).open(&vault_path) {
@@ -211,7 +222,6 @@ pub fn start_interactive_shell(
                     }
                     Err(e) => eprintln!("Vacuum error: {}", e),
                 }
-            
             }
 
             "help" => {
@@ -252,7 +262,10 @@ pub fn start_interactive_shell(
                     .chars()
                     .map(|c| if c.is_ascii_control() { '?' } else { c })
                     .collect();
-                println!("Unknown command: '{}'. Type 'help' for available commands.", sanitized_name);
+                println!(
+                    "Unknown command: '{}'. Type 'help' for available commands.",
+                    sanitized_name
+                );
             }
         }
     }

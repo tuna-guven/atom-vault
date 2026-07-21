@@ -53,11 +53,8 @@ pub const METADATA_FILE_ID: [u8; FILE_ID_LEN] = *b"atom-vault-meta1";
 /// Defined once here because `vacuum` previously hardcoded a stale `112` — the
 /// value from before `KdfSettings` joined the header — and truncated the last
 /// 13 bytes of the wrapped DEK, permanently bricking the vault.
-pub const VAULT_HEADER_SIZE: u64 = 8
-    + KdfSettings::SIZE as u64
-    + SALT_LEN as u64
-    + XNONCE_LEN as u64
-    + WRAPPED_DEK_LEN as u64;
+pub const VAULT_HEADER_SIZE: u64 =
+    8 + KdfSettings::SIZE as u64 + SALT_LEN as u64 + XNONCE_LEN as u64 + WRAPPED_DEK_LEN as u64;
 
 /// Byte overhead a v1 blob adds on top of the padded plaintext:
 /// magic (3) + file_salt (16) + nonce (24) + Poly1305 tag (16).
@@ -419,7 +416,9 @@ mod tests {
     const MAX_CHUNK_SIZE: usize = 64 * 1024;
 
     fn vault() -> UnlockedVault {
-        UnlockedVault { dek: [0x42; KEY_LEN] }
+        UnlockedVault {
+            dek: [0x42; KEY_LEN],
+        }
     }
 
     /// Header arithmetic must agree with what `create` writes. `vacuum` used a
@@ -436,7 +435,15 @@ mod tests {
     #[test]
     fn roundtrip_across_sizes() {
         let v = vault();
-        for len in [0usize, 1, 63, MAX_CHUNK_SIZE - 1, MAX_CHUNK_SIZE, MAX_CHUNK_SIZE + 1, 300_000] {
+        for len in [
+            0usize,
+            1,
+            63,
+            MAX_CHUNK_SIZE - 1,
+            MAX_CHUNK_SIZE,
+            MAX_CHUNK_SIZE + 1,
+            300_000,
+        ] {
             let pt: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let id = generate_file_id();
             let blob = encrypt_chunk(&v, &pt, &id).unwrap();
@@ -472,7 +479,11 @@ mod tests {
         let id = generate_file_id();
         let blob = encrypt_chunk(&v, b"payload", &id).unwrap();
         for cut in 0..blob.len() {
-            assert!(decrypt_chunk(&v, &blob[..cut], &id).is_err(), "prefix {} accepted", cut);
+            assert!(
+                decrypt_chunk(&v, &blob[..cut], &id).is_err(),
+                "prefix {} accepted",
+                cut
+            );
         }
     }
 
@@ -485,15 +496,23 @@ mod tests {
 
         let mut other = id;
         other[0] ^= 0xff;
-        assert_eq!(decrypt_chunk(&v, &blob, &other).unwrap_err(), CryptoError::Open);
+        assert_eq!(
+            decrypt_chunk(&v, &blob, &other).unwrap_err(),
+            CryptoError::Open
+        );
     }
 
     #[test]
     fn wrong_dek_is_rejected() {
         let id = generate_file_id();
         let blob = encrypt_chunk(&vault(), b"secret contents", &id).unwrap();
-        let other = UnlockedVault { dek: [0x43; KEY_LEN] };
-        assert_eq!(decrypt_chunk(&other, &blob, &id).unwrap_err(), CryptoError::Open);
+        let other = UnlockedVault {
+            dek: [0x43; KEY_LEN],
+        };
+        assert_eq!(
+            decrypt_chunk(&other, &blob, &id).unwrap_err(),
+            CryptoError::Open
+        );
     }
 
     #[test]
@@ -502,7 +521,10 @@ mod tests {
         let id = generate_file_id();
         let mut blob = encrypt_chunk(&v, b"x", &id).unwrap();
         blob[2] = 0x00; // version byte
-        assert_eq!(decrypt_chunk(&v, &blob, &id).unwrap_err(), CryptoError::BadFormat);
+        assert_eq!(
+            decrypt_chunk(&v, &blob, &id).unwrap_err(),
+            CryptoError::BadFormat
+        );
     }
 
     /// No deterministic leak: identical plaintext under identical key and id
@@ -543,7 +565,11 @@ mod tests {
 
         assert_ne!(&*k11, &*k12, "distinct file_id must separate keys");
         assert_ne!(&*k11, &*k21, "distinct file_salt must separate keys");
-        assert_eq!(&*k11, &*derive_chunk_key(&dek, &s1, &i1).unwrap(), "must be deterministic");
+        assert_eq!(
+            &*k11,
+            &*derive_chunk_key(&dek, &s1, &i1).unwrap(),
+            "must be deterministic"
+        );
     }
 
     #[test]
@@ -560,7 +586,12 @@ mod tests {
     /// render every existing vault unreadable.
     #[test]
     fn derivation_kat() {
-        let key = derive_chunk_key(&[0x11; KEY_LEN], &[0x22; FILE_SALT_LEN], &[0x33; FILE_ID_LEN]).unwrap();
+        let key = derive_chunk_key(
+            &[0x11; KEY_LEN],
+            &[0x22; FILE_SALT_LEN],
+            &[0x33; FILE_ID_LEN],
+        )
+        .unwrap();
         assert_eq!(&*key, &EXPECTED_KAT, "per-chunk KDF wiring changed");
     }
 
@@ -570,7 +601,7 @@ mod tests {
     /// Cross-checked against an independent RFC 5869 implementation, so this
     /// pins the standard, not merely this crate's behaviour.
     const EXPECTED_KAT: [u8; 32] = [
-        11, 138, 127, 181, 212, 85, 215, 133, 10, 76, 42, 128, 37, 172, 34, 106, 230, 49, 246,
-        21, 115, 59, 86, 192, 228, 44, 232, 124, 200, 207, 94, 119,
+        11, 138, 127, 181, 212, 85, 215, 133, 10, 76, 42, 128, 37, 172, 34, 106, 230, 49, 246, 21,
+        115, 59, 86, 192, 228, 44, 232, 124, 200, 207, 94, 119,
     ];
 }

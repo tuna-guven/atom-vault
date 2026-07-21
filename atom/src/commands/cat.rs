@@ -1,7 +1,7 @@
+use crate::crypto::UnlockedVault;
+use crate::vfs::{MemFile, VaultMetadata};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use crate::crypto::UnlockedVault;
-use crate::vfs::{VaultMetadata, MemFile};
 
 pub fn handle_cat(
     vfs_name: String,
@@ -20,9 +20,17 @@ pub fn handle_cat(
     };
 
     const AEAD_TAG_LEN: usize = 16;
-    let total_capacity: usize = target_file.chunks.iter().map(|c| {
-        if c.plain_len > 0 { c.plain_len } else { c.cipher_len.saturating_sub(AEAD_TAG_LEN) }
-    }).sum();
+    let total_capacity: usize = target_file
+        .chunks
+        .iter()
+        .map(|c| {
+            if c.plain_len > 0 {
+                c.plain_len
+            } else {
+                c.cipher_len.saturating_sub(AEAD_TAG_LEN)
+            }
+        })
+        .sum();
     let mut memfile = MemFile::new(&vfs_name, total_capacity)?;
 
     for chunk in &target_file.chunks {
@@ -40,7 +48,8 @@ pub fn handle_cat(
                     eprintln!("[ERROR] Memory write failed during decryption: {:?}", e);
                 }
             },
-        ).map_err(|e| format!("Chunk processing error: {:?}", e))?;
+        )
+        .map_err(|e| format!("Chunk processing error: {:?}", e))?;
     }
 
     let final_pos = memfile.seek(SeekFrom::Current(0))?;
@@ -61,7 +70,10 @@ pub fn handle_cat(
     if is_probably_binary {
         // Kullanıcı dostu bilgilendirme mesajı
         let preview_len = std::cmp::min(buffer.len(), 64);
-        writeln!(stdout, "[Note: Binary or Null-padded data detected. Suppressing automated terminal flood.]")?;
+        writeln!(
+            stdout,
+            "[Note: Binary or Null-padded data detected. Suppressing automated terminal flood.]"
+        )?;
         write!(stdout, "First {} bytes (HEX Preview): ", preview_len)?;
         for byte in &buffer[..preview_len] {
             write!(stdout, "{:02X} ", byte)?;
@@ -77,7 +89,10 @@ pub fn handle_cat(
             }
         }
     } else {
-        writeln!(stdout, "[Note: Non-UTF8 Binary file detected. Displaying sanitized HEX layout]")?;
+        writeln!(
+            stdout,
+            "[Note: Non-UTF8 Binary file detected. Displaying sanitized HEX layout]"
+        )?;
         for chunk in buffer.chunks(16) {
             for byte in chunk {
                 let _ = write!(stdout, "{:02X} ", byte);

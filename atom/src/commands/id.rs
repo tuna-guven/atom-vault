@@ -14,7 +14,7 @@ pub fn get_id_string() -> Result<String, Box<dyn std::error::Error>> {
 
 pub fn handle_id() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- 🪪 Your Atom Identity ---");
-    
+
     match get_id_string() {
         Ok(onion) => {
             println!("🔗 Your Link : atom://{}", onion);

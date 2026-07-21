@@ -37,8 +37,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // available in both the original and re-exec'd process.
     if let Err(e) = crate::config_crypto::init_config_key() {
         eprintln!("[FATAL] Cannot access GNOME Keyring: {e}");
-        eprintln!("Atom Vault requires the Secret Service (GNOME Keyring or compatible) to protect config files.");
-        eprintln!("Ensure the Secret Service daemon is running and your session keyring is unlocked.");
+        eprintln!(
+            "Atom Vault requires the Secret Service (GNOME Keyring or compatible) to protect config files."
+        );
+        eprintln!(
+            "Ensure the Secret Service daemon is running and your session keyring is unlocked."
+        );
         std::process::exit(1);
     }
 
@@ -108,6 +112,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             vault_path,
             friend_nickname,
         }) => commands::sync::handle_sync(&vault_path, &friend_nickname),
+        Some(Commands::Live { command }) => match command {
+            cli::LiveCommands::Id => commands::live::handle_id(),
+            cli::LiveCommands::Address { address } => commands::live::handle_address(&address),
+            cli::LiveCommands::Pair { nickname, code } => {
+                commands::live::handle_pair(&nickname, code)
+            }
+            cli::LiveCommands::Peers => commands::live::handle_peers(),
+            cli::LiveCommands::Send { vault_path, peer } => {
+                commands::live::handle_send(&vault_path, &peer)
+            }
+            cli::LiveCommands::Receive { save_path, peer } => {
+                commands::live::handle_receive(&save_path, &peer)
+            }
+        },
         None => {
             // Argüman yoksa varsayılan olarak GUI'yi ve arka plan P2P dinleyicisini başlat
             println!("[INFO] No CLI arguments provided. Launching Graphical Interface...");

@@ -9,6 +9,7 @@ use crate::commands::daemon::{DaemonEvent, SyncResponse};
 mod broker;
 mod explorer;
 mod home;
+mod live;
 mod login;
 mod p2p;
 
@@ -40,6 +41,101 @@ struct IncomingSyncState {
 struct RenameState {
     old_name: String,
     new_name: String,
+}
+
+/// Which transport the P2P screen is showing.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum TransportTab {
+    /// Live sync over Tor onion services (the original mechanism).
+    Tor,
+    /// Strict-PFS, post-quantum live transfer (`p2p-live`).
+    Live,
+}
+
+/// Which side of a live transfer this user is performing.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum LiveRole {
+    Send,
+    Receive,
+}
+
+/// Progress through the two-round pairing exchange. Both rounds travel the
+/// user's own channel; the short code must travel a *different* one.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum LiveStage {
+    /// Agree the short secret; produce our round-1 blob.
+    Code,
+    /// Paste the peer's round-1 blob; produce our sealed ticket.
+    Exchange,
+    /// Paste the peer's sealed ticket; the pairing is saved.
+    Paired,
+}
+
+/// State for the live-transfer panel.
+struct LiveState {
+    role: LiveRole,
+    stage: LiveStage,
+    /// Empty means "generate one"; non-empty means the peer read it to us.
+    code: String,
+    /// The code we generated, shown for the user to read aloud.
+    our_code: String,
+    nickname: String,
+    our_blob: String,
+    peer_blob: String,
+    /// Held between round 1 and round 2.
+    pairing: Option<p2p_live::pairing::PairingState>,
+    /// Derived at round 2; used to open the peer's sealed ticket.
+    channel: Option<p2p_live::pairing::PairedChannel>,
+    /// Fingerprints to read aloud once paired — the human MITM check.
+    our_fingerprint: String,
+    peer_fingerprint: String,
+    /// Transfer settings.
+    selected_peer: String,
+    vault_path: String,
+    save_path: String,
+    status: String,
+}
+
+impl Default for LiveState {
+    fn default() -> Self {
+        Self {
+            role: LiveRole::Send,
+            stage: LiveStage::Code,
+            code: String::new(),
+            our_code: String::new(),
+            nickname: String::new(),
+            our_blob: String::new(),
+            peer_blob: String::new(),
+            pairing: None,
+            channel: None,
+            our_fingerprint: String::new(),
+            peer_fingerprint: String::new(),
+            selected_peer: String::new(),
+            vault_path: String::new(),
+            save_path: dirs::home_dir()
+                .unwrap_or_default()
+                .join(".atom_vault/received/live.aegis")
+                .to_string_lossy()
+                .to_string(),
+            status: String::new(),
+        }
+    }
+}
+
+impl LiveState {
+    /// Reset everything derived from the code. A SPAKE2 exchange is strictly
+    /// single-use, so editing the code must discard every value derived from it
+    /// rather than leaving a half-finished pairing on screen.
+    fn reset_pairing(&mut self) {
+        self.stage = LiveStage::Code;
+        self.our_blob.clear();
+        self.peer_blob.clear();
+        self.pairing = None;
+        self.channel = None;
+        self.our_fingerprint.clear();
+        self.peer_fingerprint.clear();
+        self.status.clear();
+    }
 }
 
 enum FileAction {
@@ -112,6 +208,18 @@ struct AtomVaultApp {
     sync_status_shared: Arc<Mutex<String>>,
     sync_done: Arc<AtomicBool>,
 
+    // P2P screen — live transfer (p2p-live)
+    transport_tab: TransportTab,
+    live: LiveState,
+    /// Status text written by the background transfer thread.
+    live_status_shared: Arc<Mutex<String>>,
+    /// False while a live transfer is in flight.
+    live_done: Arc<AtomicBool>,
+    /// Progress written by the transfer thread: (transferred, total).
+    live_progress: Arc<Mutex<(u64, u64)>>,
+    /// Set so the Stop button can reach a running transfer.
+    live_cancel: p2p_live::transfer::Cancel,
+
     // Overlay dialogs
     incoming_sync: Option<IncomingSyncState>,
     rename_dialog: Option<RenameState>,
@@ -160,6 +268,12 @@ impl AtomVaultApp {
             selected_friend_idx: 0,
             sync_status_shared: Arc::new(Mutex::new(String::new())),
             sync_done: Arc::new(AtomicBool::new(true)),
+            transport_tab: TransportTab::Tor,
+            live: LiveState::default(),
+            live_status_shared: Arc::new(Mutex::new(String::new())),
+            live_done: Arc::new(AtomicBool::new(true)),
+            live_progress: Arc::new(Mutex::new((0, 0))),
+            live_cancel: p2p_live::transfer::Cancel::new(),
             incoming_sync: None,
             rename_dialog: None,
         }
@@ -201,7 +315,12 @@ impl AtomVaultApp {
 
     fn poll_file_dialog_results(&mut self) {
         // Use and_then so the MutexGuard is dropped before we borrow self mutably.
-        if let Some(path) = self.pending_vault_path.lock().ok().and_then(|mut g| g.take()) {
+        if let Some(path) = self
+            .pending_vault_path
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
             // Sandbox is applied later in try_unlock(), immediately before the
             // first cryptographic operation, so the user can still navigate
             // Back → Home and pick a different vault before committing.
@@ -212,10 +331,20 @@ impl AtomVaultApp {
                 self.screen = Screen::Login;
             }
         }
-        if let Some(full_path) = self.pending_create_path.lock().ok().and_then(|mut g| g.take()) {
+        if let Some(full_path) = self
+            .pending_create_path
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
             self.do_create_vault_at_path(full_path);
         }
-        if let Some(path) = self.pending_import_path.lock().ok().and_then(|mut g| g.take()) {
+        if let Some(path) = self
+            .pending_import_path
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
             // Send to the pre-sandbox broker for a sandboxed read; the result
             // is polled in poll_broker_results() once the sub-thread finishes.
             let vfs_name = path
@@ -226,7 +355,12 @@ impl AtomVaultApp {
             self.pending_import_bytes = Some(self.file_broker.read_file(path));
             self.explorer_status = "Reading file...".to_string();
         }
-        if let Some(path) = self.pending_export_path.lock().ok().and_then(|mut g| g.take()) {
+        if let Some(path) = self
+            .pending_export_path
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
             if let Some(vfs_name) = self.pending_export_vfs_name.take() {
                 self.do_export_via_broker(path, vfs_name);
             }
@@ -376,15 +510,15 @@ pub fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             let mut style = (*cc.egui_ctx.style()).clone();
             use egui::{FontFamily::Proportional, FontId, TextStyle::*};
             style.text_styles = [
-                (Heading,   FontId::new(22.0, Proportional)),
-                (Body,      FontId::new(14.5, Proportional)),
+                (Heading, FontId::new(22.0, Proportional)),
+                (Body, FontId::new(14.5, Proportional)),
                 (Monospace, FontId::new(13.0, egui::FontFamily::Monospace)),
-                (Button,    FontId::new(14.0, Proportional)),
-                (Small,     FontId::new(11.5, Proportional)),
+                (Button, FontId::new(14.0, Proportional)),
+                (Small, FontId::new(11.5, Proportional)),
             ]
             .into();
             style.spacing.button_padding = egui::vec2(12.0, 7.0);
-            style.spacing.item_spacing  = egui::vec2(8.0, 6.0);
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
             cc.egui_ctx.set_style(style);
 
             Ok(Box::new(AtomVaultApp::new()))

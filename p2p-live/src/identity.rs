@@ -84,6 +84,33 @@ impl LocalIdentity {
         &self.public
     }
 
+    /// The private key as PKCS#8 DER.
+    ///
+    /// **This is secret material.** It exists so an identity can be persisted
+    /// between runs — without it every session would need re-pairing — and the
+    /// caller is responsible for putting it somewhere encrypted. The return type
+    /// is `Zeroizing` so an accidental drop wipes rather than lingers.
+    pub fn to_pkcs8(&self) -> Zeroizing<Vec<u8>> {
+        self.pkcs8.clone()
+    }
+
+    /// Reconstruct an identity from PKCS#8 DER produced by [`Self::to_pkcs8`].
+    ///
+    /// The public half is re-derived from the private key rather than stored
+    /// alongside it, so a file that has been tampered with cannot present a
+    /// public key that does not match the private one.
+    pub fn from_pkcs8(der: &[u8]) -> Result<Self, Error> {
+        let kp = KeyPair::from_pkcs8_der_and_sign_algo(
+            &rustls::pki_types::PrivatePkcs8KeyDer::from(der),
+            &PKCS_ED25519,
+        )
+        .map_err(|e| Error::Identity(format!("stored identity is not a valid Ed25519 key: {e}")))?;
+        Ok(LocalIdentity {
+            public: PeerPublicKey(kp.subject_public_key_info()),
+            pkcs8: Zeroizing::new(der.to_vec()),
+        })
+    }
+
     /// Build the rustls `CertifiedKey` presenting this identity as a raw public
     /// key. For RPK the "certificate" entry carries the SPKI, not an X.509 cert.
     ///

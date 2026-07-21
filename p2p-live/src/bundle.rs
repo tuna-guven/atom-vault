@@ -54,6 +54,9 @@ const BUNDLE_ID_DOMAIN: &[u8] = b"atom-live-identity-bundle-v1";
 /// Bundle encoding version.
 const BUNDLE_VERSION: u8 = 1;
 
+/// Version byte on the serialised private identity.
+const SECRET_VERSION: u8 = 1;
+
 /// ML-DSA-65 public key length, per FIPS 204.
 const ML_DSA_65_PUBLIC_KEY_LEN: usize = 1952;
 
@@ -302,6 +305,83 @@ impl LocalBundle {
         self.bundle().id()
     }
 
+    /// Serialise both private keys so the identity survives a restart.
+    ///
+    /// **This is secret material — the whole identity.** Anyone holding these
+    /// bytes can impersonate this peer to anyone who has pinned it. Persist it
+    /// only under encryption; the caller owns that decision, because this crate
+    /// has no idea what key store the host application has.
+    ///
+    /// Forward secrecy is unaffected: these are long-term *authentication* keys
+    /// that never participate in key agreement, so a stolen identity file allows
+    /// future impersonation but cannot retroactively decrypt a recorded session
+    /// (roadmap §3.4).
+    ///
+    /// Layout: `[version][u32 ed25519 pkcs8 len][ed25519][u32 mldsa len][mldsa]`.
+    pub fn to_secret_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let ed = self.classical.to_pkcs8();
+        let empty = Zeroizing::new(Vec::new());
+        let pq = self.pq_pkcs8.as_ref().unwrap_or(&empty);
+
+        let mut v = Zeroizing::new(Vec::with_capacity(9 + ed.len() + pq.len()));
+        v.push(SECRET_VERSION);
+        v.extend_from_slice(&(ed.len() as u32).to_be_bytes());
+        v.extend_from_slice(&ed);
+        v.extend_from_slice(&(pq.len() as u32).to_be_bytes());
+        v.extend_from_slice(pq);
+        v
+    }
+
+    /// Restore an identity from [`Self::to_secret_bytes`].
+    pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let mut pos = 0usize;
+        let mut take = |n: usize| -> Result<&[u8], Error> {
+            let end = pos
+                .checked_add(n)
+                .filter(|e| *e <= bytes.len())
+                .ok_or_else(|| Error::Identity("stored identity is truncated".into()))?;
+            let out = &bytes[pos..end];
+            pos = end;
+            Ok(out)
+        };
+
+        let version = take(1)?[0];
+        if version != SECRET_VERSION {
+            return Err(Error::Identity(format!(
+                "stored identity version {version}, this build understands {SECRET_VERSION}"
+            )));
+        }
+
+        let ed_len = u32::from_be_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+        let classical = LocalIdentity::from_pkcs8(take(ed_len)?)?;
+
+        let pq_len = u32::from_be_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+        let (pq_pkcs8, pq_public) = if pq_len == 0 {
+            (None, None)
+        } else {
+            let der = Zeroizing::new(take(pq_len)?.to_vec());
+            // Re-derive the public half from the private key rather than trusting
+            // a stored copy: a tampered file then cannot pair a private key with
+            // someone else's public key.
+            let keypair = PqdsaKeyPair::from_pkcs8(&ML_DSA_65_SIGNING, &der)
+                .map_err(|_| Error::Identity("stored ML-DSA key is not valid".into()))?;
+            let public = PqPublicKey::from_bytes(keypair.public_key().as_ref().to_vec())?;
+            (Some(der), Some(public))
+        };
+
+        if pos != bytes.len() {
+            return Err(Error::Identity(
+                "trailing bytes after stored identity — refusing an ambiguous encoding".into(),
+            ));
+        }
+
+        Ok(LocalBundle {
+            classical,
+            pq_pkcs8,
+            pq_public,
+        })
+    }
+
     /// Sign `message` with the ML-DSA-65 key.
     ///
     /// Errors when this identity has no post-quantum half — callers must treat
@@ -458,6 +538,49 @@ mod tests {
         let local = LocalBundle::classical_only(LocalIdentity::generate().unwrap());
         assert!(!local.bundle().is_hybrid());
         assert!(local.sign_pq(b"x").is_err());
+    }
+
+    /// An identity must survive a restart, keys and identifier intact.
+    #[test]
+    fn a_bundle_round_trips_through_its_secret_form() {
+        let local = LocalBundle::generate().unwrap();
+        let restored = LocalBundle::from_secret_bytes(&local.to_secret_bytes()).unwrap();
+
+        assert_eq!(restored.id(), local.id(), "the identity must not change");
+        assert_eq!(restored.bundle(), local.bundle());
+
+        // The restored private keys must actually work, not merely parse.
+        let sig = restored.sign_pq(b"after a restart").unwrap();
+        local
+            .bundle()
+            .pq()
+            .unwrap()
+            .verify(b"after a restart", &sig)
+            .expect("a restored key must produce signatures the original verifies");
+    }
+
+    #[test]
+    fn a_classical_only_bundle_round_trips_too() {
+        let local = LocalBundle::classical_only(LocalIdentity::generate().unwrap());
+        let restored = LocalBundle::from_secret_bytes(&local.to_secret_bytes()).unwrap();
+        assert_eq!(restored.id(), local.id());
+        assert!(!restored.bundle().is_hybrid());
+    }
+
+    /// A corrupted or truncated identity file must be rejected, never
+    /// half-loaded into a key that no longer matches its identifier.
+    #[test]
+    fn a_damaged_identity_file_is_refused() {
+        let bytes = LocalBundle::generate().unwrap().to_secret_bytes();
+        for n in 0..bytes.len() {
+            assert!(
+                LocalBundle::from_secret_bytes(&bytes[..n]).is_err(),
+                "prefix of length {n} must be rejected"
+            );
+        }
+        let mut extra = bytes.to_vec();
+        extra.push(0);
+        assert!(LocalBundle::from_secret_bytes(&extra).is_err());
     }
 
     #[test]

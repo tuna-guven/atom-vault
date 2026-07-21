@@ -1,6 +1,6 @@
+use eff_wordlist::large::random_word;
 use eframe::egui;
 use egui::{Color32, Context, Margin, RichText, Rounding, Stroke};
-use eff_wordlist::large::random_word;
 use rfd::FileDialog;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -14,21 +14,18 @@ use super::{AtomVaultApp, Screen, VaultSession};
 /// Returns true when `name` is a safe vault/file name: non-empty, no path
 /// separators, no null bytes.
 pub(super) fn is_valid_vault_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains('\0')
 }
 
 // ── Login screen ──────────────────────────────────────────────────────────────
 
-const ACCENT:      Color32 = Color32::from_rgb(64,  160, 255);
-const ACCENT_DARK: Color32 = Color32::from_rgb(38,  110, 200);
-const PANEL_BG:    Color32 = Color32::from_rgb(20,  24,  38);
-const CARD_BG:     Color32 = Color32::from_rgb(30,  35,  54);
-const TEXT_PRI:    Color32 = Color32::from_rgb(218, 224, 245);
-const TEXT_SEC:    Color32 = Color32::from_rgb(130, 142, 175);
-const TEXT_DIM:    Color32 = Color32::from_rgb(85,  95, 125);
+const ACCENT: Color32 = Color32::from_rgb(64, 160, 255);
+const ACCENT_DARK: Color32 = Color32::from_rgb(38, 110, 200);
+const PANEL_BG: Color32 = Color32::from_rgb(20, 24, 38);
+const CARD_BG: Color32 = Color32::from_rgb(30, 35, 54);
+const TEXT_PRI: Color32 = Color32::from_rgb(218, 224, 245);
+const TEXT_SEC: Color32 = Color32::from_rgb(130, 142, 175);
+const TEXT_DIM: Color32 = Color32::from_rgb(85, 95, 125);
 
 impl AtomVaultApp {
     pub(super) fn show_login(&mut self, ctx: &Context) {
@@ -51,9 +48,7 @@ impl AtomVaultApp {
                             .file_stem()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| p.to_string_lossy().to_string());
-                        ui.label(
-                            RichText::new(&name).size(22.0).strong().color(TEXT_PRI),
-                        );
+                        ui.label(RichText::new(&name).size(22.0).strong().color(TEXT_PRI));
                         ui.add_space(2.0);
                         ui.label(RichText::new(".aegis vault").size(11.5).color(TEXT_DIM));
                     } else {
@@ -74,11 +69,7 @@ impl AtomVaultApp {
                         .inner_margin(Margin::symmetric(22.0, 18.0))
                         .show(ui, |ui| {
                             // Password label + field
-                            ui.label(
-                                RichText::new("Master Password")
-                                    .size(13.0)
-                                    .color(TEXT_SEC),
-                            );
+                            ui.label(RichText::new("Master Password").size(13.0).color(TEXT_SEC));
                             ui.add_space(4.0);
                             let pass_resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.password)
@@ -120,11 +111,7 @@ impl AtomVaultApp {
                                 } else {
                                     Color32::from_rgb(130, 190, 255)
                                 };
-                                ui.label(
-                                    RichText::new(&self.login_status)
-                                        .size(13.0)
-                                        .color(color),
-                                );
+                                ui.label(RichText::new(&self.login_status).size(13.0).color(color));
                             }
                         });
 
@@ -258,10 +245,7 @@ impl AtomVaultApp {
                                     RichText::new("← Cancel").size(13.0).color(TEXT_SEC),
                                 )
                                 .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    Color32::from_rgb(50, 58, 88),
-                                )),
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(50, 58, 88))),
                             )
                             .clicked()
                         {
@@ -335,10 +319,7 @@ impl AtomVaultApp {
                         )
                         .clicked()
                     {
-                        let pass = (0..10)
-                            .map(|_| random_word())
-                            .collect::<Vec<_>>()
-                            .join(" ");
+                        let pass = (0..10).map(|_| random_word()).collect::<Vec<_>>().join(" ");
                         self.create_password = pass.clone();
                         self.create_confirm = pass;
                         self.create_show_password = true;
@@ -349,7 +330,9 @@ impl AtomVaultApp {
 
                     // Advanced settings
                     ui.collapsing(
-                        RichText::new("Advanced Crypto Settings").size(13.0).color(TEXT_SEC),
+                        RichText::new("Advanced Crypto Settings")
+                            .size(13.0)
+                            .color(TEXT_SEC),
                         |ui| {
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
@@ -416,7 +399,8 @@ impl AtomVaultApp {
                                 let full_path = vault_dir.join(format!("{}.aegis", name));
                                 self.do_create_vault_at_path(full_path);
                             } else {
-                                self.create_status = "Error: Cannot determine home directory.".to_string();
+                                self.create_status =
+                                    "Error: Cannot determine home directory.".to_string();
                             }
                         }
                     }
@@ -445,9 +429,7 @@ impl AtomVaultApp {
                             .inner_margin(Margin::symmetric(10.0, 6.0))
                             .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new(&self.create_status)
-                                        .size(13.0)
-                                        .color(color),
+                                    RichText::new(&self.create_status).size(13.0).color(color),
                                 );
                             });
                     }
@@ -480,7 +462,11 @@ impl AtomVaultApp {
             self.sandbox_applied = true;
         }
 
-        let kdf = if self.create_kdf_argon { "argon2id" } else { "scrypt" };
+        let kdf = if self.create_kdf_argon {
+            "argon2id"
+        } else {
+            "scrypt"
+        };
         let dec_time: u32 = self.create_dec_time.parse().unwrap_or(1000);
         let mem_arg: Option<u32> = self.create_memory.parse().ok();
         let rounds_arg: Option<u32> = self.create_rounds.parse().ok();

@@ -2,8 +2,8 @@ use eframe::egui;
 use egui::{Color32, Context, Margin, RichText, Rounding, Stroke};
 use rfd::FileDialog;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use super::{AtomVaultApp, FileAction, RenameState, Screen};
 
@@ -11,29 +11,25 @@ use super::{AtomVaultApp, FileAction, RenameState, Screen};
 
 /// Same rule as `is_valid_vault_name`: non-empty, no path separators or nulls.
 pub(super) fn is_valid_vfs_filename(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains('\0')
 }
-
 
 // ── Colour palette (matching home screen) ─────────────────────────────────────
 
-const HEADER_BG:      Color32 = Color32::from_rgb(18,  22,  38);
-const PANEL_BG:       Color32 = Color32::from_rgb(20,  24,  38);
-const CARD_BG:        Color32 = Color32::from_rgb(34,  39,  58);
-const CARD_STROKE:    Color32 = Color32::from_rgb(52,  60,  92);
-const BADGE_BG:       Color32 = Color32::from_rgb(40,  46,  70);
-const ACCENT:         Color32 = Color32::from_rgb(64,  160, 255);
-const ACCENT_DARK:    Color32 = Color32::from_rgb(40,  120, 210);
-const SUCCESS:        Color32 = Color32::from_rgb(48,  190,  90);
-const SUCCESS_DARK:   Color32 = Color32::from_rgb(28,  120,  55);
-const DANGER:         Color32 = Color32::from_rgb(255,  75,  65);
-const WARN:           Color32 = Color32::from_rgb(235, 165,  50);
-const TEXT_PRIMARY:   Color32 = Color32::from_rgb(218, 224, 245);
+const HEADER_BG: Color32 = Color32::from_rgb(18, 22, 38);
+const PANEL_BG: Color32 = Color32::from_rgb(20, 24, 38);
+const CARD_BG: Color32 = Color32::from_rgb(34, 39, 58);
+const CARD_STROKE: Color32 = Color32::from_rgb(52, 60, 92);
+const BADGE_BG: Color32 = Color32::from_rgb(40, 46, 70);
+const ACCENT: Color32 = Color32::from_rgb(64, 160, 255);
+const ACCENT_DARK: Color32 = Color32::from_rgb(40, 120, 210);
+const SUCCESS: Color32 = Color32::from_rgb(48, 190, 90);
+const SUCCESS_DARK: Color32 = Color32::from_rgb(28, 120, 55);
+const DANGER: Color32 = Color32::from_rgb(255, 75, 65);
+const WARN: Color32 = Color32::from_rgb(235, 165, 50);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(218, 224, 245);
 const TEXT_SECONDARY: Color32 = Color32::from_rgb(130, 142, 175);
-const TEXT_DIM:       Color32 = Color32::from_rgb(85,  95, 125);
+const TEXT_DIM: Color32 = Color32::from_rgb(85, 95, 125);
 
 fn card_frame(bg: Color32, stroke: Color32) -> egui::Frame {
     egui::Frame::none()
@@ -51,7 +47,13 @@ impl AtomVaultApp {
         let file_names: Vec<String> = self
             .vault_session
             .as_ref()
-            .map(|s| s.metadata.file_table.iter().map(|f| f.vfs_name.clone()).collect())
+            .map(|s| {
+                s.metadata
+                    .file_table
+                    .iter()
+                    .map(|f| f.vfs_name.clone())
+                    .collect()
+            })
             .unwrap_or_default();
 
         let vault_label = self
@@ -135,11 +137,9 @@ impl AtomVaultApp {
                         // P2P Network
                         if ui
                             .add(
-                                egui::Button::new(
-                                    RichText::new("P2P Network").size(13.5),
-                                )
-                                .fill(BADGE_BG)
-                                .stroke(Stroke::new(1.0, CARD_STROKE)),
+                                egui::Button::new(RichText::new("P2P Network").size(13.5))
+                                    .fill(BADGE_BG)
+                                    .stroke(Stroke::new(1.0, CARD_STROKE)),
                             )
                             .clicked()
                         {
@@ -196,12 +196,7 @@ impl AtomVaultApp {
             .show(ctx, |ui| {
                 // Section label
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("FILES")
-                            .size(11.5)
-                            .strong()
-                            .color(TEXT_DIM),
-                    );
+                    ui.label(RichText::new("FILES").size(11.5).strong().color(TEXT_DIM));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("{} file(s)", file_names.len()))
@@ -245,10 +240,7 @@ impl AtomVaultApp {
                                 ui.add_space(8.0);
                                 ui.vertical(|ui| {
                                     ui.label(
-                                        RichText::new(name)
-                                            .size(15.0)
-                                            .strong()
-                                            .color(TEXT_PRIMARY),
+                                        RichText::new(name).size(15.0).strong().color(TEXT_PRIMARY),
                                     );
                                     ui.label(
                                         RichText::new(format!(".{} file", ext.to_uppercase()))
@@ -292,9 +284,7 @@ impl AtomVaultApp {
                                         if ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("Rename")
-                                                        .size(12.5)
-                                                        .color(WARN),
+                                                    RichText::new("Rename").size(12.5).color(WARN),
                                                 )
                                                 .fill(Color32::from_rgb(45, 38, 20))
                                                 .stroke(Stroke::new(
@@ -420,11 +410,9 @@ impl AtomVaultApp {
         };
 
         let done_flag = Arc::new(AtomicBool::new(false));
-        let spawn_result = self.file_broker.open_viewer(
-            bytes,
-            vfs_name.to_string(),
-            Arc::clone(&done_flag),
-        );
+        let spawn_result =
+            self.file_broker
+                .open_viewer(bytes, vfs_name.to_string(), Arc::clone(&done_flag));
         self.pending_viewer_spawn = Some(spawn_result);
         self.viewer_done = Some((done_flag, vfs_name.to_string()));
     }
@@ -457,8 +445,7 @@ impl AtomVaultApp {
         ) {
             Ok(bytes) => {
                 self.explorer_status = "Writing file...".to_string();
-                self.pending_export_write_result =
-                    Some(self.file_broker.write_file(path, bytes));
+                self.pending_export_write_result = Some(self.file_broker.write_file(path, bytes));
             }
             Err(e) => self.explorer_status = format!("Export Error: {}", e),
         }
@@ -509,8 +496,7 @@ impl AtomVaultApp {
                         );
                         ui.add_space(4.0);
                         ui.add(
-                            egui::TextEdit::singleline(&mut state.new_name)
-                                .desired_width(280.0),
+                            egui::TextEdit::singleline(&mut state.new_name).desired_width(280.0),
                         );
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
@@ -552,7 +538,12 @@ impl AtomVaultApp {
                 if !is_valid_vfs_filename(&state.new_name) {
                     self.explorer_status = "Rename Error: Invalid characters.".to_string();
                 } else if let Some(sess) = &mut self.vault_session {
-                    if sess.metadata.file_table.iter().any(|f| f.vfs_name == state.new_name) {
+                    if sess
+                        .metadata
+                        .file_table
+                        .iter()
+                        .any(|f| f.vfs_name == state.new_name)
+                    {
                         self.explorer_status =
                             "Rename Error: A file with that name already exists.".to_string();
                     } else if let Some(fi) = sess
@@ -572,8 +563,7 @@ impl AtomVaultApp {
                             sess.current_offset,
                         ) {
                             Ok(()) => {
-                                self.explorer_status =
-                                    format!("Renamed to: {}", state.new_name);
+                                self.explorer_status = format!("Renamed to: {}", state.new_name);
                             }
                             Err(e) => {
                                 self.explorer_status =
@@ -593,21 +583,15 @@ impl AtomVaultApp {
 
 fn file_icon(ext: &str) -> &'static str {
     match ext.to_lowercase().as_str() {
-        "pdf"                              => "📄",
-        "png" | "jpg" | "jpeg" | "gif"
-        | "webp" | "svg" | "bmp"          => "🖼",
-        "mp4" | "mkv" | "avi" | "mov"
-        | "webm"                           => "🎬",
-        "mp3" | "flac" | "ogg" | "wav"
-        | "aac" | "opus"                   => "🎵",
-        "zip" | "tar" | "gz" | "xz"
-        | "bz2" | "7z" | "rar" | "zst"   => "🗜",
-        "txt" | "md" | "rst"               => "📝",
-        "rs" | "py" | "js" | "ts"
-        | "c" | "cpp" | "go" | "rb"
-        | "java" | "sh" | "toml"
-        | "yaml" | "json"                  => "💾",
-        _                                  => "📁",
+        "pdf" => "📄",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" => "🖼",
+        "mp4" | "mkv" | "avi" | "mov" | "webm" => "🎬",
+        "mp3" | "flac" | "ogg" | "wav" | "aac" | "opus" => "🎵",
+        "zip" | "tar" | "gz" | "xz" | "bz2" | "7z" | "rar" | "zst" => "🗜",
+        "txt" | "md" | "rst" => "📝",
+        "rs" | "py" | "js" | "ts" | "c" | "cpp" | "go" | "rb" | "java" | "sh" | "toml" | "yaml"
+        | "json" => "💾",
+        _ => "📁",
     }
 }
 
@@ -687,7 +671,10 @@ mod tests {
 
     #[test]
     fn neutral_message_maps_to_gray() {
-        assert_eq!(status_color("Opening file.txt securely in sandbox..."), egui::Color32::GRAY);
+        assert_eq!(
+            status_color("Opening file.txt securely in sandbox..."),
+            egui::Color32::GRAY
+        );
         assert_eq!(status_color(""), egui::Color32::GRAY);
     }
 }

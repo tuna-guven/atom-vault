@@ -1,10 +1,10 @@
 use eframe::egui;
 use egui::{Color32, Context, Margin, RichText, Rounding, Stroke};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use super::{AtomVaultApp, Screen, TransportTab};
 use crate::commands::daemon::SyncResponse;
-use super::{AtomVaultApp, Screen};
 
 // ── Pure helpers (tested below) ───────────────────────────────────────────────
 
@@ -24,19 +24,19 @@ pub(super) fn resolve_save_path(save_path: &str, sender_nick: &str, filename: &s
 
 // ── Colour palette (matching home screen) ─────────────────────────────────────
 
-const HEADER_BG:      Color32 = Color32::from_rgb(18,  22,  38);
-const PANEL_BG:       Color32 = Color32::from_rgb(20,  24,  38);
-const CARD_BG:        Color32 = Color32::from_rgb(34,  39,  58);
-const CARD_STROKE:    Color32 = Color32::from_rgb(52,  60,  92);
-const BADGE_BG:       Color32 = Color32::from_rgb(40,  46,  70);
-const ACCENT:         Color32 = Color32::from_rgb(64,  160, 255);
-const ACCENT_DARK:    Color32 = Color32::from_rgb(40,  120, 210);
-const SUCCESS:        Color32 = Color32::from_rgb(48,  190,  90);
-const SUCCESS_DARK:   Color32 = Color32::from_rgb(28,  120,  55);
-const DANGER:         Color32 = Color32::from_rgb(255,  75,  65);
-const TEXT_PRIMARY:   Color32 = Color32::from_rgb(218, 224, 245);
+const HEADER_BG: Color32 = Color32::from_rgb(18, 22, 38);
+const PANEL_BG: Color32 = Color32::from_rgb(20, 24, 38);
+const CARD_BG: Color32 = Color32::from_rgb(34, 39, 58);
+const CARD_STROKE: Color32 = Color32::from_rgb(52, 60, 92);
+const BADGE_BG: Color32 = Color32::from_rgb(40, 46, 70);
+const ACCENT: Color32 = Color32::from_rgb(64, 160, 255);
+const ACCENT_DARK: Color32 = Color32::from_rgb(40, 120, 210);
+const SUCCESS: Color32 = Color32::from_rgb(48, 190, 90);
+const SUCCESS_DARK: Color32 = Color32::from_rgb(28, 120, 55);
+const DANGER: Color32 = Color32::from_rgb(255, 75, 65);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(218, 224, 245);
 const TEXT_SECONDARY: Color32 = Color32::from_rgb(130, 142, 175);
-const TEXT_DIM:       Color32 = Color32::from_rgb(85,  95, 125);
+const TEXT_DIM: Color32 = Color32::from_rgb(85, 95, 125);
 
 fn card_frame(bg: Color32, stroke: Color32) -> egui::Frame {
     egui::Frame::none()
@@ -122,11 +122,7 @@ impl AtomVaultApp {
                         .inner_margin(Margin::symmetric(18.0, 8.0)),
                 )
                 .show(ctx, |ui| {
-                    ui.label(
-                        RichText::new(&sync_status)
-                            .size(13.0)
-                            .color(text_color),
-                    );
+                    ui.label(RichText::new(&sync_status).size(13.0).color(text_color));
                 });
         }
 
@@ -138,6 +134,43 @@ impl AtomVaultApp {
                     .inner_margin(Margin::symmetric(18.0, 14.0)),
             )
             .show(ctx, |ui| {
+                // ── Transport selector ────────────────────────────────
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (TransportTab::Tor, "Tor (live sync)"),
+                        (TransportTab::Live, "Live — strict PFS + post-quantum"),
+                    ] {
+                        let selected = self.transport_tab == tab;
+                        let (fill, stroke_c) = if selected {
+                            (ACCENT_DARK, ACCENT)
+                        } else {
+                            (BADGE_BG, CARD_STROKE)
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(label).size(13.5).color(
+                                    if selected {
+                                        Color32::WHITE
+                                    } else {
+                                        TEXT_SECONDARY
+                                    },
+                                ))
+                                .fill(fill)
+                                .stroke(Stroke::new(1.0, stroke_c)),
+                            )
+                            .clicked()
+                        {
+                            self.transport_tab = tab;
+                        }
+                    }
+                });
+                ui.add_space(12.0);
+
+                if self.transport_tab == TransportTab::Live {
+                    self.show_live_panel(ui);
+                    return;
+                }
+
                 egui::ScrollArea::vertical()
                     .id_salt("p2p_scroll")
                     .show(ui, |ui| {
@@ -162,9 +195,7 @@ impl AtomVaultApp {
                         // ── Add friend ────────────────────────────────────────
                         section_label(ui, "ADD NEW FRIEND");
                         card_frame(CARD_BG, CARD_STROKE).show(ui, |ui| {
-                            ui.label(
-                                RichText::new("Nickname").size(12.5).color(TEXT_SECONDARY),
-                            );
+                            ui.label(RichText::new("Nickname").size(12.5).color(TEXT_SECONDARY));
                             ui.add_space(3.0);
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.friend_nick)
@@ -174,7 +205,9 @@ impl AtomVaultApp {
                             ui.add_space(8.0);
 
                             ui.label(
-                                RichText::new("atom:// URL").size(12.5).color(TEXT_SECONDARY),
+                                RichText::new("atom:// URL")
+                                    .size(12.5)
+                                    .color(TEXT_SECONDARY),
                             );
                             ui.add_space(3.0);
                             ui.add(
@@ -194,7 +227,10 @@ impl AtomVaultApp {
                             .fill(SUCCESS_DARK)
                             .stroke(Stroke::new(1.0, SUCCESS));
 
-                            if ui.add_sized([ui.available_width(), 36.0], add_btn).clicked() {
+                            if ui
+                                .add_sized([ui.available_width(), 36.0], add_btn)
+                                .clicked()
+                            {
                                 let nick = self.friend_nick.clone();
                                 let url = self.friend_url.clone();
                                 if nick.is_empty() || url.is_empty() {
@@ -211,21 +247,18 @@ impl AtomVaultApp {
                                                 all.iter().map(|f| f.nickname.clone()).collect();
                                             self.friends_full = all;
                                         }
-                                        Err(e) => {
-                                            self.add_friend_status = format!("Error: {}", e)
-                                        }
+                                        Err(e) => self.add_friend_status = format!("Error: {}", e),
                                     }
                                 }
                             }
 
                             if !self.add_friend_status.is_empty() {
                                 ui.add_space(8.0);
-                                let (color, bg) =
-                                    if self.add_friend_status.starts_with("Error") {
-                                        (DANGER, Color32::from_rgb(55, 18, 16))
-                                    } else {
-                                        (SUCCESS, Color32::from_rgb(16, 48, 26))
-                                    };
+                                let (color, bg) = if self.add_friend_status.starts_with("Error") {
+                                    (DANGER, Color32::from_rgb(55, 18, 16))
+                                } else {
+                                    (SUCCESS, Color32::from_rgb(16, 48, 26))
+                                };
                                 egui::Frame::none()
                                     .fill(bg)
                                     .rounding(Rounding::same(6.0))
@@ -276,9 +309,7 @@ impl AtomVaultApp {
                                             ui.selectable_value(
                                                 &mut self.selected_friend_idx,
                                                 i,
-                                                RichText::new(name)
-                                                    .size(14.0)
-                                                    .color(TEXT_PRIMARY),
+                                                RichText::new(name).size(14.0).color(TEXT_PRIMARY),
                                             );
                                         }
                                     });
@@ -383,7 +414,9 @@ impl AtomVaultApp {
                         ui.add_space(10.0);
 
                         ui.label(
-                            RichText::new("Local label:").size(12.5).color(TEXT_SECONDARY),
+                            RichText::new("Local label:")
+                                .size(12.5)
+                                .color(TEXT_SECONDARY),
                         );
                         ui.add_space(3.0);
                         ui.add(
@@ -442,11 +475,8 @@ impl AtomVaultApp {
         if accept {
             if let Some(state) = self.incoming_sync.take() {
                 if let Some(chan) = state.response_channel {
-                    let save = resolve_save_path(
-                        &state.save_path,
-                        &state.sender_nick,
-                        &state.filename,
-                    );
+                    let save =
+                        resolve_save_path(&state.save_path, &state.sender_nick, &state.filename);
                     let label = if state.vault_label.is_empty() {
                         "Synced Vault".to_string()
                     } else {

@@ -8,7 +8,8 @@ pub fn handle_vacuum(
     metadata: &mut VaultMetadata,
     physical_vault: &mut File,
     unlocked_vault: &UnlockedVault, // KRİTİK: Metadata'yı yeniden şifrelemek için eklendi
-) -> Result<u64, Box<dyn std::error::Error>> { // Güncel offset'i döndürür
+) -> Result<u64, Box<dyn std::error::Error>> {
+    // Güncel offset'i döndürür
     let tmp_path = format!("{}.tmp", vault_path);
     let mut tmp_file = std::fs::OpenOptions::new()
         .read(true)
@@ -69,11 +70,13 @@ pub fn handle_vacuum(
 
     tmp_file.sync_all()?;
     drop(tmp_file); // Yeniden adlandırma (rename) yapabilmek için dosya kilidini (FD) serbest bırak
-    
+
     std::fs::rename(&tmp_path, vault_path)?;
 
-    println!("[Vacuum] Optimization complete. Discarded dead zones and atomically defragmented storage container.");
-    
+    println!(
+        "[Vacuum] Optimization complete. Discarded dead zones and atomically defragmented storage container."
+    );
+
     // Yeni payload offset'ini döndür ki shell.rs bunu güncelleyebilsin
-    Ok(new_payload_offset) 
+    Ok(new_payload_offset)
 }

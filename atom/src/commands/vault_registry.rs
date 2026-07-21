@@ -24,11 +24,10 @@ fn get_registry_path() -> PathBuf {
 pub fn load_vault_registry() -> Vec<VaultEntry> {
     let path = get_registry_path();
     if let Ok(raw) = fs::read(&path) {
-        let decrypted = crate::config_crypto::decrypt_config(&raw)
-            .unwrap_or_else(|e| {
-                eprintln!("[FATAL] Cannot decrypt vaults.json: {e}");
-                std::process::exit(1);
-            });
+        let decrypted = crate::config_crypto::decrypt_config(&raw).unwrap_or_else(|e| {
+            eprintln!("[FATAL] Cannot decrypt vaults.json: {e}");
+            std::process::exit(1);
+        });
         if let Ok(contents) = String::from_utf8(decrypted) {
             if let Ok(entries) = serde_json::from_str::<Vec<VaultEntry>>(&contents) {
                 return entries

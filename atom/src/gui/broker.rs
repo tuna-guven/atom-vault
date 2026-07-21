@@ -2,13 +2,13 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use crate::commands::view::{
-    install_signal_handler, register_teardown, MlockedMap, ViewerTeardown,
+    MlockedMap, ViewerTeardown, install_signal_handler, register_teardown,
 };
 
 enum BrokerRequest {
@@ -72,7 +72,12 @@ impl FileBroker {
                                 }
                             });
                         }
-                        BrokerRequest::OpenViewer { data, filename, done_flag, spawn_result } => {
+                        BrokerRequest::OpenViewer {
+                            data,
+                            filename,
+                            done_flag,
+                            spawn_result,
+                        } => {
                             std::thread::spawn(move || {
                                 let res = open_in_viewer(data, &filename, Arc::clone(&done_flag));
                                 if let Ok(mut g) = spawn_result.lock() {
@@ -269,14 +274,18 @@ fn open_in_viewer(
         })
         .join("atom_staging");
 
-    std::fs::create_dir_all(&staging)
-        .map_err(|e| format!("Cannot create staging dir: {}", e))?;
+    std::fs::create_dir_all(&staging).map_err(|e| format!("Cannot create staging dir: {}", e))?;
 
     // Preserve the file extension so MIME-type detection routes to the user's
     // default viewer for this kind of file.
     let file_path = Path::new(filename);
-    let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or(filename);
-    let ext = file_path.extension().and_then(|e| e.to_str())
+    let stem = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
         .map(|e| format!(".{}", e))
         .unwrap_or_default();
     let tmp_path = staging.join(format!("{}_view_tmp{}", stem, ext));
@@ -421,8 +430,8 @@ fn resolve_viewer_command(path: &Path) -> Result<std::process::Command, String> 
 
     let desktop = find_desktop_file(&desktop_id)
         .ok_or_else(|| format!("Cannot locate desktop file '{}'", desktop_id))?;
-    let exec = parse_exec(&desktop)
-        .ok_or_else(|| format!("No Exec line in {}", desktop.display()))?;
+    let exec =
+        parse_exec(&desktop).ok_or_else(|| format!("No Exec line in {}", desktop.display()))?;
 
     let mut argv = build_argv(&exec, &path_str);
     if argv.is_empty() {
@@ -491,7 +500,10 @@ fn rewrite_flatpak_argv(argv: Vec<String>, staged_file: &Path) -> Result<Vec<Str
     // Sandbox overrides must precede the app ref.
     out.push("--unshare=network".to_string());
     out.push("--die-with-parent".to_string());
-    out.push(format!("--filesystem={}", flatpak_filesystem_spec(staged_file)));
+    out.push(format!(
+        "--filesystem={}",
+        flatpak_filesystem_spec(staged_file)
+    ));
 
     // Carry over the original `flatpak run` options / app-id / path, dropping the
     // document-portal forwarding machinery.  `build_argv` has already substituted
@@ -566,8 +578,8 @@ fn find_desktop_file(desktop_id: &str) -> Option<PathBuf> {
             }
         }
     }
-    let data_dirs =
-        std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
     for d in data_dirs.split(':').filter(|d| !d.is_empty()) {
         bases.push(PathBuf::from(d));
     }
@@ -669,10 +681,14 @@ fn tokenize_exec(s: &str) -> Vec<String> {
 
 /// Returns `true` if any process currently has `path` open (via /proc/*/fd).
 fn is_file_open(path: &Path) -> bool {
-    let Ok(procs) = std::fs::read_dir("/proc") else { return false };
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
     for entry in procs.flatten() {
         let fd_dir = entry.path().join("fd");
-        let Ok(fds) = std::fs::read_dir(&fd_dir) else { continue };
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
         for fd in fds.flatten() {
             if let Ok(target) = std::fs::read_link(fd.path()) {
                 if target == path {
@@ -725,8 +741,12 @@ fn write_with_sandbox(path: &Path, data: &[u8]) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path).map_err(|e| format!("[Broker] Create failed: {}", e))?;
-    f.write_all(data).map_err(|e| format!("[Broker] Write failed: {}", e))?;
-    f.sync_all().map_err(|e| format!("[Broker] Sync failed: {}", e))?;
+    let mut f = opts
+        .open(path)
+        .map_err(|e| format!("[Broker] Create failed: {}", e))?;
+    f.write_all(data)
+        .map_err(|e| format!("[Broker] Write failed: {}", e))?;
+    f.sync_all()
+        .map_err(|e| format!("[Broker] Sync failed: {}", e))?;
     Ok(())
 }

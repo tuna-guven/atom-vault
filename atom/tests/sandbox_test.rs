@@ -82,7 +82,8 @@ fn test_bwrap_file_fd_passes_memfd_content() {
     assert!(fd >= 0, "memfd_create failed");
 
     // 2. Write payload and rewind.
-    let written = unsafe { libc::write(fd, PAYLOAD.as_ptr() as *const libc::c_void, PAYLOAD.len()) };
+    let written =
+        unsafe { libc::write(fd, PAYLOAD.as_ptr() as *const libc::c_void, PAYLOAD.len()) };
     assert_eq!(written as usize, PAYLOAD.len(), "write to memfd failed");
     unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
 
@@ -92,13 +93,21 @@ fn test_bwrap_file_fd_passes_memfd_content() {
     //    -- cat /tmp/...      → reads and prints the file to stdout
     let out = Command::new("bwrap")
         .args([
-            "--ro-bind", "/usr", "/usr",
-            "--proc", "/proc",
-            "--dev", "/dev",
-            "--tmpfs", "/tmp",
-            "--file", &fd.to_string(), "/tmp/payload.txt",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--file",
+            &fd.to_string(),
+            "/tmp/payload.txt",
             "--",
-            "cat", "/tmp/payload.txt",
+            "cat",
+            "/tmp/payload.txt",
         ])
         .output()
         .expect("failed to spawn bwrap for fd-passing test");
@@ -131,11 +140,17 @@ fn test_bwrap_network_is_unshared() {
     let out = Command::new("bwrap")
         .args([
             "--unshare-net",
-            "--ro-bind", "/usr", "/usr",
-            "--proc", "/proc",
-            "--dev", "/dev",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
             "--",
-            "sh", "-c", "ping -c1 -W1 1.1.1.1 2>/dev/null; echo $?",
+            "sh",
+            "-c",
+            "ping -c1 -W1 1.1.1.1 2>/dev/null; echo $?",
         ])
         .output()
         .expect("failed to spawn bwrap for network test");
@@ -144,7 +159,10 @@ fn test_bwrap_network_is_unshared() {
     // ping exits non-zero when the host is unreachable; we capture the exit
     // code via `echo $?` so the outer bwrap still exits 0.
     let ping_exit: u32 = stdout.trim().parse().unwrap_or(0);
-    assert_ne!(ping_exit, 0, "ping succeeded inside --unshare-net sandbox; network was not isolated");
+    assert_ne!(
+        ping_exit, 0,
+        "ping succeeded inside --unshare-net sandbox; network was not isolated"
+    );
 }
 
 /// Verify that the sandbox's tmpfs is truly ephemeral: a file written inside
@@ -160,12 +178,19 @@ fn test_bwrap_tmpfs_does_not_leak_to_host() {
     // Write a sentinel file inside the sandbox's /tmp.
     let out = Command::new("bwrap")
         .args([
-            "--ro-bind", "/usr", "/usr",
-            "--proc", "/proc",
-            "--dev", "/dev",
-            "--tmpfs", "/tmp",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
             "--",
-            "sh", "-c", &format!("echo leaked > {sentinel}"),
+            "sh",
+            "-c",
+            &format!("echo leaked > {sentinel}"),
         ])
         .output()
         .expect("failed to spawn bwrap for tmpfs-leak test");
@@ -187,12 +212,7 @@ fn test_bwrap_file_dest_is_readonly() {
         return;
     }
 
-    let fd = unsafe {
-        libc::memfd_create(
-            b"atom_ro_test\0".as_ptr() as *const libc::c_char,
-            0,
-        )
-    };
+    let fd = unsafe { libc::memfd_create(b"atom_ro_test\0".as_ptr() as *const libc::c_char, 0) };
     assert!(fd >= 0);
 
     let payload = b"original";
@@ -202,13 +222,22 @@ fn test_bwrap_file_dest_is_readonly() {
     // Attempt to overwrite the --file destination; the write must fail.
     let out = Command::new("bwrap")
         .args([
-            "--ro-bind", "/usr", "/usr",
-            "--proc", "/proc",
-            "--dev", "/dev",
-            "--tmpfs", "/tmp",
-            "--file", &fd.to_string(), "/tmp/document.pdf",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--file",
+            &fd.to_string(),
+            "/tmp/document.pdf",
             "--",
-            "sh", "-c", "echo overwritten > /tmp/document.pdf; echo $?",
+            "sh",
+            "-c",
+            "echo overwritten > /tmp/document.pdf; echo $?",
         ])
         .output()
         .expect("failed to spawn bwrap for read-only test");

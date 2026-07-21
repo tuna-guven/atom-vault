@@ -2,7 +2,7 @@ use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::unistd::{Whence, ftruncate, lseek};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
-use std::io::{Write, Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind};
+use std::io::{Error, ErrorKind, Read, Result as IoResult, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use zeroize::Zeroize;
 
@@ -51,15 +51,19 @@ pub fn process_secure_chunk<F>(
     chunk_offset: u64,
     plain_len: usize,
     action: F,
-) -> std::io::Result<()> where F: FnOnce(&[u8]), {
-
+) -> std::io::Result<()>
+where
+    F: FnOnce(&[u8]),
+{
     physical_vault.seek(SeekFrom::Start(chunk_offset))?;
 
     let mut cipher_buffer = vec![0u8; cipher_len];
     physical_vault.read_exact(&mut cipher_buffer)?;
 
-    let mut secure_plaintext = crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, file_id)
-        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Decryption error: {:?}", e)))?;
+    let mut secure_plaintext =
+        crate::crypto::decrypt_chunk(unlocked_vault, &cipher_buffer, file_id).map_err(|e| {
+            Error::new(ErrorKind::InvalidData, format!("Decryption error: {:?}", e))
+        })?;
 
     // Lock memory page to prevent OS from swapping plaintext to disk
     let mlock_result = unsafe {
@@ -194,8 +198,8 @@ impl Seek for MemFile {
             SeekFrom::End(n) => (n, Whence::SeekEnd),
         };
 
-        let new_pos = lseek(&self.fd, offset, whence)
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let new_pos =
+            lseek(&self.fd, offset, whence).map_err(|e| Error::new(ErrorKind::Other, e))?;
 
         Ok(new_pos as u64)
     }

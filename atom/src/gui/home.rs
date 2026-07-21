@@ -7,27 +7,27 @@ use super::{AtomVaultApp, Screen};
 
 // ── Colour palette ────────────────────────────────────────────────────────────
 
-const ONLINE:        Color32 = Color32::from_rgb(52,  210,  90);
-const OFFLINE:       Color32 = Color32::from_rgb(115, 120, 135);
-const ACCENT:        Color32 = Color32::from_rgb(64,  160, 255);
-const ACCENT_DARK:   Color32 = Color32::from_rgb(40,  120, 210);
-const SUCCESS:       Color32 = Color32::from_rgb(48,  190,  90);
-const SUCCESS_DARK:  Color32 = Color32::from_rgb(28,  120,  55);
-const DANGER:        Color32 = Color32::from_rgb(255,  75,  65);
-const SHARED_TEAL:   Color32 = Color32::from_rgb(100, 210, 210);
+const ONLINE: Color32 = Color32::from_rgb(52, 210, 90);
+const OFFLINE: Color32 = Color32::from_rgb(115, 120, 135);
+const ACCENT: Color32 = Color32::from_rgb(64, 160, 255);
+const ACCENT_DARK: Color32 = Color32::from_rgb(40, 120, 210);
+const SUCCESS: Color32 = Color32::from_rgb(48, 190, 90);
+const SUCCESS_DARK: Color32 = Color32::from_rgb(28, 120, 55);
+const DANGER: Color32 = Color32::from_rgb(255, 75, 65);
+const SHARED_TEAL: Color32 = Color32::from_rgb(100, 210, 210);
 
-const HEADER_BG:     Color32 = Color32::from_rgb(18,  22,  38);
-const PANEL_BG:      Color32 = Color32::from_rgb(24,  28,  44);
-const CARD_BG:       Color32 = Color32::from_rgb(34,  39,  58);
-const CARD_BG_WARN:  Color32 = Color32::from_rgb(48,  32,  28);
-const CARD_STROKE:   Color32 = Color32::from_rgb(52,  60,  92);
-const CARD_STROKE_W: Color32 = Color32::from_rgb(100, 60,  45);
-const BADGE_BG:      Color32 = Color32::from_rgb(40,  46,  70);
-const FRIEND_BG:     Color32 = Color32::from_rgb(30,  35,  54);
+const HEADER_BG: Color32 = Color32::from_rgb(18, 22, 38);
+const PANEL_BG: Color32 = Color32::from_rgb(24, 28, 44);
+const CARD_BG: Color32 = Color32::from_rgb(34, 39, 58);
+const CARD_BG_WARN: Color32 = Color32::from_rgb(48, 32, 28);
+const CARD_STROKE: Color32 = Color32::from_rgb(52, 60, 92);
+const CARD_STROKE_W: Color32 = Color32::from_rgb(100, 60, 45);
+const BADGE_BG: Color32 = Color32::from_rgb(40, 46, 70);
+const FRIEND_BG: Color32 = Color32::from_rgb(30, 35, 54);
 
-const TEXT_PRIMARY:   Color32 = Color32::from_rgb(218, 224, 245);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(218, 224, 245);
 const TEXT_SECONDARY: Color32 = Color32::from_rgb(130, 142, 175);
-const TEXT_DIM:       Color32 = Color32::from_rgb(85,  95, 125);
+const TEXT_DIM: Color32 = Color32::from_rgb(85, 95, 125);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -40,10 +40,15 @@ fn unix_now() -> u64 {
 
 fn relative_time(now: u64, ts: u64) -> String {
     let diff = now.saturating_sub(ts);
-    if diff < 60        { "just now".to_string() }
-    else if diff < 3600 { format!("{}m ago", diff / 60) }
-    else if diff < 86400 { format!("{}h ago", diff / 3600) }
-    else                { format!("{}d ago", diff / 86400) }
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86400)
+    }
 }
 
 fn card_frame(bg: Color32, stroke: Color32) -> egui::Frame {
@@ -122,12 +127,7 @@ impl AtomVaultApp {
     // ── Friends panel ─────────────────────────────────────────────────────────
 
     fn draw_friends_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new("FRIENDS")
-                .size(11.5)
-                .strong()
-                .color(TEXT_DIM),
-        );
+        ui.label(RichText::new("FRIENDS").size(11.5).strong().color(TEXT_DIM));
         ui.add(egui::Separator::default().spacing(8.0));
         ui.add_space(4.0);
 
@@ -232,11 +232,7 @@ impl AtomVaultApp {
                             } else {
                                 ("never synced".to_string(), TEXT_DIM)
                             };
-                            ui.label(
-                                RichText::new(status_text)
-                                    .size(11.5)
-                                    .color(status_color),
-                            );
+                            ui.label(RichText::new(status_text).size(11.5).color(status_color));
 
                             // Shared vaults
                             ui.add_space(5.0);
@@ -271,9 +267,7 @@ impl AtomVaultApp {
                                             &sv.label
                                         };
                                         ui.label(
-                                            RichText::new(display)
-                                                .size(11.5)
-                                                .color(SHARED_TEAL),
+                                            RichText::new(display).size(11.5).color(SHARED_TEAL),
                                         );
                                     });
                                 }

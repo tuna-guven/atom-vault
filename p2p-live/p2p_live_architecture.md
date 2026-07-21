@@ -600,14 +600,15 @@ substituting the post-quantum half changes the fingerprint a human reads aloud.
 
 **Not yet built (later phases):**
 
-- **Rendezvous UX** — the protocol exists; the human-facing part (getting two
-  people online at once, guiding the two-round paste, showing fingerprints to
-  compare) is the hard problem and is not designed yet.
+- **Nothing from the roadmap.** All seven phases are resolved, and the path is
+  reachable from `atom live …` and the GUI's Live tab (`atom/src/commands/live.rs`,
+  `atom/src/gui/live.rs`), both calling the same `*_core` functions.
 - **Hybrid PQ signatures** (Phase 6) — Ed25519 + ML-DSA-65 identity, which
   forces the `atom://` URI to carry an identity-bundle hash rather than an inline
   key.
-- **CLI/GUI integration** — nothing yet drives `Transfer` from a user-facing
-  command; `commands/direct.rs` still runs the Mode A blob flow.
+- **Real-world validation.** Everything below is exercised over loopback and
+  in-memory pipes. Nothing here has met a real NAT, a real Tor circuit, or a real
+  5 GB vault, and the rendezvous UX has not met a real pair of users.
 
 **Known limitations, stated plainly:**
 

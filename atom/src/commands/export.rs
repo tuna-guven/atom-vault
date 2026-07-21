@@ -57,7 +57,11 @@ pub fn decrypt_to_bytes(
                 .map_err(|e| format!("Decryption error: {:?}", e))?,
         );
         let _mlock_guard = MlockGuard::new(&decrypted)?;
-        let content = if chunk.plain_len > 0 { &decrypted[..chunk.plain_len] } else { &decrypted[..] };
+        let content = if chunk.plain_len > 0 {
+            &decrypted[..chunk.plain_len]
+        } else {
+            &decrypted[..]
+        };
         output.extend_from_slice(content);
     }
 
@@ -105,7 +109,7 @@ pub fn handle_export(
 
     let mut open_opts = std::fs::OpenOptions::new();
     open_opts.write(true);
-    
+
     // GÜVENLİ YAZMA MODU
     if force_overwrite {
         open_opts.create(true).truncate(true); // Dosya varsa içini tamamen ez ve sıfırdan yaz
@@ -120,7 +124,11 @@ pub fn handle_export(
     }
 
     let mut output_file = open_opts.open(&target_path).map_err(|e| {
-        format!("Failed to create secure output file at '{}': {:?}", target_path.display(), e)
+        format!(
+            "Failed to create secure output file at '{}': {:?}",
+            target_path.display(),
+            e
+        )
     })?;
 
     for chunk in &target_file.chunks {
@@ -135,7 +143,11 @@ pub fn handle_export(
         );
 
         let _mlock_guard = MlockGuard::new(&decrypted_bytes)?;
-        let content = if chunk.plain_len > 0 { &decrypted_bytes[..chunk.plain_len] } else { &decrypted_bytes[..] };
+        let content = if chunk.plain_len > 0 {
+            &decrypted_bytes[..chunk.plain_len]
+        } else {
+            &decrypted_bytes[..]
+        };
         output_file.write_all(content)?;
     }
 

@@ -1,15 +1,17 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
-use std::sync::Mutex;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::commands::p2p_utils::{load_friends, parse_atom_uri, save_friends, SharedVault, SyncMessage};
+use crate::commands::p2p_utils::{
+    SharedVault, SyncMessage, load_friends, parse_atom_uri, save_friends,
+};
 
 // CROSS-THREAD COMMUNICATION FOR GUI & CLI
 pub enum DaemonEvent {
@@ -44,10 +46,7 @@ pub fn send_daemon_log(msg: &str) {
     }
 }
 
-async fn ask_user_interactive(
-    sender_nick: String,
-    filename: String,
-) -> SyncResponse {
+async fn ask_user_interactive(sender_nick: String, filename: String) -> SyncResponse {
     let tx_opt = {
         let lock = EVENT_TX.lock().unwrap();
         lock.clone()
@@ -55,40 +54,49 @@ async fn ask_user_interactive(
 
     if let Some(tx) = tx_opt {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(DaemonEvent::SyncRequest {
-            sender_nick,
-            filename,
-            response_channel: resp_tx,
-        }).await;
+        let _ = tx
+            .send(DaemonEvent::SyncRequest {
+                sender_nick,
+                filename,
+                response_channel: resp_tx,
+            })
+            .await;
 
         match resp_rx.await {
             Ok(response) => response,
-            Err(_) => SyncResponse { accepted: false, label: None, save_path: None },
+            Err(_) => SyncResponse {
+                accepted: false,
+                label: None,
+                save_path: None,
+            },
         }
     } else {
         // FALLBACK: Blocking CLI Mode
         tokio::task::spawn_blocking(move || {
             use std::io::{self, Write};
-            
-            print!("{} wants to sync {} with you. Accept? [Y/n]: ", sender_nick, filename);
+
+            print!(
+                "{} wants to sync {} with you. Accept? [Y/n]: ",
+                sender_nick, filename
+            );
             io::stdout().flush().unwrap_or_default();
             let mut ans = String::new();
             io::stdin().read_line(&mut ans).unwrap_or_default();
-            
+
             if ans.trim().to_lowercase() == "y" || ans.trim().is_empty() {
                 print!("Label for this vault?: ");
                 io::stdout().flush().unwrap_or_default();
                 let mut label = String::new();
                 io::stdin().read_line(&mut label).unwrap_or_default();
-                
+
                 let mut default_path = dirs::home_dir().unwrap_or_default();
                 default_path.push(format!("Downloads/{}/{}", sender_nick, filename));
-                
+
                 print!("Folder path? [{}]: ", default_path.display());
                 io::stdout().flush().unwrap_or_default();
                 let mut path_ans = String::new();
                 io::stdin().read_line(&mut path_ans).unwrap_or_default();
-                
+
                 let final_path = if path_ans.trim().is_empty() {
                     default_path.to_string_lossy().to_string()
                 } else {
@@ -101,11 +109,19 @@ async fn ask_user_interactive(
                     save_path: Some(final_path),
                 }
             } else {
-                SyncResponse { accepted: false, label: None, save_path: None }
+                SyncResponse {
+                    accepted: false,
+                    label: None,
+                    save_path: None,
+                }
             }
         })
         .await
-        .unwrap_or(SyncResponse { accepted: false, label: None, save_path: None })
+        .unwrap_or(SyncResponse {
+            accepted: false,
+            label: None,
+            save_path: None,
+        })
     }
 }
 
@@ -158,8 +174,12 @@ pub fn handle_daemon() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&cache_dir)?;
 
     let mut builder = arti_client::TorClientConfig::builder();
-    builder.storage().state_dir(arti_client::config::CfgPath::new_literal(state_dir));
-    builder.storage().cache_dir(arti_client::config::CfgPath::new_literal(cache_dir));
+    builder
+        .storage()
+        .state_dir(arti_client::config::CfgPath::new_literal(state_dir));
+    builder
+        .storage()
+        .cache_dir(arti_client::config::CfgPath::new_literal(cache_dir));
     let config = builder.build()?;
 
     let rt = tokio::runtime::Runtime::new()?;

@@ -108,6 +108,71 @@ pub enum Commands {
         friend_nickname: String,
     },
 
+    /// Live transfer: strict forward secrecy, post-quantum, no broker
+    #[command(long_about = "Transfer a vault live, while both peers are online.\n\n\
+        Nothing is stored anywhere in between: there is no server, no relay, and no \
+        capability that could later be stolen or compelled. Key agreement is hybrid \
+        post-quantum (X25519 + ML-KEM-768) and every session uses fresh ephemeral keys, \
+        so recording the traffic today gains an attacker nothing tomorrow.\n\n\
+        Pair once with 'atom live pair', then both of you run 'send' and 'receive' at the \
+        same time. The pairing code is the root of trust for everything else: say it out \
+        loud, in person or on a call, and NEVER send it through the same channel as the \
+        pairing blobs.\n\n\
+        Your ISP and your peer's ISP can see that the two of you exchanged packets. If \
+        that must stay hidden, pair with an .onion address so the transfer runs over Tor.")]
+    Live {
+        #[command(subcommand)]
+        command: LiveCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LiveCommands {
+    /// Show your live identity and the address peers will reach you on
+    Id,
+
+    /// Set the address peers should use to reach you (ip:port or onion:port)
+    Address {
+        /// e.g. 203.0.113.7:4433, or <56-char>.onion:4433 to transfer over Tor
+        #[arg(value_name = "ADDRESS", required = true)]
+        address: String,
+    },
+
+    /// Pair with a peer by exchanging tickets, authenticated by a short secret
+    Pair {
+        /// What to call this peer locally
+        #[arg(long, required = true)]
+        nickname: String,
+
+        /// The pairing code your peer read out. Omit to generate one to read to them.
+        #[arg(long)]
+        code: Option<String>,
+    },
+
+    /// List the peers you have paired with
+    Peers,
+
+    /// Send a vault to a paired peer (they must run 'receive' at the same time)
+    Send {
+        /// Path to the .aegis vault file to send
+        #[arg(long, value_parser = parse_vault_path)]
+        vault_path: String,
+
+        /// Nickname of the paired peer
+        #[arg(long, required = true)]
+        peer: String,
+    },
+
+    /// Receive a vault from a paired peer (they must run 'send' at the same time)
+    Receive {
+        /// Where to write the received vault
+        #[arg(long, value_parser = parse_vault_path)]
+        save_path: String,
+
+        /// Nickname of the paired peer
+        #[arg(long, required = true)]
+        peer: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -138,7 +203,9 @@ fn parse_vault_name(s: &str) -> Result<String, String> {
     if !s.is_ascii() {
         return Err("Vault name must contain only ASCII".to_string());
     }
-    if s.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '-') {
+    if s.chars()
+        .any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    {
         return Err("Vault name can only contain alphanumeric characters, _, or -".to_string());
     }
     Ok(s.to_string())

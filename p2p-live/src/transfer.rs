@@ -255,6 +255,15 @@ impl Transfer {
         self.cancel.clone()
     }
 
+    /// Adopt a caller-owned cancellation token.
+    ///
+    /// For a UI that creates the token before the transfer exists — a Stop
+    /// button has to be wired up before the work starts, not after.
+    pub fn with_cancel(mut self, cancel: Cancel) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
     /// Total padded size of one frame on the wire.
     fn frame_len(&self) -> usize {
         self.chunk_len + HEADER_LEN

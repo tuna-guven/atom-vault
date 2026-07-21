@@ -118,11 +118,10 @@ fn get_friends_path() -> PathBuf {
 pub fn load_friends() -> Vec<FriendRecord> {
     let path = get_friends_path();
     if let Ok(raw) = fs::read(&path) {
-        let decrypted = crate::config_crypto::decrypt_config(&raw)
-            .unwrap_or_else(|e| {
-                eprintln!("[FATAL] Cannot decrypt friends.json: {e}");
-                std::process::exit(1);
-            });
+        let decrypted = crate::config_crypto::decrypt_config(&raw).unwrap_or_else(|e| {
+            eprintln!("[FATAL] Cannot decrypt friends.json: {e}");
+            std::process::exit(1);
+        });
         if let Ok(contents) = String::from_utf8(decrypted) {
             if let Ok(friends) = serde_json::from_str(&contents) {
                 return friends;

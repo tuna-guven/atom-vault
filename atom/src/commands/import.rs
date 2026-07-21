@@ -53,8 +53,7 @@ pub fn handle_import_from_bytes(
     }
 
     let chunk_boundaries: Vec<fastcdc::v2020::ChunkData> =
-        crate::chunker::chunk_data(std::io::Cursor::new(&data))
-            .collect::<Result<Vec<_>, _>>()?;
+        crate::chunker::chunk_data(std::io::Cursor::new(&data)).collect::<Result<Vec<_>, _>>()?;
 
     let mut new_chunks = Vec::new();
     physical_vault.seek(SeekFrom::Start(*current_payload_offset))?;

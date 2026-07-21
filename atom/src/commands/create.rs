@@ -45,7 +45,7 @@ pub fn handle_create(
         settings.choice = KdfChoice::Argon2id;
         settings.memory_kib = memory_arg.unwrap_or(65536);
         settings.parallelism = parallelism_arg.unwrap_or(total_threads.max(1));
-    } 
+    }
 
     std::io::stdout().flush()?;
 
@@ -65,7 +65,7 @@ pub fn handle_create(
     } else {
         // Doğrudan sistem seviyesi TTY okuyucunu çağırıyoruz
         let pass = crate::secure_input::read_password_pinentry()?;
-        
+
         if pass.trim().is_empty() {
             return Err("Password cannot be empty or contain only spaces.".into());
         }

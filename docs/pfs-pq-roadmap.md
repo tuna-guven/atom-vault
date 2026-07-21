@@ -1,9 +1,10 @@
 # Roadmap — Strict Forward Secrecy & Post-Quantum Security
 
-> **Status: all seven phases resolved.** Phases 0–6 are implemented in the
-> `p2p-live` crate; Phase 7 is decided and executed — **Mode A has been deleted**
-> (§6 option A). What remains outstanding is Phase 3's *UX* and the fact that
-> none of this is wired into the CLI or GUI yet.
+> **Status: all seven phases resolved and shipped to both UIs.** Phases 0–6 are
+> implemented in the `p2p-live` crate; Phase 7 is decided and executed — **Mode A
+> has been deleted** (§6 option A). The whole path is now reachable as
+> `atom live …` and from the GUI's **Live** transport tab, both driving the same
+> `commands::live::*` functions.
 >
 > This roadmap **replaces** the Mode A (blind store) design; the `p2p-direct`
 > crate no longer exists. Companion docs: `p2p-live/p2p_live_architecture.md`
@@ -165,7 +166,7 @@ decoy ladder addressed. `encode.rs` remains relevant, but its job changes from
 | `pake.rs` (L4) | Repurpose | **Deleted, reimplemented.** `p2p-live/src/pairing.rs` uses SPAKE2 for ticket authentication instead of cap delivery — a smaller, safer role. |
 | `store.rs` (L1/A) | Demote | **Deleted.** §6 answered A, so no async fallback is kept. |
 | `p2p-sync` handshake | Supersede | **Still present.** Superseded in principle by `p2p-live`, but not yet removed — nothing has migrated onto the new AKE. |
-| `commands/direct.rs`, GUI panel | Rework | **Deleted.** The live rendezvous that replaces them is not yet wired into the CLI or GUI. |
+| `commands/direct.rs`, GUI panel | Rework | **Deleted and replaced.** `commands/live.rs` + `gui/live.rs` drive the live rendezvous from both surfaces. |
 
 **Note the direction of travel: this deletes more than it adds.** No cap, no
 store, no manifest, no decoy objects. That is a security win in itself.
@@ -289,7 +290,7 @@ connection migration survives many IP/port changes without dropping. The resume
 protocol above is only for **full** drops: process death, sleep past the idle
 timeout, peer restart, long outage.
 
-### Phase 3 — L0 pairing & rendezvous ✅ **protocol done**, UX outstanding
+### Phase 3 — L0 pairing & rendezvous ✅ **done** (protocol and UX)
 - Ticket format: identity key(s), transport hints, capability/suite IDs.
   → `ticket.rs`, plus an expiry (a stale ticket names an address that may have
   been reassigned) and a checksummed text form.
@@ -300,10 +301,14 @@ timeout, peer restart, long outage.
 - NAT traversal: manual address entry by default, STUN opt-in with an explicit
   warning (per spec §6). → `rendezvous.rs` and `stun.rs`; STUN is never called
   automatically.
-- **Rendezvous UX: still outstanding.** The protocol works; getting two people
-  online at once, guiding a two-round paste, and making fingerprint comparison
-  something users actually do is the hard part and is not designed yet. It
-  remains, as noted, the thing most likely to sink adoption.
+- **Rendezvous UX: built** in `atom/src/commands/live.rs` (CLI) and
+  `atom/src/gui/live.rs` (panel). Both drive the same `*_core` functions, so the
+  out-of-band steps have one implementation rather than two. The UX carries three
+  warnings on screen rather than in a manual: the code must travel a *different*
+  channel from the blobs, the fingerprints must be compared aloud, and both peers
+  must be online simultaneously. Whether it is *good* UX needs real users — the
+  claim here is only that the dangerous steps are surfaced, not that they are
+  easy.
 
 Suite IDs are the hook for §6 below: a non-forward-secret async mode would have
 to take a **new** suite value, so a peer can never silently reinterpret a live

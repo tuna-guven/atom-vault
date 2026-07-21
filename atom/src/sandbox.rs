@@ -32,10 +32,8 @@ pub fn apply_process_sandbox(
     read_write_paths: &[&Path],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use landlock::{
-        Access, AccessFs, ABI,
-        CompatLevel, Compatible,
-        PathBeneath, PathFd,
-        Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+        ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus,
     };
 
     // `IoctlDev` (V5) is the last filesystem access right Landlock defines, so
@@ -152,8 +150,8 @@ pub fn apply_process_sandbox(
 /// Every other filesystem path — including the rest of `/home` — is denied
 /// at the kernel level for the lifetime of the process.
 pub fn apply_gui_vault_sandbox(vault_path: &Path) {
-    let xdg_runtime: String = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| "/run/user/1000".into());
+    let xdg_runtime: String =
+        std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
     let staging: String = format!("{}/atom_staging", xdg_runtime);
 
     // ~/.atom_vault/ holds friends.json, onion.txt, vault registry, and
@@ -309,7 +307,10 @@ pub fn try_bwrap_self_sandbox() {
 
     // exec() returned — bwrap binary found but execvp failed (should be rare
     // since we already probed successfully, but guard anyway).
-    eprintln!("[Sandbox] bwrap outer cage: exec failed: {} — Landlock only", err);
+    eprintln!(
+        "[Sandbox] bwrap outer cage: exec failed: {} — Landlock only",
+        err
+    );
 }
 
 /// Returns `true` if bwrap can create a mount+IPC namespace on this system.
@@ -318,9 +319,12 @@ pub fn try_bwrap_self_sandbox() {
 fn bwrap_namespace_available() -> bool {
     std::process::Command::new("bwrap")
         .args([
-            "--ro-bind-try", "/usr", "/usr",
+            "--ro-bind-try",
+            "/usr",
+            "/usr",
             "--unshare-ipc",
-            "--", "true",
+            "--",
+            "true",
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -349,7 +353,11 @@ pub(crate) fn build_self_bwrap_args(
     // /lib and /lib64 only when they are real directories (not symlinks into /usr).
     for path in ["/lib", "/lib64"] {
         let p = Path::new(path);
-        if p.exists() && p.symlink_metadata().map(|m| !m.file_type().is_symlink()).unwrap_or(false) {
+        if p.exists()
+            && p.symlink_metadata()
+                .map(|m| !m.file_type().is_symlink())
+                .unwrap_or(false)
+        {
             args.extend(["--ro-bind", path, path].map(String::from));
         }
     }
@@ -395,8 +403,13 @@ pub(crate) fn build_self_bwrap_args(
     // Namespace isolation (no --unshare-user: SELinux blocks it;
     //                      no --unshare-net: P2P daemon needs network).
     args.extend(
-        ["--unshare-ipc", "--unshare-uts", "--new-session", "--die-with-parent"]
-            .map(String::from),
+        [
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--new-session",
+            "--die-with-parent",
+        ]
+        .map(String::from),
     );
 
     // Pass through essential environment variables.
@@ -409,9 +422,7 @@ pub(crate) fn build_self_bwrap_args(
         args.extend(["--setenv", key, val].map(String::from));
     }
     if let Some(dbus_socket) = extract_dbus_socket_path(dbus_addr) {
-        args.extend(
-            ["--setenv", "DBUS_SESSION_BUS_ADDRESS", dbus_addr].map(String::from),
-        );
+        args.extend(["--setenv", "DBUS_SESSION_BUS_ADDRESS", dbus_addr].map(String::from));
         // Bind the socket itself in case /run was mounted RO above and
         // the socket path falls outside XDG_RUNTIME_DIR on some distros.
         if Path::new(&dbus_socket).exists() {
@@ -451,7 +462,13 @@ pub fn spawn_in_bwrap_sandbox(
     // Rewind so bwrap reads the full document from the start.
     unsafe { libc::lseek(inherited_fd, 0, libc::SEEK_SET) };
 
-    let args = build_bwrap_args(inherited_fd, &xdg_runtime, &wayland_display, &home, &dbus_addr);
+    let args = build_bwrap_args(
+        inherited_fd,
+        &xdg_runtime,
+        &wayland_display,
+        &home,
+        &dbus_addr,
+    );
 
     let cstrings: Vec<CString> = args
         .iter()
@@ -507,7 +524,15 @@ pub(crate) fn build_bwrap_args(
     // EPERM because non-root cannot create those namespaces in the current
     // user namespace.  Flatpak can still nest its own inner user namespace
     // inside ours (user.max_user_namespaces allows multiple levels).
-    args.extend(["--unshare-user", "--unshare-ipc", "--unshare-net", "--unshare-uts"].map(String::from));
+    args.extend(
+        [
+            "--unshare-user",
+            "--unshare-ipc",
+            "--unshare-net",
+            "--unshare-uts",
+        ]
+        .map(String::from),
+    );
     // Kill bwrap if the atom parent dies; no controlling terminal.
     args.extend(["--die-with-parent", "--new-session"].map(String::from));
 
@@ -643,12 +668,19 @@ mod tests {
     fn self_bwrap_usr_is_ro() {
         let args = self_bwrap_sample();
         // --ro-bind-try /usr /usr must appear
-        let pos = args.iter().position(|a| a == "--ro-bind-try").expect("--ro-bind-try missing");
+        let pos = args
+            .iter()
+            .position(|a| a == "--ro-bind-try")
+            .expect("--ro-bind-try missing");
         // scan all --ro-bind-try triples for /usr
-        let triples: Vec<_> = args.windows(3)
+        let triples: Vec<_> = args
+            .windows(3)
             .filter(|w| w[0] == "--ro-bind-try" || w[0] == "--ro-bind")
             .collect();
-        assert!(triples.iter().any(|w| w[1] == "/usr"), "/usr must be bound RO");
+        assert!(
+            triples.iter().any(|w| w[1] == "/usr"),
+            "/usr must be bound RO"
+        );
         let _ = pos;
     }
 
@@ -679,14 +711,19 @@ mod tests {
     #[test]
     fn self_bwrap_tmp_is_private() {
         let args = self_bwrap_sample();
-        let pos = args.iter().position(|a| a == "--tmpfs").expect("--tmpfs missing");
+        let pos = args
+            .iter()
+            .position(|a| a == "--tmpfs")
+            .expect("--tmpfs missing");
         assert_eq!(args[pos + 1], "/tmp");
     }
 
     #[test]
     fn self_bwrap_marker_env_set() {
         let args = self_bwrap_sample();
-        let pos = args.iter().position(|a| a == "ATOM_BWRAP_SANDBOX")
+        let pos = args
+            .iter()
+            .position(|a| a == "ATOM_BWRAP_SANDBOX")
             .expect("ATOM_BWRAP_SANDBOX missing");
         assert_eq!(args[pos - 1], "--setenv");
         assert_eq!(args[pos + 1], "1");
@@ -696,7 +733,8 @@ mod tests {
     fn self_bwrap_home_is_rw() {
         let args = self_bwrap_sample();
         // Home must appear as --bind-try (RW), not --ro-bind.
-        let home_in_rw = args.windows(3)
+        let home_in_rw = args
+            .windows(3)
             .any(|w| w[0] == "--bind-try" && w[1] == "/home/user");
         assert!(home_in_rw, "home directory must be bound RW");
     }
@@ -704,7 +742,10 @@ mod tests {
     #[test]
     fn self_bwrap_exe_is_last_positional() {
         let args = self_bwrap_sample();
-        let sep = args.iter().rposition(|a| a == "--").expect("-- separator missing");
+        let sep = args
+            .iter()
+            .rposition(|a| a == "--")
+            .expect("-- separator missing");
         assert_eq!(args[sep + 1], "/usr/bin/atom");
     }
 
@@ -720,7 +761,10 @@ mod tests {
         );
         let sep = args.iter().rposition(|a| a == "--").unwrap();
         let positional: Vec<&str> = args[sep + 1..].iter().map(|s| s.as_str()).collect();
-        assert_eq!(positional, vec!["/usr/bin/atom", "--vault-path", "my.aegis"]);
+        assert_eq!(
+            positional,
+            vec!["/usr/bin/atom", "--vault-path", "my.aegis"]
+        );
     }
 
     // ── apply_process_sandbox ────────────────────────────────────────────────
@@ -744,7 +788,6 @@ mod tests {
             assert!(!p.exists(), "sentinel path must not exist on this machine");
         }
     }
-
 
     // ── extract_dbus_socket_path ─────────────────────────────────────────────
 
@@ -801,7 +844,10 @@ mod tests {
 
     #[test]
     fn test_dbus_parse_non_unix_transport_returns_none() {
-        assert_eq!(extract_dbus_socket_path("tcp:host=localhost,port=12345"), None);
+        assert_eq!(
+            extract_dbus_socket_path("tcp:host=localhost,port=12345"),
+            None
+        );
     }
 
     // ── build_bwrap_args ─────────────────────────────────────────────────────
@@ -861,7 +907,10 @@ mod tests {
     #[test]
     fn test_args_tmpfs_on_tmp() {
         let args = sample_args();
-        let pos = args.iter().position(|a| a == "--tmpfs").expect("--tmpfs missing");
+        let pos = args
+            .iter()
+            .position(|a| a == "--tmpfs")
+            .expect("--tmpfs missing");
         assert_eq!(args[pos + 1], "/tmp");
     }
 
@@ -869,7 +918,10 @@ mod tests {
     fn test_args_file_fd_correct() {
         let fd: RawFd = 42;
         let args = build_bwrap_args(fd, "/run/user/1000", "wayland-0", "/home/user", "");
-        let pos = args.iter().position(|a| a == "--file").expect("--file missing");
+        let pos = args
+            .iter()
+            .position(|a| a == "--file")
+            .expect("--file missing");
         assert_eq!(args[pos + 1], fd.to_string());
         assert_eq!(args[pos + 2], "/tmp/document.pdf");
     }
@@ -924,10 +976,7 @@ mod tests {
     #[test]
     fn test_args_home_set() {
         let args = sample_args();
-        let pos = args
-            .iter()
-            .position(|a| a == "HOME")
-            .expect("HOME missing");
+        let pos = args.iter().position(|a| a == "HOME").expect("HOME missing");
         assert_eq!(args[pos - 1], "--setenv");
         assert_eq!(args[pos + 1], "/home/user");
     }

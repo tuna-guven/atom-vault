@@ -11,7 +11,6 @@ pub fn sync_core(
     friend_nickname: &str,
     status_tx: Option<Sender<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
     // Helper closure to route logs to either the GUI channel or CLI stdout
     let log = |msg: &str| {
         if let Some(tx) = &status_tx {
@@ -27,11 +26,13 @@ pub fn sync_core(
         .find(|f| f.nickname == friend_nickname)
         .ok_or_else(|| format!("Friend '{}' not found in address book.", friend_nickname))?;
 
-    log(&format!("Initiating P2P block sync for '{}' with '{}'...", vault_path, friend.nickname));
+    log(&format!(
+        "Initiating P2P block sync for '{}' with '{}'...",
+        vault_path, friend.nickname
+    ));
 
     let (onion_address, friend_pubkey) = parse_atom_uri(&friend.url)?;
 
-    
     let local_identity = get_or_create_identity()?;
 
     let mut client_state_dir = dirs::home_dir().ok_or("Could not find home directory")?;
@@ -54,7 +55,7 @@ pub fn sync_core(
             .modified()?
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-            
+
         let filename = physical_vault_path
             .file_name()
             .unwrap()
@@ -91,7 +92,10 @@ pub fn sync_core(
         stream_io.write_all(proposal_json.as_bytes()).await?;
         stream_io.flush().await?;
 
-        log(&format!("Waiting for {} to accept the vault transfer...", friend_nickname));
+        log(&format!(
+            "Waiting for {} to accept the vault transfer...",
+            friend_nickname
+        ));
 
         // 2. Await remote decision
         let mut reply_line = String::new();
@@ -100,7 +104,10 @@ pub fn sync_core(
         if let Ok(reply) = serde_json::from_str::<SyncMessage>(&reply_line) {
             match reply {
                 SyncMessage::Accept { action: _ } => {
-                    log(&format!("{} accepted the sync. Pumping ciphertext blocks...", friend_nickname));
+                    log(&format!(
+                        "{} accepted the sync. Pumping ciphertext blocks...",
+                        friend_nickname
+                    ));
 
                     let mut file = tokio::fs::File::open(&physical_vault_path).await?;
                     let bytes_sent = tokio::io::copy(&mut file, &mut stream_io).await?;
@@ -109,13 +116,19 @@ pub fn sync_core(
                     let mut inner_stream = stream_io.into_inner();
                     inner_stream.shutdown().await?;
 
-                    log(&format!("Blind file transfer complete. Pushed {} bytes.", bytes_sent));
+                    log(&format!(
+                        "Blind file transfer complete. Pushed {} bytes.",
+                        bytes_sent
+                    ));
                 }
                 SyncMessage::Reject => {
                     log(&format!("{} rejected the sync request.", friend_nickname));
                 }
                 _ => {
-                    log(&format!("Received an invalid protocol response from {}.", friend_nickname));
+                    log(&format!(
+                        "Received an invalid protocol response from {}.",
+                        friend_nickname
+                    ));
                 }
             }
         } else {
@@ -132,7 +145,6 @@ pub fn sync_core(
 
     Ok(())
 }
-
 
 pub fn handle_sync(
     vault_path: &str,

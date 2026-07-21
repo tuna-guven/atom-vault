@@ -129,6 +129,35 @@ impl std::fmt::Display for PairingCode {
     }
 }
 
+/// Prefix on a round-1 pairing message, so a user who pastes the wrong blob into
+/// the wrong box is told so rather than seeing a decode failure.
+pub const MESSAGE_PREFIX: &str = "atom-live-pair-1:";
+
+/// Render a round-1 SPAKE2 message for a human to copy.
+///
+/// Safe to send over the observed channel — that is what a PAKE is for. What
+/// must **not** travel with it is the pairing code.
+pub fn encode_message(msg: &[u8]) -> String {
+    format!(
+        "{MESSAGE_PREFIX}{}",
+        BASE32_NOPAD.encode(msg).to_lowercase()
+    )
+}
+
+/// Parse a round-1 message, tolerating case and surrounding whitespace.
+pub fn decode_message(text: &str) -> Result<Vec<u8>, Error> {
+    let lowered = text.trim().to_lowercase();
+    let body = lowered.strip_prefix(MESSAGE_PREFIX).ok_or_else(|| {
+        Error::Pairing(format!(
+            "a pairing message must start with `{MESSAGE_PREFIX}` — is this the \
+             sealed ticket from round 2 rather than the round-1 message?"
+        ))
+    })?;
+    BASE32_NOPAD
+        .decode(body.to_uppercase().as_bytes())
+        .map_err(|e| Error::Pairing(format!("pairing message is not valid base32: {e}")))
+}
+
 /// An in-progress pairing. Consumed by [`PairingState::finish`].
 pub struct PairingState {
     inner: Spake2<Ed25519Group>,
@@ -376,6 +405,25 @@ mod tests {
         // The grouped display must parse back to the same secret, or a peer who
         // types what they see would fail to pair.
         assert_eq!(PairingCode::parse(&a.display()).unwrap(), a);
+    }
+
+    /// Round-1 messages survive the clipboard, and a round-2 blob pasted into
+    /// the round-1 box is diagnosed rather than failing obscurely.
+    #[test]
+    fn pairing_messages_round_trip_and_are_distinguishable() {
+        let code = PairingCode::generate().unwrap();
+        let (_state, msg) = start(&code);
+
+        let text = encode_message(&msg);
+        assert!(text.starts_with(MESSAGE_PREFIX));
+        assert_eq!(decode_message(&text).unwrap(), msg);
+        assert_eq!(
+            decode_message(&format!("  {}  ", text.to_uppercase())).unwrap(),
+            msg
+        );
+
+        let err = decode_message("gibberish").unwrap_err().to_string();
+        assert!(err.contains(MESSAGE_PREFIX), "got: {err}");
     }
 
     #[test]
