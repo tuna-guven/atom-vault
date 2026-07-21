@@ -596,10 +596,22 @@ impl AtomVaultApp {
                 }
             };
 
+            // Which rung of the reach ladder found the peer. Pushed into the
+            // status line rather than dropped: the rungs differ in who learns
+            // about the connection, so it is the user's to see.
+            let s = Arc::clone(&status);
+            let mut on_path = move |found: p2p_live::reach::Path| {
+                if let Ok(mut g) = s.lock() {
+                    *g = format!("Connected via {found} — transferring…");
+                }
+            };
+
             let result = match role {
-                LiveRole::Send => live::send_core(&path, &peer, &mut on_progress, Some(cancel)),
+                LiveRole::Send => {
+                    live::send_core(&path, &peer, &mut on_progress, Some(cancel), &mut on_path)
+                }
                 LiveRole::Receive => {
-                    live::receive_core(&path, &peer, &mut on_progress, Some(cancel))
+                    live::receive_core(&path, &peer, &mut on_progress, Some(cancel), &mut on_path)
                 }
             };
 

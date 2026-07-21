@@ -12,9 +12,15 @@
 //!   Anyone holding it can impersonate you to peers who have paired with you.
 //!   It cannot decrypt past transfers: these are authentication keys and never
 //!   take part in key agreement, which is what keeps forward secrecy strict.
-//! * `live_peers.json` — your advertised address and one ticket per paired
-//!   peer. A ticket carries no secret, but it does link an identity to an
-//!   address, which is exactly the metadata worth protecting.
+//! * `live_peers.json` — your advertised address, your rendezvous endpoint
+//!   configuration, and one entry per paired peer. A ticket carries no secret,
+//!   but it does link an identity to an address, which is exactly the metadata
+//!   worth protecting. **Since Phase 8 this file also holds one real secret per
+//!   peer** — the pairwise rendezvous secret. It decrypts nothing and
+//!   authenticates nobody (see `p2p_live::discovery::secret`), but someone
+//!   holding it can read where a peer says it is and forge a record pointing
+//!   elsewhere, so the file's encryption is now load-bearing rather than
+//!   merely prudent.
 //!
 //! # Why the functions here are UI-agnostic
 //!
@@ -28,15 +34,18 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use data_encoding::BASE32_NOPAD;
 use p2p_live::bundle::LocalBundle;
+use p2p_live::discovery::{self, BlindEndpoint, Discovery, RendezvousSecret, ServerLink};
 use p2p_live::pacing::Pacing;
 use p2p_live::pairing::{self, PairedChannel, PairingCode, PairingState};
-use p2p_live::rendezvous;
+use p2p_live::reach::{self, PeerState};
 use p2p_live::ticket::{Endpoint, Ticket};
 use p2p_live::transfer::{Cancel, EncryptedAtRest, Progress, Summary, Transfer};
 
@@ -75,11 +84,102 @@ fn write_private(path: &Path, data: &[u8]) -> Res<()> {
 }
 
 /// A peer we have paired with.
+///
+/// Every Phase 8 field is `#[serde(default)]`, so a `live_peers.json` written
+/// before this existed still loads — such a peer simply has no rendezvous
+/// secret and stays on the manual-address path until re-paired.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LivePeer {
     pub nickname: String,
     /// The peer's ticket in its canonical text form.
     pub ticket: String,
+
+    /// The pairwise rendezvous secret from pairing, base32.
+    ///
+    /// `None` for a peer paired before Phase 8. Its absence is what makes
+    /// [`peer_state`] refuse to look them up rather than silently failing to.
+    #[serde(default)]
+    pub rendezvous_secret: Option<String>,
+
+    /// Where this peer was last actually reached.
+    ///
+    /// Tried before any endpoint is contacted, so a peer who has not moved is
+    /// reconnected with no third party involved at all.
+    #[serde(default)]
+    pub last_known: Vec<String>,
+
+    /// Highest address-record sequence accepted from this peer.
+    ///
+    /// The replay floor: an endpoint that re-serves a record we have already
+    /// used cannot pass it off as current.
+    #[serde(default)]
+    pub newest_seen: Option<u64>,
+}
+
+impl LivePeer {
+    /// A newly paired peer, with the discovery secret and nothing learned yet.
+    fn new(nickname: &str, ticket: &Ticket, secret: &RendezvousSecret) -> Self {
+        LivePeer {
+            nickname: nickname.to_string(),
+            ticket: ticket.to_text(),
+            rendezvous_secret: Some(encode_secret(secret)),
+            last_known: Vec::new(),
+            newest_seen: None,
+        }
+    }
+
+    /// Whether this peer can be found by ID alone.
+    pub fn is_reachable_by_id(&self) -> bool {
+        self.rendezvous_secret.is_some()
+    }
+}
+
+/// One dumb, self-hostable rendezvous endpoint.
+///
+/// Stored as **the link exactly as it was pasted**, plus two local choices: what
+/// to call it, and whether to reach it through a proxy. Nothing about the
+/// endpoint is stored in parts, because parts are what let a pin drift away from
+/// the address it belongs to — and a pin that has drifted is one that silently
+/// stops protecting anything.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RendezvousEndpoint {
+    /// Local nickname. Ours, not the operator's: a name carried inside a link
+    /// would be attacker-chosen text rendered in our own UI.
+    pub name: String,
+    /// The `atom-rdv-1:…` link.
+    pub link: String,
+    /// SOCKS5 proxy to route through, e.g. `127.0.0.1:9050` for Tor.
+    ///
+    /// Set this and the endpoint never learns this machine's address, which is
+    /// the one control that closes the "wrote tag T, read tag T" correlation
+    /// entirely. Required for an onion-only link.
+    #[serde(default)]
+    pub via_socks: Option<String>,
+}
+
+impl RendezvousEndpoint {
+    fn parsed(&self) -> Res<ServerLink> {
+        Ok(ServerLink::from_text(&self.link)?)
+    }
+
+    fn proxy(&self) -> Res<Option<SocketAddr>> {
+        match &self.via_socks {
+            None => Ok(None),
+            Some(s) => {
+                Ok(Some(s.parse().map_err(|_| {
+                    format!("'{s}' is not a host:port for a SOCKS proxy")
+                })?))
+            }
+        }
+    }
+
+    /// Build the client from the stored link.
+    fn build(&self) -> Res<Arc<BlindEndpoint>> {
+        Ok(Arc::new(BlindEndpoint::from_link(
+            &self.parsed()?,
+            self.proxy()?,
+        )?))
+    }
 }
 
 /// Everything `atom live` remembers besides the private identity.
@@ -90,12 +190,32 @@ pub struct LiveState {
     pub my_endpoints: Vec<String>,
     #[serde(default)]
     pub peers: Vec<LivePeer>,
+    /// Where address records are published and looked up.
+    #[serde(default)]
+    pub rendezvous: Vec<RendezvousEndpoint>,
 }
 
 impl LiveState {
     pub fn peer(&self, nickname: &str) -> Option<&LivePeer> {
         self.peers.iter().find(|p| p.nickname == nickname)
     }
+}
+
+/// Base32 for a rendezvous secret, matching how every other identifier in this
+/// project is written down.
+fn encode_secret(secret: &RendezvousSecret) -> String {
+    BASE32_NOPAD.encode(secret.expose()).to_lowercase()
+}
+
+fn decode_secret(text: &str) -> Res<RendezvousSecret> {
+    let raw = BASE32_NOPAD
+        .decode(text.trim().to_uppercase().as_bytes())
+        .map_err(|e| format!("stored rendezvous secret is not valid base32: {e}"))?;
+    let bytes: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| "stored rendezvous secret is not 32 bytes")?;
+    Ok(RendezvousSecret::from_bytes(bytes))
 }
 
 pub fn load_state() -> Res<LiveState> {
@@ -188,6 +308,34 @@ pub fn set_endpoints(addresses: &[String]) -> Res<()> {
     Ok(())
 }
 
+/// Ask a STUN server what our external `ip:port` is, and store it.
+///
+/// **This tells the STUN server our IP address.** `CLAUDE.md` §6 keeps STUN off
+/// by default for exactly that reason, and nothing calls this on the user's
+/// behalf — but the ID-only path needs an address to publish, and behind NAT
+/// there is no other way to learn one. The caller must have shown the warning
+/// before getting here.
+///
+/// `port` is the local UDP port we will transfer from. The mapping a NAT hands
+/// out belongs to a port, so querying from any other one yields an address the
+/// peer cannot reach.
+pub fn discover_address(server: &str, port: u16) -> Res<String> {
+    let server: SocketAddr = server
+        .parse()
+        .map_err(|_| format!("'{server}' is not a host:port — STUN needs e.g. 203.0.113.1:3478"))?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let found = rt.block_on(async {
+        // Bound to the port the transfer will use, then dropped before the QUIC
+        // endpoint binds the same port.
+        let socket = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+        p2p_live::stun::discover(&socket, server, Duration::from_secs(5)).await
+    })?;
+
+    set_endpoints(&[found.to_string()])?;
+    Ok(found.to_string())
+}
+
 /// Build the ticket we hand a peer during pairing.
 pub fn my_ticket() -> Res<Ticket> {
     let bundle = load_or_create_identity()?;
@@ -233,6 +381,10 @@ pub fn pair_complete(channel: &PairedChannel, sealed: &str, nickname: &str) -> R
         return Err("That ticket is your own identity — you cannot pair with yourself.".into());
     }
 
+    // The one thing that outlives the pairing: the pairwise discovery secret,
+    // which is what lets this peer be found by ID after their address changes.
+    let secret = channel.rendezvous_secret();
+
     let mut state = load_state()?;
     if let Some(existing) = state.peers.iter_mut().find(|p| p.nickname == nickname) {
         let old = Ticket::from_text(&existing.ticket)?;
@@ -246,24 +398,143 @@ pub fn pair_complete(channel: &PairedChannel, sealed: &str, nickname: &str) -> R
             .into());
         }
         existing.ticket = ticket.to_text();
+        // Re-pairing is a fresh exchange, so it yields a fresh secret on both
+        // sides. Keeping the old one would leave the two peers addressing
+        // different slots and unable to find each other at all.
+        existing.rendezvous_secret = Some(encode_secret(&secret));
     } else {
-        state.peers.push(LivePeer {
-            nickname: nickname.to_string(),
-            ticket: ticket.to_text(),
-        });
+        state.peers.push(LivePeer::new(nickname, &ticket, &secret));
     }
     save_state(&state)?;
     Ok(ticket)
 }
 
+// ── Discovery ────────────────────────────────────────────────────────────────
+
+/// Build the resolver from the configured endpoints.
+///
+/// An endpoint that will not build is reported rather than skipped: silently
+/// dropping a misconfigured endpoint would leave a user believing they are
+/// reachable when they are not.
+pub fn discovery_from(state: &LiveState) -> Res<Discovery> {
+    let mut substrates: Vec<Arc<dyn p2p_live::Substrate>> = Vec::new();
+    for cfg in &state.rendezvous {
+        substrates.push(cfg.build()?);
+    }
+    Ok(Discovery::new(substrates))
+}
+
+/// Assemble the in-memory peer state the reach layer works with.
+fn peer_state(peer: &LivePeer) -> Res<PeerState> {
+    let ticket = Ticket::from_text(&peer.ticket)?;
+    let secret_text = peer.rendezvous_secret.as_ref().ok_or_else(|| {
+        format!(
+            "'{}' was paired before rendezvous existed, so they cannot be found by ID. \
+             Re-pair with 'atom live pair --nickname {}' to enable it.",
+            peer.nickname, peer.nickname
+        )
+    })?;
+
+    // Prefer what we last actually reached them on; fall back to the ticket's
+    // hints, which is all a freshly paired peer has.
+    let mut last_known = Vec::new();
+    for e in &peer.last_known {
+        last_known.push(parse_endpoint(e)?);
+    }
+    if last_known.is_empty() {
+        last_known = ticket.hints.clone();
+    }
+
+    Ok(PeerState {
+        identity: ticket.identity,
+        rendezvous: decode_secret(secret_text)?,
+        last_known,
+        newest_seen: peer.newest_seen,
+    })
+}
+
+/// Write back what a connection attempt learned.
+fn remember(nickname: &str, learned: &PeerState) -> Res<()> {
+    let mut state = load_state()?;
+    if let Some(p) = state.peers.iter_mut().find(|p| p.nickname == nickname) {
+        p.last_known = learned.last_known.iter().map(|e| e.to_string()).collect();
+        p.newest_seen = learned.newest_seen;
+        save_state(&state)?;
+    }
+    Ok(())
+}
+
+/// What an announce achieved, for the UI to report.
+pub struct AnnounceOutcome {
+    pub peer: String,
+    pub reached: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+/// Publish our current address to every peer's slot.
+///
+/// One record per peer rather than one for everybody: the whole construction
+/// rests on each pair having its own unlinkable slot, so a shared record would
+/// hand an endpoint exactly the group membership the design denies it.
+pub fn announce_core(only: Option<&str>) -> Res<Vec<AnnounceOutcome>> {
+    let state = load_state()?;
+    let me = load_or_create_identity()?;
+    let discovery = discovery_from(&state)?;
+
+    if discovery.is_empty() {
+        return Err(
+            "No rendezvous endpoint configured. Run 'atom live rendezvous add …' \
+                    first, or keep exchanging addresses by hand."
+                .into(),
+        );
+    }
+
+    let mut hints = Vec::new();
+    for e in &state.my_endpoints {
+        hints.push(parse_endpoint(e)?);
+    }
+    if hints.is_empty() {
+        return Err("No address set, so there is nothing to publish. Run \
+                    'atom live address <ip:port>' (or --stun) first."
+            .into());
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut outcomes = Vec::new();
+
+    for peer in &state.peers {
+        if only.is_some_and(|n| n != peer.nickname) {
+            continue;
+        }
+        if !peer.is_reachable_by_id() {
+            continue;
+        }
+        let ps = peer_state(peer)?;
+        let report = rt.block_on(reach::announce(&me, &ps, &discovery, hints.clone()))?;
+        outcomes.push(AnnounceOutcome {
+            peer: peer.nickname.clone(),
+            reached: report.succeeded,
+            failed: report.failed,
+        });
+    }
+
+    if outcomes.is_empty() {
+        return Err(match only {
+            Some(n) => format!("No peer named '{n}' that can be found by ID.").into(),
+            None => "No peers to announce to.".to_string().into(),
+        });
+    }
+    Ok(outcomes)
+}
+
 // ── Transfer ─────────────────────────────────────────────────────────────────
 
-fn peer_ticket(nickname: &str) -> Res<Ticket> {
+fn stored_peer(nickname: &str) -> Res<LivePeer> {
     let state = load_state()?;
-    let peer = state
+    state
         .peer(nickname)
-        .ok_or_else(|| format!("No peer named '{nickname}'. Run 'atom live pair' first."))?;
-    Ok(Ticket::from_text(&peer.ticket)?)
+        .cloned()
+        .ok_or_else(|| format!("No peer named '{nickname}'. Run 'atom live pair' first.").into())
 }
 
 /// Our own bind address, taken from the first direct endpoint we advertise.
@@ -295,14 +566,25 @@ fn run_transfer(
     direction: Direction,
     on_progress: &mut (dyn FnMut(Progress) + Send),
     cancel: Option<Cancel>,
+    on_path: &mut (dyn FnMut(reach::Path) + Send),
 ) -> Res<Summary> {
-    let ticket = peer_ticket(peer_nick)?;
+    let state = load_state()?;
+    let peer = stored_peer(peer_nick)?;
     let me = load_or_create_identity()?;
     let bind = bind_address()?;
+    let discovery = discovery_from(&state)?;
+    let mut ps = peer_state(&peer)?;
+
+    let opts = reach::Options {
+        timeout: RENDEZVOUS_TIMEOUT,
+        socks: None,
+        use_discovery: !discovery.is_empty(),
+    };
 
     let rt = tokio::runtime::Runtime::new()?;
-    let summary = rt.block_on(async move {
-        let mut session = rendezvous::rendezvous(bind, &ticket, &me, RENDEZVOUS_TIMEOUT).await?;
+    let (summary, learned) = rt.block_on(async {
+        let (mut session, path) = reach::connect(bind, &me, &mut ps, &discovery, &opts).await?;
+        on_path(path);
 
         let mut transfer = Transfer::new(EncryptedAtRest::aegis_vault()).pacing(Pacing::default());
         if let Some(c) = cancel {
@@ -310,31 +592,48 @@ fn run_transfer(
         }
 
         let result = match &direction {
-            Direction::Send(p) => transfer.send(&mut session, p, on_progress).await,
-            Direction::Receive(p) => transfer.recv(&mut session, p, on_progress).await,
+            Direction::Send(p) => transfer.send(session.as_mut(), p, on_progress).await,
+            Direction::Receive(p) => transfer.recv(session.as_mut(), p, on_progress).await,
         };
 
         // Close either way: gracefully so the peer sees the end of the stream,
         // and because an abandoned session would otherwise linger until the
         // idle timeout.
-        let _ = p2p_live::SecureSession::close(&mut session).await;
-        result
+        let _ = session.close().await;
+        result.map(|s| (s, ps))
     })?;
+
+    // Persisted after the transfer, not during: a freshly resolved address is
+    // only worth remembering once it has actually carried a session, and a
+    // failed attempt must not overwrite an address that still works.
+    remember(peer_nick, &learned)?;
     Ok(summary)
 }
 
 /// Send `vault_path` to a paired peer. Both peers must run their side together.
+///
+/// `on_path` reports which rung of the ladder reached them. It is a required
+/// argument rather than an optional one because the rungs differ in who learns
+/// about the connection, and a UI that quietly dropped that would be hiding the
+/// only part of the tradeoff the user can act on.
 pub fn send_core(
     vault_path: &str,
     peer_nick: &str,
     on_progress: &mut (dyn FnMut(Progress) + Send),
     cancel: Option<Cancel>,
+    on_path: &mut (dyn FnMut(reach::Path) + Send),
 ) -> Res<Summary> {
     let path = PathBuf::from(vault_path);
     if !path.exists() {
         return Err(format!("No such vault: {vault_path}").into());
     }
-    run_transfer(peer_nick, Direction::Send(path), on_progress, cancel)
+    run_transfer(
+        peer_nick,
+        Direction::Send(path),
+        on_progress,
+        cancel,
+        on_path,
+    )
 }
 
 /// Receive a vault from a paired peer into `save_path`.
@@ -343,12 +642,19 @@ pub fn receive_core(
     peer_nick: &str,
     on_progress: &mut (dyn FnMut(Progress) + Send),
     cancel: Option<Cancel>,
+    on_path: &mut (dyn FnMut(reach::Path) + Send),
 ) -> Res<Summary> {
     let path = PathBuf::from(save_path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    run_transfer(peer_nick, Direction::Receive(path), on_progress, cancel)
+    run_transfer(
+        peer_nick,
+        Direction::Receive(path),
+        on_progress,
+        cancel,
+        on_path,
+    )
 }
 
 // ── CLI handlers ─────────────────────────────────────────────────────────────
@@ -397,9 +703,28 @@ pub fn handle_id() -> Res<()> {
     );
     if s.endpoints.is_empty() {
         println!("📍 Address   : not set");
-        println!("\n👉 Run 'atom live address <ip:port>' so peers know where to reach you.");
+        println!(
+            "\n👉 Run 'atom live address <ip:port>' so peers know where to reach you,\n   \
+             or 'atom live stun <server:port>' to discover it (tells that server your IP)."
+        );
     } else {
         println!("📍 Address   : {}", s.endpoints.join(", "));
+    }
+
+    let state = load_state()?;
+    if state.rendezvous.is_empty() {
+        println!("📇 Rendezvous: none — peers must be given your address by hand");
+    } else {
+        println!(
+            "📇 Rendezvous: {}",
+            state
+                .rendezvous
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("   Peers who paired with you can find you by ID after your address changes.");
     }
     println!(
         "\nRead the fingerprint aloud when you pair. It covers both of your keys,\n\
@@ -431,20 +756,33 @@ pub fn handle_peers() -> Res<()> {
     for p in &state.peers {
         match Ticket::from_text(&p.ticket) {
             Ok(t) => {
-                let expired = t.check_valid().is_err();
                 println!(
-                    "  {:<16} {}  {}{}",
+                    "  {:<16} {}  {}",
                     p.nickname,
                     t.fingerprint(),
-                    if t.is_hybrid() { "PQ" } else { "classical" },
-                    if expired {
-                        "  ⚠️ ticket expired"
-                    } else {
-                        ""
-                    }
+                    if t.is_hybrid() { "PQ" } else { "classical" }
                 );
-                for h in &t.hints {
-                    println!("      via {h}");
+                if p.is_reachable_by_id() {
+                    // A ticket's expiry stops mattering once the peer can be
+                    // looked up: the address in it is no longer what we dial.
+                    println!("      findable by ID");
+                } else {
+                    println!(
+                        "      ⚠️  paired before rendezvous — re-pair to be findable by ID{}",
+                        if t.check_valid().is_err() {
+                            ", and this ticket has expired"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                for h in &p.last_known {
+                    println!("      last reached at {h}");
+                }
+                if p.last_known.is_empty() {
+                    for h in &t.hints {
+                        println!("      via {h} (from pairing)");
+                    }
                 }
             }
             Err(e) => println!("  {:<16} ⚠️ unreadable ticket: {e}", p.nickname),
@@ -548,17 +886,209 @@ fn run_with_progress(
     Ok(())
 }
 
+/// Print which rung of the ladder reached the peer.
+///
+/// Always printed, never only on the "worse" rungs: a user who sees the line
+/// every time notices when it changes, whereas a warning that appears only
+/// sometimes is read as noise.
+fn report_path(p: reach::Path) {
+    println!("\r🔗 Reached via {p}");
+    if p == reach::Path::Discovered {
+        println!(
+            "   The endpoint saw an opaque tag, not who either of you are — but it did\n   \
+             see both your addresses within the hour. Self-host it, or route through\n   \
+             Tor with --via-socks, if that matters."
+        );
+    }
+}
+
 pub fn handle_send(vault_path: &str, peer: &str) -> Res<()> {
     run_with_progress("📤 Sending", peer, |cb| {
-        send_core(vault_path, peer, cb, None)
+        send_core(vault_path, peer, cb, None, &mut report_path)
     })
 }
 
 pub fn handle_receive(save_path: &str, peer: &str) -> Res<()> {
     run_with_progress("📥 Receiving", peer, |cb| {
-        receive_core(save_path, peer, cb, None)
+        receive_core(save_path, peer, cb, None, &mut report_path)
     })?;
     println!("   Saved to {save_path}");
+    Ok(())
+}
+
+pub fn handle_announce(peer: Option<String>) -> Res<()> {
+    let outcomes = announce_core(peer.as_deref())?;
+    println!("--- 📡 Announced ---");
+    for o in &outcomes {
+        if o.reached.is_empty() {
+            println!("  {:<16} ❌ published nowhere", o.peer);
+        } else {
+            println!("  {:<16} ✅ via {}", o.peer, o.reached.join(", "));
+        }
+        for (name, err) in &o.failed {
+            println!("      ⚠️  {name}: {err}");
+        }
+    }
+    println!(
+        "\nEach peer got its own record under its own rotating tag, so no endpoint can\n\
+         tell which of these belong together. Re-run this whenever your address changes."
+    );
+    Ok(())
+}
+
+pub fn handle_rendezvous_add(
+    link: &str,
+    name: Option<String>,
+    via_socks: Option<String>,
+) -> Res<()> {
+    let parsed = ServerLink::from_text(link)?;
+    // The label the operator's address implies, unless the user names it.
+    let name = name.unwrap_or_else(|| parsed.label());
+
+    let cfg = RendezvousEndpoint {
+        name: name.clone(),
+        // Stored re-serialised from the parsed form rather than as typed, so
+        // whitespace and case a chat client introduced do not survive into the
+        // config file.
+        link: parsed.to_text(),
+        via_socks,
+    };
+    // Built before it is saved, so a link that cannot work is refused now rather
+    // than during a rendezvous someone is waiting on.
+    cfg.build()?;
+
+    let mut state = load_state()?;
+    if let Some(existing) = state.rendezvous.iter_mut().find(|e| e.name == name) {
+        *existing = cfg;
+        println!("✅ Updated rendezvous endpoint '{name}'");
+    } else {
+        state.rendezvous.push(cfg);
+        println!("✅ Added rendezvous endpoint '{name}'");
+    }
+    save_state(&state)?;
+
+    println!(
+        "   Pinned to {} certificate(s) from the link.",
+        parsed.pins.len()
+    );
+    if state
+        .rendezvous
+        .iter()
+        .find(|e| e.name == name)
+        .is_some_and(|e| e.via_socks.is_none())
+    {
+        println!(
+            "\n⚠️  This endpoint will see your IP address when you publish or look up.\n\
+             It never learns who you are — the tag is opaque and rotates hourly — but\n\
+             within that hour it can tell that your address and your peer's are a pair.\n\
+             Host it yourself, or add --via-socks 127.0.0.1:9050 to reach it over Tor."
+        );
+    }
+    Ok(())
+}
+
+/// Produce a link for an operator to publish.
+///
+/// The one place the pieces are still handled separately — by whoever runs the
+/// server, once, for their own endpoint. Everybody else pastes the result.
+pub fn handle_rendezvous_link(
+    host: &str,
+    port: u16,
+    prefix: &str,
+    pins: &[String],
+    onion: Option<String>,
+) -> Res<()> {
+    let mut parsed_pins = Vec::with_capacity(pins.len());
+    for p in pins {
+        parsed_pins.push(discovery::parse_pin(p)?);
+    }
+
+    let onion = match onion {
+        None => None,
+        Some(text) => match parse_endpoint(&text)? {
+            Endpoint::Onion(o) => Some(o),
+            Endpoint::Direct(_) => {
+                return Err("--onion needs an .onion address with a port".into());
+            }
+        },
+    };
+
+    let link = ServerLink::new(
+        discovery::ServerKind::Rendezvous,
+        host,
+        port,
+        prefix,
+        parsed_pins,
+        onion,
+    )?;
+
+    println!("--- 🔗 Rendezvous Link ---\n");
+    println!("{link}\n");
+    println!(
+        "Give this to anyone who should use your endpoint. It carries the address and\n\
+         the certificate pin together, so there is nothing for them to type by hand and\n\
+         no pin for them to skip. They run:\n\n  \
+         atom live rendezvous add <link>\n"
+    );
+    if link.is_onion_only() {
+        println!(
+            "This link is onion-only, so no routable address appears in it at all —\n\
+             users of it will need --via-socks pointing at their Tor client."
+        );
+    }
+    Ok(())
+}
+
+pub fn handle_rendezvous_list() -> Res<()> {
+    let state = load_state()?;
+    if state.rendezvous.is_empty() {
+        println!(
+            "No rendezvous endpoints configured — peers can only be reached at the\n\
+             address you exchanged by hand. Add one with 'atom live rendezvous add <link>'."
+        );
+        return Ok(());
+    }
+    println!("--- 📇 Rendezvous Endpoints ---");
+    for e in &state.rendezvous {
+        let route = match &e.via_socks {
+            Some(p) => format!("via {p}"),
+            None => "direct (sees your IP)".to_string(),
+        };
+        match e.parsed() {
+            Ok(link) => println!(
+                "  {:<20} {:<28} {route}  [{} pin(s)]",
+                e.name,
+                link.label(),
+                link.pins.len()
+            ),
+            Err(err) => println!("  {:<20} ⚠️ unreadable link: {err}", e.name),
+        }
+    }
+    Ok(())
+}
+
+pub fn handle_rendezvous_remove(name: &str) -> Res<()> {
+    let mut state = load_state()?;
+    let before = state.rendezvous.len();
+    state.rendezvous.retain(|e| e.name != name);
+    if state.rendezvous.len() == before {
+        return Err(format!("No rendezvous endpoint named '{name}'.").into());
+    }
+    save_state(&state)?;
+    println!("✅ Removed rendezvous endpoint '{name}'");
+    Ok(())
+}
+
+pub fn handle_stun(server: &str, port: u16) -> Res<()> {
+    println!(
+        "⚠️  A STUN query tells {server} your IP address, moments before you connect\n\
+         to a peer. That is the one third-party touch the live path otherwise avoids.\n\
+         If you have a forwarded port or a static address, use 'atom live address'\n\
+         instead and skip this entirely.\n"
+    );
+    let found = discover_address(server, port)?;
+    println!("✅ Your external address is {found} — saved and ready to announce.");
+    println!("   Run 'atom live announce' to publish it to your peers.");
     Ok(())
 }
 
@@ -597,21 +1127,142 @@ mod tests {
         }
     }
 
+    fn a_secret() -> RendezvousSecret {
+        RendezvousSecret::from_bytes([9u8; 32])
+    }
+
+    fn a_link() -> ServerLink {
+        ServerLink::new(
+            discovery::ServerKind::Rendezvous,
+            "rdv.example.org",
+            8443,
+            "records",
+            vec![[7u8; 32]],
+            None,
+        )
+        .unwrap()
+    }
+
     /// A peer entry must round-trip through the on-disk form unchanged.
     #[test]
     fn live_state_serialises() {
+        let ticket = Ticket::new(LocalBundle::generate().unwrap().bundle(), vec![]).unwrap();
         let state = LiveState {
             my_endpoints: vec!["203.0.113.7:4433".into()],
-            peers: vec![LivePeer {
-                nickname: "bob".into(),
-                ticket: "atom-live-1:abc".into(),
+            peers: vec![LivePeer::new("bob", &ticket, &a_secret())],
+            rendezvous: vec![RendezvousEndpoint {
+                name: "mine".into(),
+                link: a_link().to_text(),
+                via_socks: None,
             }],
         };
         let json = serde_json::to_vec(&state).unwrap();
         let back: LiveState = serde_json::from_slice(&json).unwrap();
+
         assert_eq!(back.my_endpoints, state.my_endpoints);
-        assert_eq!(back.peer("bob").unwrap().ticket, "atom-live-1:abc");
+        assert_eq!(back.peer("bob").unwrap().ticket, ticket.to_text());
         assert!(back.peer("nobody").is_none());
+        assert_eq!(back.rendezvous[0].name, "mine");
+    }
+
+    /// The rendezvous secret must survive the on-disk round trip exactly. A
+    /// single flipped bit puts the two peers on different slots and they simply
+    /// never find each other — with no error to explain why.
+    #[test]
+    fn a_rendezvous_secret_round_trips_through_storage() {
+        let original = a_secret();
+        let restored = decode_secret(&encode_secret(&original)).unwrap();
+        assert_eq!(restored.expose(), original.expose());
+    }
+
+    #[test]
+    fn a_corrupt_stored_secret_is_refused_rather_than_truncated() {
+        assert!(decode_secret("").is_err());
+        assert!(decode_secret("not base32 at all!").is_err());
+        // Right alphabet, wrong length — must not be zero-padded into a key.
+        assert!(decode_secret("aaaa").is_err());
+    }
+
+    /// A `live_peers.json` written before Phase 8 must still load, and the peer
+    /// in it must be reported as not findable by ID rather than half-working.
+    #[test]
+    fn a_pre_phase8_state_file_still_loads() {
+        let legacy = br#"{
+            "my_endpoints": ["203.0.113.7:4433"],
+            "peers": [{"nickname": "bob", "ticket": "atom-live-1:abc"}]
+        }"#;
+        let state: LiveState = serde_json::from_slice(legacy).unwrap();
+
+        let bob = state.peer("bob").unwrap();
+        assert_eq!(bob.ticket, "atom-live-1:abc");
+        assert!(
+            !bob.is_reachable_by_id(),
+            "a peer with no stored secret must not claim to be findable"
+        );
+        assert!(state.rendezvous.is_empty());
+    }
+
+    /// Refusing to look up a peer paired before Phase 8 must say what to do
+    /// about it, since the fix is a re-pair rather than anything automatic.
+    #[test]
+    fn a_peer_without_a_secret_cannot_be_resolved() {
+        let peer = LivePeer {
+            nickname: "bob".into(),
+            ticket: Ticket::new(LocalBundle::generate().unwrap().bundle(), vec![])
+                .unwrap()
+                .to_text(),
+            rendezvous_secret: None,
+            last_known: vec![],
+            newest_seen: None,
+        };
+        let err = peer_state(&peer)
+            .expect_err("a peer with no secret cannot be resolved")
+            .to_string();
+        assert!(err.contains("Re-pair"), "got: {err}");
+    }
+
+    /// An endpoint must be rejected while it is being configured, not when
+    /// somebody is waiting on a rendezvous.
+    #[test]
+    fn a_rendezvous_endpoint_validates_its_link_when_built() {
+        let good = RendezvousEndpoint {
+            name: "mine".into(),
+            link: a_link().to_text(),
+            via_socks: None,
+        };
+        assert!(good.build().is_ok());
+
+        // A link damaged in transit must not be half-accepted.
+        let mut damaged = a_link().to_text();
+        damaged.truncate(damaged.len() - 3);
+        assert!(
+            RendezvousEndpoint {
+                link: damaged,
+                ..good.clone()
+            }
+            .build()
+            .is_err()
+        );
+
+        // Anything that is not a link at all.
+        assert!(
+            RendezvousEndpoint {
+                link: "example.org:443".into(),
+                ..good.clone()
+            }
+            .build()
+            .is_err()
+        );
+
+        // A SOCKS address that is not host:port must also be caught here.
+        assert!(
+            RendezvousEndpoint {
+                via_socks: Some("localhost".into()),
+                ..good.clone()
+            }
+            .build()
+            .is_err()
+        );
     }
 
     /// An empty state file must load as empty rather than failing, so a first

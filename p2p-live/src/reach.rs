@@ -38,7 +38,6 @@ use std::time::Duration;
 
 use crate::bundle::{IdentityBundle, LocalBundle};
 use crate::discovery::{AddressRecord, Discovery, PublishReport, RendezvousSecret};
-use crate::session::QuicSession;
 use crate::ticket::{Endpoint, Ticket};
 use crate::{Error, rendezvous};
 
@@ -68,12 +67,31 @@ pub struct PeerState {
 }
 
 impl PeerState {
-    /// A freshly paired peer: authenticated, with nothing learned yet.
+    /// A peer known only by identity, with nowhere to try yet.
+    ///
+    /// Prefer [`PeerState::from_ticket`] straight after pairing: a peer built
+    /// this way has an empty `last_known`, so the very first connection skips
+    /// the free rung and goes to an endpoint even though the peer just told us
+    /// where they are.
     pub fn new(identity: IdentityBundle, rendezvous: RendezvousSecret) -> Self {
         PeerState {
             identity,
             rendezvous,
             last_known: Vec::new(),
+            newest_seen: None,
+        }
+    }
+
+    /// A freshly paired peer, seeded with the address from their ticket.
+    ///
+    /// The ticket's hints are exactly "where this peer said they were a moment
+    /// ago", which is the best cached address there is — and using it means the
+    /// first connection after pairing touches no third party at all.
+    pub fn from_ticket(ticket: &Ticket, rendezvous: RendezvousSecret) -> Self {
+        PeerState {
+            identity: ticket.identity.clone(),
+            rendezvous,
+            last_known: ticket.hints.clone(),
             newest_seen: None,
         }
     }
@@ -118,18 +136,13 @@ impl std::fmt::Display for Path {
     }
 }
 
-/// An established session, tagged with how it was reached.
+/// An established session, whichever transport carried it.
 ///
-/// The two transports have different types rather than one boxed trait because
-/// [`crate::SecureSession`] uses `async fn`, which is not object-safe. Callers
-/// match and dispatch to the same generic transfer code.
-pub enum Reached {
-    /// A directly hole-punched QUIC session.
-    Direct(QuicSession),
-    /// A session over a Tor circuit. Boxed only because a TLS session is much
-    /// the larger of the two, and every caller would otherwise pay for it.
-    Onion(Box<crate::tls::TlsSession<tokio::net::TcpStream>>),
-}
+/// Boxed as a trait object rather than an enum of the two concrete types: every
+/// caller does the same thing with it — hand it to [`crate::transfer::Transfer`],
+/// which already takes `&mut dyn SecureSession` — so making them match on the
+/// transport would only invite them to treat the two differently.
+pub type Reached = Box<dyn crate::SecureSession>;
 
 /// Knobs for [`connect`].
 #[derive(Clone, Debug)]
@@ -197,14 +210,27 @@ pub async fn connect(
     let deadline = tokio::time::Instant::now() + opts.timeout;
     let mut attempts: Vec<String> = Vec::new();
 
+    // One socket for every direct rung. Binding per rung would be wrong twice
+    // over: the second bind fails outright, because the first endpoint's socket
+    // is not released the instant it is closed; and even if it succeeded, a new
+    // port would discard the NAT mapping the first attempt just spent its budget
+    // opening. The endpoint is peer-specific — both directions pinned — so it is
+    // built after the self-check above and used for this peer only.
+    let endpoint = rendezvous::bind_endpoint(bind, local, &peer.identity)?;
+
     // --- Rung 1: the address we remember. No third party sees anything. ---
     let cached_direct = direct_only(&peer.last_known);
     if !cached_direct.is_empty() {
         let budget = budget_for_cache(remaining(deadline));
-        match rendezvous::rendezvous(bind, &peer.ticket(cached_direct.clone())?, local, budget)
-            .await
+        match rendezvous::rendezvous_on(
+            &endpoint,
+            &peer.ticket(cached_direct.clone())?,
+            local,
+            budget,
+        )
+        .await
         {
-            Ok(session) => return Ok((Reached::Direct(session), Path::Cached)),
+            Ok(session) => return Ok((Box::new(session), Path::Cached)),
             Err(e) => attempts.push(format!("remembered address: {e}")),
         }
     }
@@ -229,15 +255,15 @@ pub async fn connect(
                 let direct = record.direct_hints();
                 if !direct.is_empty() && !remaining(deadline).is_zero() {
                     let hints = direct.into_iter().map(Endpoint::Direct).collect();
-                    match rendezvous::rendezvous(
-                        bind,
+                    match rendezvous::rendezvous_on(
+                        &endpoint,
                         &peer.ticket(hints)?,
                         local,
                         remaining(deadline),
                     )
                     .await
                     {
-                        Ok(session) => return Ok((Reached::Direct(session), Path::Discovered)),
+                        Ok(session) => return Ok((Box::new(session), Path::Discovered)),
                         Err(e) => attempts.push(format!("discovered address: {e}")),
                     }
                 }
@@ -246,11 +272,16 @@ pub async fn connect(
         }
     }
 
+    // No direct rung succeeded, so the socket has no further use. Released
+    // before the Tor attempt rather than after, so a long onion connection does
+    // not sit on a bound port nothing is listening on.
+    endpoint.close(0u32.into(), b"no direct path");
+
     // --- Rung 3: Tor, if the peer offers an onion and we have a proxy. ---
     let onions = onion_only(&peer.last_known);
     if let (Some(socks), false) = (opts.socks, onions.is_empty()) {
         match crate::tor::dial(socks, &peer.ticket(onions)?, local).await {
-            Ok(session) => return Ok((Reached::Onion(Box::new(session)), Path::Onion)),
+            Ok(session) => return Ok((Box::new(session), Path::Onion)),
             Err(e) => attempts.push(format!("onion: {e}")),
         }
     }

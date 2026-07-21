@@ -5,8 +5,9 @@
 > executed — **Mode A has been deleted** (§6 option A). That path is reachable as
 > `atom live …` and from the GUI's **Live** transport tab, both driving the same
 > `commands::live::*` functions. **Phase 8** adds reachability from an ID alone,
-> so a pairing survives dynamic addresses; its protocol layer is built and tested
-> in `p2p-live/src/{discovery,reach}.rs` but is not yet wired to either UI.
+> so a pairing survives dynamic addresses — built in
+> `p2p-live/src/{discovery,reach}.rs` and wired to both UIs. Its relay fallback
+> for symmetric NAT is decided but not yet built.
 >
 > This roadmap **replaces** the Mode A (blind store) design; the `p2p-direct`
 > crate no longer exists. Companion docs: `p2p-live/p2p_live_architecture.md`
@@ -445,7 +446,7 @@ high-risk recipient (§1), accepted deliberately.
 The prior Mode A architecture document went with the crate; it is recoverable
 from git history if the analysis is ever wanted again.
 
-### Phase 8 — Reachability by ID 🔨 **protocol done, not yet wired to the UIs**
+### Phase 8 — Reachability by ID ✅ **done** (relay fallback outstanding)
 
 **The problem.** Phases 0–7 assume a human carries an `ip:port` to the other
 human. Home and mobile addresses are dynamic, so a ticket is stale within days
@@ -504,18 +505,77 @@ I". A peer behind NAT still cannot learn its own external `ip:port` — so STUN
 peer that will not use it can still receive over an onion, but cannot publish a
 direct address. This trade should be on screen, not in a manual.
 
+**No address is ever handled by a human — including a server's.** A rendezvous
+endpoint is configured by pasting one checksummed `atom-rdv-1:…` link that
+carries its address, path and certificate pin together (`discovery/link.rs`).
+The earlier `--host --port --prefix --pin <64 hex chars>` form was a genuine
+security defect, not just poor ergonomics: **the pin is the field people skip**,
+and a skipped pin silently turns the endpoint into "trust whoever answers".
+Bundling them makes the pin impossible to omit without the address going with
+it, and the checksum means a truncated paste is refused rather than
+half-accepted.
+
+This mirrors what Syncthing actually does, which is worth stating precisely
+because it is often described as address-free: its discovery server is
+`https://discovery.syncthing.net/v2/?id=LYXKCHX-VI3NYZR-…` and its relays are
+`relay://31.16.4.4:22067/?id=…`. Both carry a host **and** an ID. The ID does
+not replace the address — it replaces the CA. Those strings feel invisible only
+because they ship compiled into the binary. A packet needs a route; what must
+never happen is a person handling that route separately from the key that
+authenticates it.
+
+`ServerKind` is in the link from v1 so the relay can share the format and a
+relay link is *refused* by the rendezvous path rather than misread as one.
+A link may carry an onion instead of a host — the one form where **no routable
+address exists anywhere in the configuration** — and `BlindEndpoint::from_link`
+prefers the onion whenever a proxy is configured. That is deliberately the
+opposite of the ticket rule, where preferring an onion silently would override a
+choice the *peer* made; here the choice is ours and the onion is strictly less
+exposing.
+
+`atom live rendezvous link` is the one place the pieces are still separate,
+run once by whoever operates the endpoint.
+
+**Wired to the CLI and the GUI.** `live_peers.json` gained the rendezvous
+secret, `last_known` and `newest_seen` per peer, plus the endpoint list — which
+stores the link verbatim rather than in parts, so a pin cannot drift away from
+the address it belongs to. All `#[serde(default)]`, so a pre-Phase-8 file still
+loads and its peers are reported as *not* findable by ID rather than silently
+half-working. New commands: `atom live rendezvous add|link|list|remove`,
+`atom live announce`, and `atom live stun` (which prints the IP-disclosure
+warning before it queries). `send`/`receive` go through `reach::connect`, and
+**both UIs report which rung reached the peer** — the rungs differ in who learns
+about the connection, so that is not the client's to hide.
+
+**Two bugs the end-to-end test caught, worth keeping in mind:**
+
+1. `PeerState::new` dropped the ticket's hints, so the first connection after
+   pairing skipped the free rung and went straight to an endpoint even though
+   the peer had just said where they were. Hence `PeerState::from_ticket`.
+2. The ladder rebound the same UDP port per rung, which fails with "address
+   already in use" — an endpoint's socket is not released the instant it closes —
+   and would have thrown away the NAT mapping the previous rung just paid to
+   open. Hence `rendezvous::bind_endpoint` + `rendezvous_on`: **bind once, try
+   every direct rung through the same socket.** Any future rung must use it too.
+
 **Still to build:**
 
 - **Relay fallback for symmetric NAT / CGNAT** — decided in favour, against the
   recommendation here, so it must be built as narrowly as possible: self-hosted,
-  addressed by the *same* blinded pairwise tag so it never sees an ID, a dumb
-  byte pipe with the pinned hybrid-PQ handshake running end-to-end through it,
-  Phase 4 pacing on top, last resort only, with an explicit downgrade notice. A
-  relay is the one component that re-introduces the pairing visibility this
-  design deleted; that must stay stated in the UI, not just here.
-- **Persistence** — `reach::PeerState` (identity, rendezvous secret,
-  `last_known`, `newest_seen`) in the keyring-encrypted peer store.
-- **CLI/GUI** — `atom live connect <id>`, an announce loop, endpoint config.
+  configured by an `atom-rdv-1:` link with `ServerKind::Relay` (the format and
+  the refusal path already exist), addressed by the *same* blinded pairwise tag
+  so it never sees an ID, a dumb byte pipe with the pinned hybrid-PQ handshake
+  running end-to-end through it, Phase 4 pacing on top, last resort only, with
+  an explicit downgrade notice. A relay is the one component that re-introduces
+  the pairing visibility this design deleted; that must stay stated in the UI,
+  not just here.
+- **An announce loop.** `atom live announce` is manual, so a peer whose address
+  changes mid-session goes unreachable until they re-run it. A daemon that
+  re-announces each epoch is the obvious next step; it also needs to re-run STUN,
+  which is exactly the periodic disclosure the user should get to opt into
+  knowingly rather than by default.
+- **GUI configuration for endpoints.** The panel reports the rung it used, but
+  endpoints and announce are CLI-only so far.
 
 ---
 

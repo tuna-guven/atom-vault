@@ -56,6 +56,7 @@
 //! tried, that is the canonical bug in this module.
 
 pub mod blind;
+pub mod link;
 pub mod record;
 pub mod secret;
 
@@ -68,6 +69,7 @@ use crate::Error;
 use crate::bundle::BundleId;
 
 pub use blind::{BlindEndpoint, CertPin, parse_pin};
+pub use link::{LINK_PREFIX, ServerKind, ServerLink};
 pub use record::{AddressRecord, SEALED_LEN};
 pub use secret::{Direction, EPOCH_SECS, RendezvousSecret, Slot};
 

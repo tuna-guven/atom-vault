@@ -109,6 +109,60 @@ pub async fn rendezvous(
     local: &LocalBundle,
     timeout: Duration,
 ) -> Result<QuicSession, Error> {
+    let endpoint = bind_endpoint(bind, local, &ticket.identity)?;
+    match rendezvous_on(&endpoint, ticket, local, timeout).await {
+        Ok(session) => Ok(session),
+        Err(e) => {
+            endpoint.close(0u32.into(), b"rendezvous failed");
+            Err(e)
+        }
+    }
+}
+
+/// Bind the UDP socket both roles will use, configured for one specific peer.
+///
+/// Split out from [`rendezvous`] so a caller making **several attempts at the
+/// same peer** — [`crate::reach::connect`] walking its ladder — can bind once
+/// and reuse it. Two things force that rather than merely encourage it:
+///
+/// * a NAT mapping belongs to a local port, so a second attempt from a fresh
+///   port throws away the mapping the first attempt opened;
+/// * the port is the one we published, and rebinding it immediately fails with
+///   "address already in use" because the previous endpoint's socket is not
+///   released synchronously.
+///
+/// The configuration is peer-specific — both directions are pinned to
+/// `peer_identity` — so an endpoint built here must not be reused for a
+/// different peer.
+pub fn bind_endpoint(
+    bind: SocketAddr,
+    local: &LocalBundle,
+    peer_identity: &crate::bundle::IdentityBundle,
+) -> Result<quinn::Endpoint, Error> {
+    let peer = peer_identity.classical();
+    let mut client_cfg = client_config(local.classical(), peer)?;
+    client_cfg.transport_config(transport_config());
+    let mut server_cfg = server_config(local.classical(), peer)?;
+    server_cfg.transport_config(transport_config());
+
+    // One socket doing both jobs. This matters beyond tidiness: the NAT mapping
+    // is per local port, so punching and connecting must happen on the *same*
+    // port or the mapping opened is not the one used.
+    let mut endpoint = quinn::Endpoint::server(server_cfg, bind)?;
+    endpoint.set_default_client_config(client_cfg);
+    Ok(endpoint)
+}
+
+/// [`rendezvous`] on an endpoint the caller owns.
+///
+/// Never closes `endpoint`, on success or failure — the caller may be about to
+/// try again through it. That is the whole reason this is separate.
+pub async fn rendezvous_on(
+    endpoint: &quinn::Endpoint,
+    ticket: &Ticket,
+    local: &LocalBundle,
+    timeout: Duration,
+) -> Result<QuicSession, Error> {
     ticket.check_valid()?;
 
     if local.id() == ticket.id() {
@@ -138,31 +192,12 @@ pub async fn rendezvous(
     }
 
     let peer = ticket.identity.classical();
-    let mut client_cfg = client_config(local.classical(), peer)?;
-    client_cfg.transport_config(transport_config());
-    let mut server_cfg = server_config(local.classical(), peer)?;
-    server_cfg.transport_config(transport_config());
-
-    // One socket doing both jobs. This matters beyond tidiness: the NAT mapping
-    // is per local port, so punching and connecting must happen on the *same*
-    // port or the mapping opened is not the one used.
-    let mut endpoint = quinn::Endpoint::server(server_cfg, bind)?;
-    endpoint.set_default_client_config(client_cfg);
-
     let role = role_for(local, ticket);
     let deadline = tokio::time::Instant::now() + timeout;
 
-    let result = match role {
-        Role::Dialer => dial_loop(&endpoint, peer, &hints, deadline).await,
-        Role::Accepter => accept_loop(&endpoint, ticket, &hints, deadline).await,
-    };
-
-    let mut session = match result {
-        Ok(session) => session,
-        Err(e) => {
-            endpoint.close(0u32.into(), b"rendezvous failed");
-            return Err(e);
-        }
+    let mut session = match role {
+        Role::Dialer => dial_loop(endpoint, peer, &hints, deadline).await?,
+        Role::Accepter => accept_loop(endpoint, ticket, &hints, deadline).await?,
     };
 
     // Post-quantum authentication, before the caller can send anything. Run
@@ -172,10 +207,7 @@ pub async fn rendezvous(
         Role::Dialer => Side::Initiator,
         Role::Accepter => Side::Responder,
     };
-    if let Err(e) = pq_auth::authenticate(&mut session, local, &ticket.identity, side).await {
-        endpoint.close(0u32.into(), b"pq auth failed");
-        return Err(e);
-    }
+    pq_auth::authenticate(&mut session, local, &ticket.identity, side).await?;
 
     Ok(session)
 }

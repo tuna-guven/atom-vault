@@ -125,6 +125,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli::LiveCommands::Receive { save_path, peer } => {
                 commands::live::handle_receive(&save_path, &peer)
             }
+            cli::LiveCommands::Stun { server, port } => commands::live::handle_stun(&server, port),
+            cli::LiveCommands::Announce { peer } => commands::live::handle_announce(peer),
+            cli::LiveCommands::Rendezvous { command } => match command {
+                cli::RendezvousCommands::Add {
+                    link,
+                    name,
+                    via_socks,
+                } => commands::live::handle_rendezvous_add(&link, name, via_socks),
+                cli::RendezvousCommands::Link {
+                    host,
+                    port,
+                    prefix,
+                    pins,
+                    onion,
+                } => commands::live::handle_rendezvous_link(&host, port, &prefix, &pins, onion),
+                cli::RendezvousCommands::List => commands::live::handle_rendezvous_list(),
+                cli::RendezvousCommands::Remove { name } => {
+                    commands::live::handle_rendezvous_remove(&name)
+                }
+            },
         },
         None => {
             // Argüman yoksa varsayılan olarak GUI'yi ve arka plan P2P dinleyicisini başlat

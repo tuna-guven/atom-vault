@@ -173,6 +173,113 @@ pub enum LiveCommands {
         #[arg(long, required = true)]
         peer: String,
     },
+
+    /// Discover your external address via STUN (tells that server your IP)
+    #[command(
+        long_about = "Ask a STUN server what address the internet sees you at.\n\n\
+        This is the one third-party touch the live path otherwise avoids: the server \
+        learns your IP, moments before you connect to a peer. If you have a forwarded \
+        port or a static address, use 'atom live address' instead.\n\n\
+        Behind NAT there is no other way to learn the address your peers must dial, so \
+        this is close to required for the find-by-ID path."
+    )]
+    Stun {
+        /// STUN server as host:port, e.g. 203.0.113.1:3478
+        #[arg(value_name = "SERVER", required = true)]
+        server: String,
+
+        /// Local UDP port to query from — must be the port you transfer on
+        #[arg(long, default_value_t = 4433)]
+        port: u16,
+    },
+
+    /// Publish your current address so paired peers can find you by ID
+    #[command(
+        long_about = "Publish where you currently are, once per paired peer.\n\n\
+        Each peer's record goes under its own rotating opaque tag, sealed with a secret \
+        only the two of you hold, so an endpoint cannot tell which records belong \
+        together or whose they are.\n\n\
+        Re-run this whenever your address changes. Peers who look you up afterwards \
+        connect without anyone exchanging an address by hand."
+    )]
+    Announce {
+        /// Announce to one peer only, instead of all of them
+        #[arg(long)]
+        peer: Option<String>,
+    },
+
+    /// Manage the blind endpoints that carry address records
+    Rendezvous {
+        #[command(subcommand)]
+        command: RendezvousCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+#[command(about = "Blind rendezvous endpoints — dumb stores that hold sealed address records")]
+pub enum RendezvousCommands {
+    /// Add or update an endpoint from a pasted link
+    #[command(
+        long_about = "Configure a rendezvous endpoint by pasting its link.\n\n\
+        The link carries the address and the certificate pin together, so there is \
+        nothing to type by hand — and, more to the point, no pin to skip. It is \
+        checksummed, so a truncated paste is refused rather than half-accepted.\n\n\
+        The endpoint itself is given no identity and no account: it sees an opaque \
+        rotating tag pointing at a fixed-size sealed blob, and cannot read any of it. \
+        Whoever operates it can still see that two addresses touched the same tag \
+        within the hour — self-host it, or use --via-socks so it never sees yours."
+    )]
+    Add {
+        /// The atom-rdv-1:… link from whoever runs the endpoint
+        #[arg(value_name = "LINK", required = true)]
+        link: String,
+
+        /// Local name for it. Defaults to the address inside the link.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Reach it through a SOCKS5 proxy, e.g. 127.0.0.1:9050 for Tor.
+        /// With this set the endpoint never learns your address at all.
+        #[arg(long)]
+        via_socks: Option<String>,
+    },
+
+    /// Produce a link for an endpoint you operate, to give to others
+    #[command(long_about = "Build the link for a rendezvous endpoint you run.\n\n\
+        This is the only place an address and a pin are handled as separate fields, \
+        and it is run once, by the operator. Everyone else pastes the result.\n\n\
+        Get the pin with:\n  \
+        openssl s_client -connect HOST:PORT </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout\n\n\
+        Give --onion without --host for a link with no routable address in it at all.")]
+    Link {
+        /// Hostname or IP the endpoint answers on
+        #[arg(long, default_value = "")]
+        host: String,
+
+        #[arg(long, default_value_t = 443)]
+        port: u16,
+
+        /// Path prefix the tags hang under, e.g. rdv
+        #[arg(long, default_value = "")]
+        prefix: String,
+
+        /// SHA-256 of the certificate it presents. Repeat to stage a rotation.
+        #[arg(long = "pin", required = true, num_args = 1..)]
+        pins: Vec<String>,
+
+        /// An onion it also answers on, as <56-char>.onion:port
+        #[arg(long)]
+        onion: Option<String>,
+    },
+
+    /// List the configured endpoints
+    List,
+
+    /// Remove an endpoint
+    Remove {
+        #[arg(value_name = "NAME", required = true)]
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

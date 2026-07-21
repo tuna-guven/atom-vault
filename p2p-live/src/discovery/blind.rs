@@ -62,6 +62,7 @@ use tokio::net::TcpStream;
 
 use crate::Error;
 use crate::discovery::Substrate;
+use crate::discovery::link::{ServerKind, ServerLink};
 use crate::discovery::record::SEALED_LEN;
 
 /// Whole-request budget. An endpoint slower than this is not usable for a
@@ -141,6 +142,56 @@ impl BlindEndpoint {
             pins,
             via: None,
             tls: Arc::new(tls),
+        })
+    }
+
+    /// Build from a pasted [`ServerLink`], which is how a user configures one.
+    ///
+    /// [`BlindEndpoint::new`] takes the pieces apart and is for tests and for the
+    /// operator-side tool that *produces* a link. Everything user-facing goes
+    /// through here, so a host and a pin are never two things a person handles
+    /// separately — the pin is the field people skip, and a skipped pin is an
+    /// endpoint that trusts whoever answers.
+    ///
+    /// An onion-only link requires a proxy: `.onion` is unreachable without one,
+    /// and failing at the first request would be worse than refusing now.
+    pub fn from_link(link: &ServerLink, socks: Option<SocketAddr>) -> Result<Self, Error> {
+        if link.kind != ServerKind::Rendezvous {
+            return Err(Error::Discovery(
+                "this link names a different kind of server — a rendezvous endpoint \
+                 and a relay do different jobs and are not interchangeable"
+                    .into(),
+            ));
+        }
+
+        // Prefer the onion whenever a proxy is available. This is the opposite
+        // of the rule for a peer's ticket, where offering an onion is the peer's
+        // decision and silently preferring it would undo a choice they made.
+        // Here the choice is *ours*: the onion path is strictly less exposing —
+        // the endpoint never learns this machine's address — and there is no
+        // peer whose intent could be overridden.
+        let (host, port) = match (&link.onion, socks) {
+            (Some(onion), Some(_)) => (onion.host().to_string(), onion.port()),
+            _ if link.is_onion_only() => {
+                return Err(Error::Discovery(
+                    "this endpoint is reachable only over Tor, so it needs a SOCKS \
+                     proxy — pass one (usually 127.0.0.1:9050)"
+                        .into(),
+                ));
+            }
+            _ => (link.host.clone(), link.port),
+        };
+
+        let endpoint = Self::new(
+            link.label(),
+            host,
+            port,
+            link.prefix.clone(),
+            link.pins.clone(),
+        )?;
+        Ok(match socks {
+            Some(proxy) => endpoint.via_socks(proxy),
+            None => endpoint,
         })
     }
 
@@ -546,6 +597,76 @@ mod tests {
         assert!(parse_pin("").is_err());
         assert!(parse_pin("0102").is_err());
         assert!(parse_pin(&"zz".repeat(32)).is_err());
+    }
+
+    fn link_with(host: &str, onion: bool) -> ServerLink {
+        ServerLink::new(
+            ServerKind::Rendezvous,
+            host,
+            8443,
+            "records",
+            vec![a_pin()],
+            onion.then(|| {
+                crate::tor::OnionAddress::new(
+                    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion",
+                    8443,
+                )
+                .unwrap()
+            }),
+        )
+        .unwrap()
+    }
+
+    /// A pasted link must produce a usable endpoint with no other input — that
+    /// is the entire point of the format.
+    #[test]
+    fn an_endpoint_is_built_from_a_link_alone() {
+        let e = BlindEndpoint::from_link(&link_with("rdv.example.org", false), None).unwrap();
+        assert_eq!(e.host, "rdv.example.org");
+        assert_eq!(e.port, 8443);
+        assert_eq!(e.path_for("ab"), "/records/ab");
+        assert_eq!(e.pins(), &[a_pin()]);
+        assert!(e.via.is_none());
+    }
+
+    /// When a proxy is available the onion is the better route and must be
+    /// taken: it is the difference between the endpoint seeing our address and
+    /// not.
+    #[test]
+    fn the_onion_is_preferred_when_a_proxy_exists() {
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let e = BlindEndpoint::from_link(&link_with("rdv.example.org", true), Some(proxy)).unwrap();
+        assert!(e.host.ends_with(".onion"), "got {}", e.host);
+        assert_eq!(e.via, Some(proxy));
+
+        // Without a proxy the onion is unreachable, so the host is used instead.
+        let direct = BlindEndpoint::from_link(&link_with("rdv.example.org", true), None).unwrap();
+        assert_eq!(direct.host, "rdv.example.org");
+    }
+
+    /// An onion-only link with no proxy must fail on configuration, not on the
+    /// first lookup an hour later.
+    #[test]
+    fn an_onion_only_link_without_a_proxy_is_refused() {
+        let err = BlindEndpoint::from_link(&link_with("", true), None)
+            .err()
+            .expect("an onion needs a proxy");
+        assert!(err.to_string().contains("SOCKS"), "got: {err}");
+    }
+
+    /// A relay link must not quietly become a rendezvous endpoint.
+    #[test]
+    fn a_link_for_another_kind_of_server_is_refused() {
+        let relay = ServerLink::new(
+            ServerKind::Relay,
+            "relay.example.org",
+            8443,
+            "",
+            vec![a_pin()],
+            None,
+        )
+        .unwrap();
+        assert!(BlindEndpoint::from_link(&relay, None).is_err());
     }
 
     /// A hostile endpoint must not be able to make this client read forever or
