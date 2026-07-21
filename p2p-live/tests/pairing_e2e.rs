@@ -12,7 +12,7 @@ use p2p_live::identity::LocalIdentity;
 use p2p_live::pacing::Pacing;
 use p2p_live::pairing::{self, PairingCode};
 use p2p_live::rendezvous::{self, Role};
-use p2p_live::ticket::Ticket;
+use p2p_live::ticket::{Endpoint, Ticket};
 use p2p_live::transfer::{EncryptedAtRest, Transfer};
 use p2p_live::{SecureSession, transfer::Cancel};
 
@@ -66,8 +66,12 @@ async fn short_secret_to_verified_vault_over_a_brokerless_path() {
     let b_chan = b_state.finish(&a_msg).unwrap();
 
     // --- L0: tickets, sealed under the paired channel. ---------------------
-    let a_ticket = Ticket::new(alice.public_key().clone(), vec![alice_addr]).unwrap();
-    let b_ticket = Ticket::new(bob.public_key().clone(), vec![bob_addr]).unwrap();
+    let a_ticket = Ticket::new(
+        alice.public_key().clone(),
+        vec![Endpoint::Direct(alice_addr)],
+    )
+    .unwrap();
+    let b_ticket = Ticket::new(bob.public_key().clone(), vec![Endpoint::Direct(bob_addr)]).unwrap();
 
     let bobs_view_of_alice = b_chan
         .open_ticket(&a_chan.seal_ticket(&a_ticket).unwrap())
@@ -157,9 +161,17 @@ async fn a_swapped_identity_in_a_ticket_cannot_connect() {
     let bob_addr = reserve_port();
 
     // Bob is honest and waits for the real Alice.
-    let bobs_view = Ticket::new(alice.public_key().clone(), vec![alice_addr]).unwrap();
+    let bobs_view = Ticket::new(
+        alice.public_key().clone(),
+        vec![Endpoint::Direct(alice_addr)],
+    )
+    .unwrap();
     // Alice was handed a ticket naming the impostor at Bob's address.
-    let alices_view = Ticket::new(impostor.public_key().clone(), vec![bob_addr]).unwrap();
+    let alices_view = Ticket::new(
+        impostor.public_key().clone(),
+        vec![Endpoint::Direct(bob_addr)],
+    )
+    .unwrap();
 
     let budget = Duration::from_secs(3);
     let a = tokio::spawn(async move {

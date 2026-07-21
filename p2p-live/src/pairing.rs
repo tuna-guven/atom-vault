@@ -278,7 +278,9 @@ mod tests {
         let id = LocalIdentity::generate().unwrap();
         Ticket::new(
             id.public_key().clone(),
-            vec![format!("198.51.100.9:{port}").parse().unwrap()],
+            vec![crate::ticket::Endpoint::Direct(
+                format!("198.51.100.9:{port}").parse().unwrap(),
+            )],
         )
         .unwrap()
     }

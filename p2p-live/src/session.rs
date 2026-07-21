@@ -26,17 +26,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::framing::{read_frame_opt, write_frame};
 use crate::identity::{LocalIdentity, PeerPublicKey};
 use crate::{ALPN, Error, client_config, server_config};
+
+pub use crate::framing::MAX_FRAME_LEN;
 
 /// Server name presented in the TLS handshake. Authentication comes from the
 /// pinned raw public key, not from this name, so it is a fixed placeholder.
 pub(crate) const SERVER_NAME: &str = "atom-vault";
-
-/// Upper bound on a single framed message. Bounds the memory a peer can make the
-/// receiver allocate from one length prefix. The bulk transfer (Phase 2) streams
-/// in chunks well under this; control messages are tiny.
-pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// Force a QUIC key update after this many bytes have been sent on a session.
 ///
@@ -149,22 +147,8 @@ impl QuicSession {
     }
 
     async fn send_frame(&mut self, msg: &[u8]) -> Result<(), Error> {
-        if msg.len() > MAX_FRAME_LEN {
-            return Err(Error::Session(format!(
-                "outbound frame too large: {} > {MAX_FRAME_LEN}",
-                msg.len()
-            )));
-        }
-        let len = (msg.len() as u32).to_be_bytes();
-        self.send
-            .write_all(&len)
-            .await
-            .map_err(|e| Error::Session(format!("write length: {e}")))?;
-        self.send
-            .write_all(msg)
-            .await
-            .map_err(|e| Error::Session(format!("write payload: {e}")))?;
-        self.account_sent(len.len() as u64 + msg.len() as u64);
+        let n = write_frame(&mut self.send, msg).await?;
+        self.account_sent(n);
         Ok(())
     }
 
@@ -182,30 +166,9 @@ impl QuicSession {
         Ok(())
     }
 
-    /// Read one frame, distinguishing a clean end-of-stream (`Ok(None)`) from a
-    /// real error. A clean end is the peer having `finish`ed its stream exactly
-    /// at a frame boundary.
+    /// Read one frame, or `None` at a clean end of stream.
     async fn recv_frame_opt(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        let mut len_buf = [0u8; 4];
-        match self.recv.read_exact(&mut len_buf).await {
-            Ok(()) => {}
-            // Peer finished the stream cleanly with no partial frame pending.
-            Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(None),
-            Err(e) => return Err(Error::Session(format!("read length: {e}"))),
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_FRAME_LEN {
-            // Refuse before allocating — this is the whole point of the cap.
-            return Err(Error::Session(format!(
-                "inbound frame too large: {len} > {MAX_FRAME_LEN}"
-            )));
-        }
-        let mut buf = vec![0u8; len];
-        self.recv
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| Error::Session(format!("read payload: {e}")))?;
-        Ok(Some(buf))
+        read_frame_opt(&mut self.recv).await
     }
 }
 

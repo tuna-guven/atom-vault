@@ -3,8 +3,9 @@
 > Sibling crate to `p2p-sync` (Tor) and `p2p-direct` (Mode A blind store).
 > Implements the **live, both-peers-online** transfer mechanism from
 > `docs/pfs-pq-roadmap.md`. This document describes the architecture as built
-> **through Phase 0** (the hybrid-PQ + raw-public-key handshake spike) and sketches
-> the sequences the later phases will fill in. Sequence diagrams will be drawn on
+> **through Phase 5** (handshake, session layer, resumable transfer, pairing and
+> rendezvous, traffic shaping, and the Tor transport) and sketches the sequences
+> the remaining phases will fill in. Sequence diagrams will be drawn on
 > top of the textual sequences in [§7](#7-sequences); a formal threat model follows
 > later (see [§9](#9-planned-follow-ups)).
 
@@ -59,19 +60,17 @@ The roadmap's target architecture, and where this crate sits in it:
 +-------------------------------------------------------------+
 | L2  Session        HYBRID EPHEMERAL AKE  (PFS + PQ)          |  live  <-- THIS CRATE, Phase 0/1
 +-------------------------------------------------------------+
-| L1  Transport      QUIC direct  |  OR  |  Tor onion          |  pluggable           (Phase 1/5)
+| L1  Transport      QUIC direct  |  OR  |  Tor onion          |  pluggable, BOTH BUILT
 +-------------------------------------------------------------+
 | L0  Bootstrap      manual ticket exchange (no broker)        |  out-of-band         (Phase 3)
 +-------------------------------------------------------------+
 ```
 
-What `p2p-live` contains **today** is L2 (the authenticated key exchange and the
-`SecureSession` channel built on it), the identity primitive (L0's payload) it
-authenticates against, and L3's transfer protocol — chunked, resumable and
-integrity-checked. L1 is the QUIC binding; the `SecureSession` boundary is what
-lets Phase 5 substitute Tor without touching L2 or L3. Still absent: L3's
-traffic-analysis hardening (pacing, cover traffic — Phase 4) and L4 pairing
-(Phase 3). §7 describes the sequences those will implement.
+Every layer in that diagram is now built: L0 tickets, L1 in **both** variants
+(direct QUIC with NAT hole punching, and Tor), L2's authenticated key exchange
+and session channel, L3's resumable transfer with traffic shaping, and L4's
+SPAKE2 pairing. What remains is the human-facing rendezvous UX (Phase 3's hard
+half), hybrid PQ signatures (Phase 6), and integration into the CLI and GUI.
 
 Note what is **absent** compared to `p2p-direct`: there is no capability layer and
 no object store. The design deletes more than it adds — no cap, no manifest, no
@@ -99,11 +98,15 @@ p2p-live/
     pairing.rs    L4: SPAKE2 over a short secret, sealing the ticket exchange.
     rendezvous.rs L1: brokerless simultaneous-open / NAT hole punching.
     stun.rs       L1, opt-in and off by default: external-address discovery.
+    framing.rs    Length-prefixed framing + size cap, shared by both transports.
+    tls.rs        L2 over any byte stream: the second SecureSession impl.
+    tor.rs        L1 over Tor: onion address validation, SOCKS5, onion listener.
   tests/
     pq_handshake.rs   End-to-end gate tests over real QUIC (Phase 0 gate).
     session.rs        Framing, identity, frame caps, key-update (Phase 1).
     transfer.rs       Round-trip, resume, seam rejection, rollback (Phase 2).
     pairing_e2e.rs    Short secret → ticket → rendezvous → vault (Phase 3).
+    tor_transport.rs  The same transfer over TLS, and a QUIC→TLS resume (Phase 5).
 ```
 
 The public surface is deliberately small. L2 exposes the config builders
@@ -113,9 +116,10 @@ The public surface is deliberately small. L2 exposes the config builders
 `Progress`/`Summary`/`Cancel` types. The pinning verifiers stay crate-private —
 they are an implementation detail of "pin the peer's key", not an API surface.
 
-**The seam that matters** is `SecureSession`: L3 names no transport, so
-`transfer.rs` is already Tor-ready. Nothing in the transfer protocol knows it is
-running over QUIC.
+**The seam that matters** is `SecureSession`. L3 names no transport, and Phase 5
+proved it: adding the Tor path required a second implementation of the trait and
+**no change to `transfer.rs` at all**. A transfer interrupted on QUIC now resumes
+over Tor and completes byte-identical.
 
 ---
 
@@ -446,12 +450,49 @@ revisited rather than inherited.
 a 4 GiB read each side). Persisting hasher state would avoid it, and would be
 exactly the "trust what we wrote down" the seam check exists to reject.
 
-### 7.5 Transport substitution (Phase 5, planned)
+### 7.5 Transport substitution (Phase 5, **implemented**)
 
-The same L2 handshake and L3 transfer run unchanged over the existing Tor onion
-transport instead of direct QUIC — `transfer.rs` takes a `&mut dyn SecureSession`
-and never names QUIC, so this is an added implementation of the trait, not a
-change to the protocol. This recovers the peer-IP-pairing metadata
+```
+  L3  transfer.rs          <- identical in both columns
+  L2  SecureSession        <- identical guarantees, one shared rustls config
+      +------------------------+---------------------------------+
+      | QuicSession            | TlsSession<S>                    |
+      | quinn, UDP             | tokio-rustls over any byte stream|
+      | rendezvous + punching  | onion service, no punching needed|
+      | force_key_update()     | refresh_traffic_keys()           |
+      +------------------------+---------------------------------+
+  L1  UDP to a peer IP        | TCP through a Tor circuit
+```
+
+Both sessions build from the **same** `client_tls_config` / `server_tls_config`,
+so there is one place where the PQ group, the TLS version and the PFS switches
+are set, and a change to any of them applies to both transports at once. There is
+no second crypto stack to keep in sync.
+
+**Why TLS-over-TCP rather than QUIC-over-Tor:** onion services are TCP-only, so
+QUIC cannot traverse a circuit at all. Running the same TLS 1.3 handshake
+directly on the stream is the substitution, not a workaround.
+
+**What Tor adds:** it hides the peer-IP pairing — the one exposure `CLAUDE.md`
+§10 says the direct path cannot remove, and which Phase 4's padding explicitly
+does not touch.
+
+**What it does not add:** onion v3 identity is Ed25519 and ntor is X25519, both
+outside our control. Our session *inside* the circuit is hybrid-PQ, which is
+genuine defence in depth, but this is not a post-quantum Tor path and must never
+be described as one (roadmap §8). Circuits are also slower, which interacts with
+the pacing rate: a rate above what a circuit sustains silently stops being
+constant.
+
+**The `.onion` guard.** `connect_onion` accepts only a validated v3 onion
+address, and there is deliberately no fallback. This is not input tidiness: a
+hostname passed to the SOCKS proxy is resolved *by Tor*, whereas a locally
+resolved name leaks a DNS query identifying the peer, and a direct-TCP fallback
+would announce the connection to the user's ISP while they believed they were on
+Tor. Likewise `OnionListener` refuses to bind anywhere but loopback — a service
+reachable off-circuit is not hidden. Tickets that offer only an onion are
+refused by the direct rendezvous with a message pointing at the Tor path, rather
+than being dialled directly. This recovers the peer-IP-pairing metadata
 property for recipients who need it, without a second crypto stack. (Non-goal: the
 Tor layer itself stays classical — onion v3 identity is Ed25519 and ntor is
 X25519, outside our control; our session *inside* it is PQ, which is genuine
@@ -478,8 +519,12 @@ defense in depth but must not be described as a post-quantum Tor path.)
   an opt-in STUN client that is never called automatically.
 - *Phase 4* — traffic shaping per §7.6: uniform frame padding, constant-rate
   pacing, a quantised frame count and a randomised ramp-down, on by default.
-- **70 passing tests** across five targets: 52 unit (`src/`), 4 QUIC gate tests,
-  5 session tests, 6 transfer/resume tests, 3 end-to-end pairing tests. The
+- *Phase 5* — the Tor transport per §7.5: `TlsSession` over any byte stream
+  sharing the QUIC path's rustls config, onion address validation, a loopback-only
+  onion listener, and tickets that can carry onion endpoints.
+- **91 passing tests** across six targets: 70 unit (`src/`), 4 QUIC gate tests,
+  5 session tests, 6 transfer/resume tests, 3 end-to-end pairing tests, 3 Tor
+  transport tests. The
   resume set covers the roadmap §7 requirements directly — byte-identical
   resumed output, a divergent prefix rejected at the seam, a non-durable tail
   rolled back to the last checkpoint, and a behavioural assertion that a second
@@ -488,14 +533,17 @@ defense in depth but must not be described as a post-quantum Tor path.)
   frames between `DONE` and `FINISH`, two different payloads presenting the same
   frame count, and the rate limit measurably holding. `pairing_e2e.rs` drives the
   entire path from a spoken code to a verified vault with no server of any kind
-  involved.
+  involved, and `tor_transport.rs` runs the identical transfer over TLS and then
+  resumes a QUIC-interrupted transfer over Tor.
 
 **Not yet built (later phases):**
 
 - **Rendezvous UX** — the protocol exists; the human-facing part (getting two
   people online at once, guiding the two-round paste, showing fingerprints to
   compare) is the hard problem and is not designed yet.
-- **Tor transport binding** (Phase 5) and **hybrid PQ signatures** (Phase 6).
+- **Hybrid PQ signatures** (Phase 6) — Ed25519 + ML-DSA-65 identity, which
+  forces the `atom://` URI to carry an identity-bundle hash rather than an inline
+  key.
 - **CLI/GUI integration** — nothing yet drives `Transfer` from a user-facing
   command; `commands/direct.rs` still runs the Mode A blob flow.
 
@@ -570,6 +618,11 @@ defense in depth but must not be described as a post-quantum Tor path.)
 | `async-trait` | object-safe async methods on `SecureSession` |
 | `zeroize` | wipe the long-term identity private key on drop |
 | `blake3` | L3 end-to-end integrity and the resume offset commitment |
+| `tokio-rustls` | TLS 1.3 over an arbitrary byte stream (the Tor transport) |
+| `tokio-socks` | SOCKS5 client for reaching an onion through a Tor proxy |
+| `spake2`, `chacha20poly1305`, `hkdf`, `sha2` | L4 pairing |
+| `data-encoding` | base32 for tickets, pairing codes and sealed blobs |
+| `getrandom` | pairing codes, STUN transaction IDs, the randomised tail |
 
 Versions are pinned in `p2p-live/Cargo.toml`; verify current releases before
 bumping — the hybrid-PQ group availability in particular is moving fast.

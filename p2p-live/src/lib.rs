@@ -31,6 +31,7 @@
 //! cannot retroactively decrypt a recorded session. That separation is what
 //! makes the forward secrecy strict.
 
+pub mod framing;
 pub mod identity;
 pub mod pacing;
 pub mod pairing;
@@ -39,6 +40,8 @@ pub mod rendezvous;
 pub mod session;
 pub mod stun;
 pub mod ticket;
+pub mod tls;
+pub mod tor;
 pub mod transfer;
 
 use std::sync::Arc;
@@ -132,7 +135,7 @@ pub fn client_config(
 /// Split out so the negotiation guarantees can be asserted directly against the
 /// same configuration the transport uses — a test that built its own config
 /// would prove nothing about this one.
-fn client_tls_config(
+pub(crate) fn client_tls_config(
     local: &LocalIdentity,
     expected_peer: &PeerPublicKey,
 ) -> Result<rustls::ClientConfig, Error> {
@@ -174,7 +177,7 @@ pub fn server_config(
 }
 
 /// The rustls half of [`server_config`]. See [`client_tls_config`].
-fn server_tls_config(
+pub(crate) fn server_tls_config(
     local: &LocalIdentity,
     expected_peer: &PeerPublicKey,
 ) -> Result<rustls::ServerConfig, Error> {

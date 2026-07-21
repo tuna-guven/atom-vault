@@ -37,6 +37,7 @@ use data_encoding::BASE32_NOPAD;
 
 use crate::Error;
 use crate::identity::PeerPublicKey;
+use crate::tor::OnionAddress;
 
 /// Human-visible prefix. Includes the format version so a future incompatible
 /// ticket is rejected by name rather than misparsed.
@@ -52,8 +53,55 @@ const CHECKSUM_LEN: usize = 4;
 /// hash this crate computes over the same bytes.
 const CHECKSUM_DOMAIN: &[u8] = b"atom-live-ticket-checksum-v1";
 
+/// Encoded width of a v3 onion host, including the `.onion` suffix.
+const ONION_LABEL_BYTES: usize = 62;
+
 /// A cap on hint count, keeping a decoded ticket bounded.
 const MAX_HINTS: usize = 8;
+
+/// Address-family tags inside the encoded hint list.
+const TAG_V4: u8 = 4;
+const TAG_V6: u8 = 6;
+const TAG_ONION: u8 = 9;
+
+/// A place the peer can be reached.
+///
+/// Both transports are expressible, and which one a ticket offers is the
+/// recipient's choice of tradeoff — not something this layer decides. A direct
+/// address is fast but tells both ISPs who is talking to whom; an onion address
+/// hides that pairing at the cost of Tor's latency (`CLAUDE.md` §10).
+///
+/// A ticket may carry both, and a peer may then pick. Nothing here ranks them:
+/// offering an onion at all is a deliberate act, and silently preferring the
+/// fast path would quietly undo it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Endpoint {
+    /// A routable UDP address for the QUIC rendezvous.
+    Direct(SocketAddr),
+    /// A v3 onion service reached over Tor.
+    Onion(OnionAddress),
+}
+
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Endpoint::Direct(a) => write!(f, "{a}"),
+            Endpoint::Onion(a) => write!(f, "{a}"),
+        }
+    }
+}
+
+impl From<SocketAddr> for Endpoint {
+    fn from(a: SocketAddr) -> Self {
+        Endpoint::Direct(a)
+    }
+}
+
+impl From<OnionAddress> for Endpoint {
+    fn from(a: OnionAddress) -> Self {
+        Endpoint::Onion(a)
+    }
+}
 
 /// Default ticket lifetime. Short on purpose: a ticket names an address, and an
 /// address that was yours last month may be someone else's today. Re-pairing is
@@ -98,9 +146,9 @@ impl Suite {
 pub struct Ticket {
     /// The peer's identity — this is what the session pins.
     pub identity: PeerPublicKey,
-    /// Addresses to try, in preference order. May be empty when the peer will be
+    /// Places to try, in preference order. May be empty when the peer will be
     /// the one dialling.
-    pub hints: Vec<SocketAddr>,
+    pub hints: Vec<Endpoint>,
     /// The protocol this ticket is for.
     pub suite: Suite,
     /// Unix seconds after which this ticket must be refused.
@@ -109,7 +157,7 @@ pub struct Ticket {
 
 impl Ticket {
     /// Build a ticket valid for [`DEFAULT_TTL_SECS`] from now.
-    pub fn new(identity: PeerPublicKey, hints: Vec<SocketAddr>) -> Result<Self, Error> {
+    pub fn new(identity: PeerPublicKey, hints: Vec<Endpoint>) -> Result<Self, Error> {
         Ok(Ticket {
             identity,
             hints,
@@ -160,19 +208,53 @@ impl Ticket {
 
         v.push(self.hints.len() as u8);
         for hint in &self.hints {
-            match hint.ip() {
-                IpAddr::V4(a) => {
-                    v.push(4);
-                    v.extend_from_slice(&a.octets());
+            match hint {
+                Endpoint::Direct(addr) => {
+                    match addr.ip() {
+                        IpAddr::V4(a) => {
+                            v.push(TAG_V4);
+                            v.extend_from_slice(&a.octets());
+                        }
+                        IpAddr::V6(a) => {
+                            v.push(TAG_V6);
+                            v.extend_from_slice(&a.octets());
+                        }
+                    }
+                    v.extend_from_slice(&addr.port().to_be_bytes());
                 }
-                IpAddr::V6(a) => {
-                    v.push(6);
-                    v.extend_from_slice(&a.octets());
+                Endpoint::Onion(onion) => {
+                    v.push(TAG_ONION);
+                    // The label is a fixed 56 characters for every v3 address,
+                    // so no length prefix is needed — and a fixed width means a
+                    // malformed length cannot be used to desynchronise the parse.
+                    v.extend_from_slice(onion.host().as_bytes());
+                    v.extend_from_slice(&onion.port().to_be_bytes());
                 }
             }
-            v.extend_from_slice(&hint.port().to_be_bytes());
         }
         v
+    }
+
+    /// Only the direct addresses, for the QUIC rendezvous.
+    pub fn direct_hints(&self) -> Vec<SocketAddr> {
+        self.hints
+            .iter()
+            .filter_map(|h| match h {
+                Endpoint::Direct(a) => Some(*a),
+                Endpoint::Onion(_) => None,
+            })
+            .collect()
+    }
+
+    /// Only the onion addresses, for the Tor transport.
+    pub fn onion_hints(&self) -> Vec<OnionAddress> {
+        self.hints
+            .iter()
+            .filter_map(|h| match h {
+                Endpoint::Onion(a) => Some(a.clone()),
+                Endpoint::Direct(_) => None,
+            })
+            .collect()
     }
 
     /// Decode the canonical binary form.
@@ -205,19 +287,32 @@ impl Ticket {
         }
         let mut hints = Vec::with_capacity(hint_count);
         for _ in 0..hint_count {
-            let ip = match r.u8()? {
-                4 => {
+            let hint = match r.u8()? {
+                TAG_V4 => {
                     let o: [u8; 4] = r.take(4)?.try_into().expect("4 bytes taken");
-                    IpAddr::V4(Ipv4Addr::from(o))
+                    let port = r.u16()?;
+                    Endpoint::Direct(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(o)), port))
                 }
-                6 => {
+                TAG_V6 => {
                     let o: [u8; 16] = r.take(16)?.try_into().expect("16 bytes taken");
-                    IpAddr::V6(Ipv6Addr::from(o))
+                    let port = r.u16()?;
+                    Endpoint::Direct(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(o)), port))
+                }
+                TAG_ONION => {
+                    let label = r.take(ONION_LABEL_BYTES)?;
+                    let host = std::str::from_utf8(label)
+                        .map_err(|_| Error::Ticket("onion hint is not valid UTF-8".into()))?;
+                    let port = r.u16()?;
+                    // Validated on the way in, not merely copied: a ticket is
+                    // attacker-influenced input, and an unvalidated host here
+                    // would reach the SOCKS proxy.
+                    Endpoint::Onion(OnionAddress::new(host, port).map_err(|e| {
+                        Error::Ticket(format!("ticket carries a bad onion hint: {e}"))
+                    })?)
                 }
                 tag => return Err(Error::Ticket(format!("unknown address family tag {tag}"))),
             };
-            let port = r.u16()?;
-            hints.push(SocketAddr::new(ip, port));
+            hints.push(hint);
         }
 
         if !r.is_empty() {
@@ -353,13 +448,20 @@ mod tests {
     use super::*;
     use crate::identity::LocalIdentity;
 
+    const ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion";
+
+    fn direct(s: &str) -> Endpoint {
+        Endpoint::Direct(s.parse().unwrap())
+    }
+
     fn sample() -> Ticket {
         let id = LocalIdentity::generate().unwrap();
         Ticket::new(
             id.public_key().clone(),
             vec![
-                "203.0.113.7:4433".parse().unwrap(),
-                "[2001:db8::1]:4433".parse().unwrap(),
+                direct("203.0.113.7:4433"),
+                direct("[2001:db8::1]:4433"),
+                Endpoint::Onion(OnionAddress::new(ONION, 4433).unwrap()),
             ],
         )
         .unwrap()
@@ -436,7 +538,12 @@ mod tests {
         let id = LocalIdentity::generate().unwrap();
         let mut t = Ticket::new(id.public_key().clone(), vec![]).unwrap();
         t.hints = (0..=MAX_HINTS)
-            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8)), 443))
+            .map(|i| {
+                Endpoint::Direct(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8)),
+                    443,
+                ))
+            })
             .collect();
         assert!(Ticket::from_bytes(&t.to_bytes()).is_err());
     }
@@ -476,5 +583,35 @@ mod tests {
             "the SPKI appears once and nothing else does"
         );
         assert_eq!(bytes.len(), 1 + 1 + 8 + 1 + der.len() + 1);
+    }
+
+    /// Both transports must survive the round trip, and each must be selectable
+    /// on its own — the rendezvous needs direct addresses, the Tor path needs
+    /// onions, and neither may silently see the other's.
+    #[test]
+    fn direct_and_onion_hints_round_trip_and_stay_separate() {
+        let t = Ticket::from_text(&sample().to_text()).unwrap();
+        assert_eq!(t.direct_hints().len(), 2);
+        assert_eq!(t.onion_hints().len(), 1);
+        assert_eq!(t.onion_hints()[0].host(), ONION);
+        assert_eq!(t.onion_hints()[0].port(), 4433);
+    }
+
+    /// A ticket is attacker-influenced input. An onion hint that is not a valid
+    /// v3 address must be rejected while decoding, not handed to a SOCKS proxy.
+    #[test]
+    fn a_malformed_onion_hint_is_rejected_while_decoding() {
+        let id = LocalIdentity::generate().unwrap();
+        let t = Ticket::new(
+            id.public_key().clone(),
+            vec![Endpoint::Onion(OnionAddress::new(ONION, 443).unwrap())],
+        )
+        .unwrap();
+        let mut bytes = t.to_bytes();
+        // Corrupt one character of the onion label into one outside base32.
+        let idx = bytes.len() - ONION_LABEL_BYTES - 2 + 3;
+        bytes[idx] = b'1';
+        let err = Ticket::from_bytes(&bytes).unwrap_err().to_string();
+        assert!(err.contains("onion"), "got: {err}");
     }
 }

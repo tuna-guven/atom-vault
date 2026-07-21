@@ -1,9 +1,9 @@
 # Roadmap — Strict Forward Secrecy & Post-Quantum Security
 
-> **Status: Phases 0–4 implemented** in the `p2p-live` crate (handshake, session
-> layer, live transfer with resume, pairing and rendezvous, traffic shaping).
-> Phase 3's *UX* and Phases 5–7 remain outstanding. Nothing is wired into the
-> CLI or GUI yet.
+> **Status: Phases 0–5 implemented** in the `p2p-live` crate (handshake, session
+> layer, live transfer with resume, pairing and rendezvous, traffic shaping, Tor
+> transport). Phase 3's *UX*, Phase 6 and Phase 7 remain outstanding. Nothing is
+> wired into the CLI or GUI yet.
 >
 > This roadmap supersedes the Mode A (blind store) design as the *primary*
 > transfer mechanism. Companion docs: `p2p-live/p2p_live_architecture.md` (what
@@ -333,9 +333,34 @@ reverse-direction packet and undo the ramp-down.
 Residual leak, not fixed: the receiver's `RESUME` timing reveals roughly how long
 it spent hashing its partial, hence roughly how far an earlier attempt got.
 
-### Phase 5 — Tor transport binding
+### Phase 5 — Tor transport binding ✅ **done** (`p2p-live/src/{tls,tor}.rs`)
 - Run the same `SecureSession` over the existing onion transport.
 - Delivers the metadata property back for recipients who need it (§1).
+
+Implemented as `TlsSession<S>`: TLS 1.3 over **any** `AsyncRead + AsyncWrite`,
+built from the *same* `client_tls_config`/`server_tls_config` as the QUIC path.
+One place sets the PQ group, the TLS version and the PFS switches, and a change
+to any of them applies to both transports — which is the whole reason §1 insisted
+the AKE be transport-agnostic.
+
+- **TLS-over-TCP, not QUIC-over-Tor.** Onion services are TCP-only, so QUIC
+  cannot traverse a circuit at all. Ratcheting uses rustls `refresh_traffic_keys`
+  in place of QUIC's `force_key_update`.
+- **`transfer.rs` was not touched.** The proof is a test that interrupts a
+  transfer on QUIC and resumes it over Tor, byte-identical — possible only
+  because resume carries a byte offset and a hash, never transport or key state.
+- **Two guards.** `connect_onion` accepts only validated v3 onion addresses with
+  no fallback (a locally resolved name leaks a DNS query identifying the peer; a
+  direct-TCP fallback would expose the connection while the user believed they
+  were on Tor). `OnionListener` refuses any non-loopback bind, since a service
+  reachable off-circuit is not hidden.
+- **Ticket format extended.** `hints` became `Vec<Endpoint>` so a ticket can
+  carry onion endpoints; without that, Phase 5 would have been unreachable
+  through the pairing flow. The direct rendezvous refuses an onion-only ticket
+  rather than dialling directly.
+
+Framing was factored into `framing.rs` and is now shared, so the frame size cap
+cannot drift between transports.
 
 ### Phase 6 — Hybrid PQ signatures
 - Ed25519 + ML-DSA-65 identity.

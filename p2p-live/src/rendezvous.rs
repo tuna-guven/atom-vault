@@ -42,7 +42,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::identity::LocalIdentity;
+use crate::identity::{LocalIdentity, PeerPublicKey};
 use crate::session::{QuicSession, SERVER_NAME, client_session, server_session, transport_config};
 use crate::ticket::Ticket;
 use crate::{Error, client_config, server_config};
@@ -105,7 +105,20 @@ pub async fn rendezvous(
             "this ticket is our own identity — a peer cannot rendezvous with itself".into(),
         ));
     }
-    if ticket.hints.is_empty() {
+    // Only direct addresses are usable here. A ticket that offers *only* an
+    // onion is not a failure to connect — it is a peer asking to be reached over
+    // Tor, and silently falling back to a direct path would undo exactly the
+    // protection they chose.
+    let hints = ticket.direct_hints();
+    if hints.is_empty() {
+        if !ticket.onion_hints().is_empty() {
+            return Err(Error::Connect(
+                "this ticket offers only onion addresses: the peer asked to be \
+                 reached over Tor, so use the Tor transport rather than a direct \
+                 rendezvous"
+                    .into(),
+            ));
+        }
         return Err(Error::Connect(
             "ticket carries no address hints; enter the peer's address manually or \
              ask them for a ticket that includes one"
@@ -129,8 +142,8 @@ pub async fn rendezvous(
     let deadline = tokio::time::Instant::now() + timeout;
 
     let result = match role {
-        Role::Dialer => dial_loop(&endpoint, ticket, deadline).await,
-        Role::Accepter => accept_loop(&endpoint, ticket, deadline).await,
+        Role::Dialer => dial_loop(&endpoint, peer, &hints, deadline).await,
+        Role::Accepter => accept_loop(&endpoint, ticket, &hints, deadline).await,
     };
 
     match result {
@@ -145,16 +158,17 @@ pub async fn rendezvous(
 /// Retry outbound connections across every hint until one completes.
 async fn dial_loop(
     endpoint: &quinn::Endpoint,
-    ticket: &Ticket,
+    peer: &PeerPublicKey,
+    hints: &[SocketAddr],
     deadline: tokio::time::Instant,
 ) -> Result<QuicSession, Error> {
     let mut last = String::from("no attempt completed");
 
     while tokio::time::Instant::now() < deadline {
-        for hint in &ticket.hints {
+        for hint in hints {
             match attempt_connect(endpoint, *hint).await {
                 Ok(conn) => {
-                    return client_session(endpoint.clone(), conn, &ticket.identity).await;
+                    return client_session(endpoint.clone(), conn, peer).await;
                 }
                 Err(e) => last = e,
             }
@@ -169,7 +183,7 @@ async fn dial_loop(
         "rendezvous timed out while dialling {:?}; last error: {last}. If both peers \
          were online, the addresses are probably wrong or a symmetric NAT is \
          rewriting ports.",
-        ticket.hints
+        hints
     )))
 }
 
@@ -178,6 +192,7 @@ async fn dial_loop(
 async fn accept_loop(
     endpoint: &quinn::Endpoint,
     ticket: &Ticket,
+    hints: &[SocketAddr],
     deadline: tokio::time::Instant,
 ) -> Result<QuicSession, Error> {
     loop {
@@ -187,7 +202,7 @@ async fn accept_loop(
                 "rendezvous timed out waiting for the peer to connect from {:?}. \
                  Either they were not running at the same time, or our address is \
                  not reachable from theirs.",
-                ticket.hints
+                hints
             )));
         }
 
@@ -195,7 +210,7 @@ async fn accept_loop(
             // Our side of the punch: an outbound attempt we do not expect to
             // succeed. The peer is not accepting, so it will fail — but the
             // packets left our NAT, which is the entire purpose.
-            _ = punch(endpoint, &ticket.hints) => {}
+            _ = punch(endpoint, hints) => {}
 
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else {
@@ -248,7 +263,8 @@ mod tests {
     use crate::ticket::Ticket;
 
     fn ticket_for(id: &LocalIdentity, addr: &str) -> Ticket {
-        Ticket::new(id.public_key().clone(), vec![addr.parse().unwrap()]).unwrap()
+        let addr: SocketAddr = addr.parse().unwrap();
+        Ticket::new(id.public_key().clone(), vec![addr.into()]).unwrap()
     }
 
     /// Both peers must independently compute complementary roles, or two
